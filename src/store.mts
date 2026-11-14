@@ -66,6 +66,15 @@ export function settledTurn(
   }
 }
 
+interface StaleTurnRow {
+  id: string
+  thread_id: string
+  started_at: number | null
+  items_json: string
+  owner_pid: number | null
+  owner_started: string | null
+}
+
 const PROJECT_SELECT = `SELECT p.*, (
   SELECT MAX(t.updated_at) FROM threads t WHERE t.project_id = p.id AND t.archived = 0
 ) AS recency_at FROM projects p`
@@ -1179,6 +1188,48 @@ export class SessionStore {
       .run(archived ? 1 : 0, nowSeconds(), threadId)
   }
 
+  // Atomically claims the thread's one active foreground turn. A live owner
+  // in another adapter wins; a dead owner's turn is settled before this one
+  // replaces it. The write lock makes the check and insert one operation
+  // across every server sharing this database.
+  claimTurn(turn: TurnRecord): { claimed: true } | { claimed: false; activeTurn: TurnRecord } {
+    return this.transaction(() => {
+      const inProgress = this.db.prepare(
+        `SELECT * FROM turns
+         WHERE thread_id = ? AND status = 'inProgress'
+         ORDER BY started_at DESC, rowid DESC`,
+      )
+      const activeRows = inProgress.all(turn.threadId) as StaleTurnRow[]
+      const self = currentProcessOwner()
+      const ownerAlive = (row: StaleTurnRow): boolean => {
+        if (self && row.owner_pid === self.pid && row.owner_started === self.started) {
+          return true
+        }
+        // A live server whose ps failed (or Windows) writes no owner, and
+        // startup recovery has already settled rows from before owners were
+        // recorded. An unowned row appearing now may be live, so never
+        // displace it on a guess.
+        if (row.owner_pid == null || row.owner_started == null) return true
+        return otherProcessRunning({ pid: Number(row.owner_pid), started: row.owner_started })
+      }
+      const live = activeRows.find(ownerAlive)
+      if (live) return { claimed: false as const, activeTurn: this.rowToTurn(live) }
+
+      // Settled the way startup recovery settles them: items the owner left
+      // running end too, and the row keeps naming the owner that ran it.
+      const message = 'turn owner exited before completing turn'
+      const hasTurn = this.db.prepare('SELECT 1 FROM turns WHERE thread_id = ? LIMIT 1')
+      const isDead = (threadId: string): boolean =>
+        threadId === turn.threadId ||
+        hasTurn.get(threadId) === undefined ||
+        (inProgress.all(threadId) as StaleTurnRow[]).some((row) => !ownerAlive(row))
+      const completedAt = nowSeconds()
+      for (const row of activeRows) this.interruptStaleTurn(row, message, isDead, completedAt)
+      this.upsertTurn(turn)
+      return { claimed: true as const }
+    })
+  }
+
   upsertTurn(turn: TurnRecord): void {
     const owner = currentProcessOwner()
     this.db
@@ -1740,12 +1791,6 @@ export class SessionStore {
       }>
     ).filter((row) => !ownerRunning(row))
     const completedAt = nowSeconds()
-    const errorJson = JSON.stringify({ message })
-    const updateTurn = this.db.prepare(`
-      UPDATE turns
-      SET status = ?, completed_at = ?, duration_ms = ?, error_json = ?, items_json = ?
-      WHERE id = ?
-    `)
     const reconcileThread = this.db.prepare(
       `UPDATE threads SET status_json = ?, updated_at = ?
        WHERE id = ?
@@ -1760,16 +1805,7 @@ export class SessionStore {
     const hasTurn = this.db.prepare('SELECT 1 FROM turns WHERE thread_id = ? LIMIT 1')
     const isDead = (threadId: string) => cutOff.has(threadId) || hasTurn.get(threadId) === undefined
     for (const row of rows) {
-      const startedAt = row.started_at == null ? null : Number(row.started_at)
-      const durationMs = startedAt == null ? null : Math.max(0, (completedAt - startedAt) * 1000)
-      updateTurn.run(
-        'interrupted',
-        completedAt,
-        durationMs,
-        errorJson,
-        this.terminalizeStaleItems(row.items_json, message, isDead),
-        row.id,
-      )
+      this.interruptStaleTurn(row, message, isDead, completedAt)
       seenThreads.add(String(row.thread_id))
       recoveredCount += 1
     }
@@ -1819,6 +1855,32 @@ export class SessionStore {
     ) as { changes?: number }
     recoveredCount += Number(reconciled.changes ?? 0)
     return recoveredCount
+  }
+
+  // Ends a turn whose owner is gone as interrupted, failing the items it left
+  // running. The owner columns stay as they are.
+  private interruptStaleTurn(
+    row: StaleTurnRow,
+    message: string,
+    isDead: (threadId: string) => boolean,
+    completedAt: number,
+  ): void {
+    const startedAt = row.started_at == null ? null : Number(row.started_at)
+    const durationMs = startedAt == null ? null : Math.max(0, (completedAt - startedAt) * 1000)
+    this.db
+      .prepare(
+        `UPDATE turns
+         SET status = ?, completed_at = ?, duration_ms = ?, error_json = ?, items_json = ?
+         WHERE id = ?`,
+      )
+      .run(
+        'interrupted',
+        completedAt,
+        durationMs,
+        JSON.stringify({ message }),
+        this.terminalizeStaleItems(row.items_json, message, isDead),
+        row.id,
+      )
   }
 
   // A recovered turn is also replayed from its persisted item list. Clear the
