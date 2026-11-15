@@ -1193,6 +1193,28 @@ export class SessionStore {
   // replaces it. The write lock makes the check and insert one operation
   // across every server sharing this database.
   claimTurn(turn: TurnRecord): { claimed: true } | { claimed: false; activeTurn: TurnRecord } {
+    // ps can take seconds, so read liveness before taking the write lock. An
+    // owner can only go from alive to dead meanwhile, so a stale answer at
+    // worst rejects this claim, never displaces a live owner.
+    const known = new Map<string, boolean>()
+    const aliveOf = (pid: number, started: string): boolean => {
+      const key = `${pid} ${started}`
+      let alive = known.get(key)
+      if (alive === undefined) {
+        alive = otherProcessRunning({ pid, started })
+        known.set(key, alive)
+      }
+      return alive
+    }
+    for (const row of this.db
+      .prepare(
+        "SELECT owner_pid, owner_started FROM turns WHERE thread_id = ? AND status = 'inProgress'",
+      )
+      .all(turn.threadId) as StaleTurnRow[]) {
+      if (row.owner_pid != null && row.owner_started != null) {
+        aliveOf(Number(row.owner_pid), row.owner_started)
+      }
+    }
     return this.transaction(() => {
       const inProgress = this.db.prepare(
         `SELECT * FROM turns
@@ -1210,7 +1232,7 @@ export class SessionStore {
         // recorded. An unowned row appearing now may be live, so never
         // displace it on a guess.
         if (row.owner_pid == null || row.owner_started == null) return true
-        return otherProcessRunning({ pid: Number(row.owner_pid), started: row.owner_started })
+        return aliveOf(Number(row.owner_pid), row.owner_started)
       }
       const live = activeRows.find(ownerAlive)
       if (live) return { claimed: false as const, activeTurn: this.rowToTurn(live) }

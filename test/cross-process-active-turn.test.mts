@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { existsSync, readFileSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -382,6 +382,51 @@ test('a claim never displaces an in-progress turn without owner metadata', async
     assert.equal(store.getTurn('unowned-turn')?.status, 'inProgress')
     assert.equal(store.getTurn('competing-turn'), null)
   } finally {
+    store.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a claim never displaces a live owner whose start time ps cannot read', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-process-turn-'))
+  const path = join(home, 'state.sqlite')
+  const threadId = 'ps-failure-thread'
+  const store = new SessionStore(path)
+  const owner = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' })
+  const savedPath = process.env.PATH
+  try {
+    store.upsertThread(threadRecord(threadId))
+    store.upsertTurn(turnRecord(threadId, 'live-owner-turn'))
+    const db = new DatabaseSync(path)
+    try {
+      // A live process; its recorded start time differs from the real one, so
+      // only a failed ps lookup can make it look alive.
+      db.prepare('UPDATE turns SET owner_pid = ?, owner_started = ? WHERE id = ?').run(
+        owner.pid as number,
+        'Mon Jan  1 00:00:00 2001',
+        'live-owner-turn',
+      )
+    } finally {
+      db.close()
+    }
+    // A ps that fails, as when it times out or cannot run.
+    const bin = join(home, 'bin')
+    await mkdir(bin)
+    await writeFile(join(bin, 'ps'), '#!/bin/sh\nexit 2\n', { mode: 0o755 })
+    process.env.PATH = `${bin}:${savedPath}`
+    const claim = store.claimTurn(turnRecord(threadId, 'competing-turn'))
+    assert.equal(claim.claimed, false)
+    assert.equal(claim.claimed === false && claim.activeTurn.id, 'live-owner-turn')
+    assert.equal(store.getTurn('live-owner-turn')?.status, 'inProgress')
+    assert.equal(store.getTurn('competing-turn'), null)
+
+    // With ps working again the same mismatched start time is a dead owner.
+    process.env.PATH = savedPath
+    assert.equal(store.claimTurn(turnRecord(threadId, 'second-try')).claimed, true)
+    assert.equal(store.getTurn('live-owner-turn')?.status, 'interrupted')
+  } finally {
+    process.env.PATH = savedPath
+    owner.kill()
     store.close()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }

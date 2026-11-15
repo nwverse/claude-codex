@@ -24,12 +24,15 @@ export function currentProcessOwner(): ProcessOwner | null {
   return self
 }
 
-// Whether `owner` is another process that is still running. A process whose
-// start time cannot be read counts as gone, which is how every turn was
-// treated before turns recorded their server.
+// Whether `owner` is another process that is still running. A pid that
+// answers a signal but whose start time cannot be read (ps failed or timed
+// out) counts as running: a live owner must never be mistaken for a dead one.
+// It is gone when its pid is gone, or its start time differs from one read.
 export function otherProcessRunning(owner: ProcessOwner): boolean {
   if (owner.pid === process.pid || !signalable(owner.pid)) return false
-  return startTimes([owner.pid])?.get(owner.pid) === owner.started
+  const times = startTimes([owner.pid])
+  if (times === null) return true
+  return times.get(owner.pid) === owner.started
 }
 
 function signalable(pid: number): boolean {
