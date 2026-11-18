@@ -105,14 +105,20 @@ export async function runWorkflowCli(
     }
     case 'ingest-github': {
       const source = requiredOption(parsed, 'github-json')
-      const result = parseGitHubQueueJson(await readFile(source, 'utf8'), now)
+      const result = parseGitHubQueueJson(
+        await readFile(source, 'utf8'),
+        now,
+        state.tasks.map((task) => task.id),
+      )
       const nextState = result.tasks.reduce((current, task) => upsertTask(current, task), state)
-      await store.write(nextState)
+      // A duplicate-only import leaves the saved state file untouched.
+      if (result.tasks.length > 0 || result.existing.length === 0) await store.write(nextState)
       writeJson(io.stdout, {
         status: 'ingested',
         statePath: store.path,
         source,
         enqueued: result.tasks.length,
+        existing: result.existing,
         skipped: result.skipped,
         taskIds: result.tasks.map((task) => task.id),
       })
