@@ -405,7 +405,7 @@ versioning or publishing metadata.
   with an `exitedReviewMode` item that carries Claude's answer, or Codex's
   fallback text when there is none, also when the review is interrupted,
   fails or is cut off by the adapter stopping, as Codex does.
-- The Claude Agent SDK is 0.3.304, which bundles Claude Code 2.1.304. The
+- The Claude Agent SDK is 0.3.322, which bundles Claude Code 2.1.322. The
   adapter always passes a permission mode, so the CLI's changed default for
   SDK sessions without one does not reach Claude threads.
 - Claude's Bash commands stream their output into the App's command item

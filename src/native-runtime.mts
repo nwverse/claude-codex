@@ -62,6 +62,7 @@ import {
 } from './command-output.mjs'
 import { CronJobs } from './cron-jobs.mjs'
 import { dynamicToolCallResult } from './dynamic-tools.mjs'
+import { ForegroundShells, shellExitEvent } from './foreground-shells.mjs'
 import {
   CREATE_GOAL_DESCRIPTION,
   GET_GOAL_DESCRIPTION,
@@ -196,6 +197,9 @@ interface PendingTurn {
   // Tasks Claude started while this turn ran. An interrupt of the turn also
   // ends the background agents among them (see abandonTurn).
   startedTasks: Set<string>
+  foregroundShells: ForegroundShells
+  // A CLI result handed off a timed-out shell. Its notification reply still belongs here.
+  awaitingShellReply: boolean
   // Tool ids whose content_block_start we already saw — used to skip the
   // second delivery via AssistantMessage.content (the SDK ships every
   // ToolUseBlock twice; we keep only the AssistantMessage copy because
@@ -313,11 +317,10 @@ interface LiveSession {
   openCommands: Set<string>
   // Steers waiting for the CLI to start consuming them, by send uuid.
   steers: Map<string, () => void>
-  // Tasks the user stopped, and tasks that ended while the CLI was idle:
-  // Claude starts a turn to answer those, which is pointless when the user
-  // stopped every one of them.
-  stoppedTasks: Set<string>
-  endedWhileIdle: string[]
+  // Stop requests the adapter issued, including the agents of an interrupted turn.
+  requestedStops: Set<string>
+  // Capture the cause when the task ends, before another run reuses its ID.
+  endedWhileIdle: { taskId: string; requestedStop: boolean }[]
   // Live output of the Bash commands the main loop runs.
   commandOutputs: CommandOutputs
   // How many commands_changed messages the session has sent: a newer list
@@ -548,7 +551,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         const current = live.current
         const cancelled = current ? this.cancelSends(live) : []
         if (current) {
-          await this.stopLiveWorkflows(live, current)
+          // The CLI also stops the agents launched by the turn it interrupts.
+          if (live.cliRunning) {
+            for (const id of current.startedTasks)
+              if (live.liveTasks.has(id) && live.tasks.get(id)?.taskType === 'local_agent')
+                live.requestedStops.add(id)
+          }
+          await this.stopSessionTasks(live, this.ownedBackgroundTasks(live, current))
           await this.stopWorkflowTasks(current)
           this.releaseTurn(current)
           live.current = null
@@ -584,12 +593,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (!live || live.closed || !live.query) return false
     const query = live.query as Query & { stopTask?: (taskId: string) => Promise<void> }
     if (typeof query.stopTask !== 'function') return false
-    live.stoppedTasks.add(taskId)
+    live.requestedStops.add(taskId)
     try {
       await query.stopTask(taskId)
       return true
     } catch (error) {
-      live.stoppedTasks.delete(taskId)
+      live.requestedStops.delete(taskId)
       debugLog('native.task.stop_failed', {
         threadId,
         taskId,
@@ -643,14 +652,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     )
   }
 
-  // A workflow belongs to the turn that launched it; the turn waits for it.
-  // Left running past an interrupt, it would finish later and wake the thread.
-  private async stopLiveWorkflows(live: LiveSession, pending: PendingTurn): Promise<void> {
-    await this.stopSessionTasks(live, this.workflowTaskIds(live, pending))
-  }
-
-  private workflowTaskIds(live: LiveSession, pending: PendingTurn): Set<string> {
-    const taskIds = new Set<string>()
+  // Work the turn still owns even though the CLI moved it into the background.
+  private ownedBackgroundTasks(live: LiveSession, pending: PendingTurn): Set<string> {
+    const taskIds = new Set(pending.foregroundShells.running.keys())
     for (const [taskId, state] of pending.workflowTasks ?? [])
       if (!state.terminal) taskIds.add(taskId)
     for (const taskId of live.liveTasks)
@@ -661,7 +665,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   // What the turn runs itself: its workflows and the foreground agents it
   // waits on. Agents it handed off left activeSubagents at launch.
   private turnTaskIds(live: LiveSession, pending: PendingTurn): Set<string> {
-    const taskIds = this.workflowTaskIds(live, pending)
+    const taskIds = this.ownedBackgroundTasks(live, pending)
     for (const [taskId, task] of live.tasks)
       if (task.toolUseId && pending.activeSubagents.has(task.toolUseId)) taskIds.add(taskId)
     return taskIds
@@ -671,7 +675,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const query = live.query as (Query & { stopTask?: (taskId: string) => Promise<void> }) | null
     if (typeof query?.stopTask !== 'function') return
     for (const taskId of taskIds) {
-      live.stoppedTasks.add(taskId)
+      live.requestedStops.add(taskId)
       let failed = false
       const settled = await settlesWithin(
         query.stopTask(taskId).catch(() => {
@@ -679,7 +683,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         }),
         SESSION_CONTROL_TIMEOUT_MS,
       )
-      if (failed) live.stoppedTasks.delete(taskId)
+      if (failed) live.requestedStops.delete(taskId)
       debugLog('native.task.stop', { threadId: live.threadId, taskId, settled, failed })
     }
   }
@@ -1420,7 +1424,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         lifecycleSeen: false,
         openCommands: new Set(),
         steers: new Map(),
-        stoppedTasks: new Set(),
+        requestedStops: new Set(),
         endedWhileIdle: [],
         // startCli replaces it once the CLI's query exists.
         commandOutputs: new CommandOutputs(null),
@@ -1687,6 +1691,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       skippedWorkflowTaskIds: new Set(),
       workflowTasks: new Map(),
       startedTasks: new Set(),
+      foregroundShells: new ForegroundShells(),
+      awaitingShellReply: false,
       toolStartSeen: new Set(),
       toolInputPreviews:
         process.env.CLAUDE_CODEX_LIVE_FILE_CHANGES === '0' ? null : new ToolInputPreviews(),
@@ -1875,7 +1881,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     const init = type === 'system' && message.subtype === 'init' && !message.parent_tool_use_id
     const result = type === 'result'
-    let endedWhileIdle: string[] = []
+    let endedWhileIdle: LiveSession['endedWhileIdle'] = []
     if (init) {
       this.noteCliVersion(session, message.claude_code_version)
       if (cronJobs && typeof message.session_id === 'string')
@@ -1906,12 +1912,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     } else if (session.current) {
       await this.deliver(session, session.current, message)
       if (session.current?.resolved) this.detach(session, session.current)
-    } else if (init && this.answersOnlyStoppedTasks(session, endedWhileIdle)) {
+    } else if (
+      init &&
+      endedWhileIdle.length > 0 &&
+      endedWhileIdle.every((task) => task.requestedStop)
+    ) {
       // The user stopped these tasks; Codex does not wake the parent for
       // that, so neither does a turn Claude starts only to acknowledge it.
       debugLog('native.session.stopped_task_turn', {
         threadId: session.threadId,
-        taskIds: endedWhileIdle,
+        taskIds: endedWhileIdle.map((task) => task.taskId),
       })
       this.beginSink(session, [], true)
       this.reinterrupt(session)
@@ -1965,10 +1975,6 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       return message.subtype === 'init' || (message.subtype === 'api_retry' && session.cliRunning)
     }
     return isTurnOutput(type, message)
-  }
-
-  private answersOnlyStoppedTasks(session: LiveSession, ended: string[]): boolean {
-    return ended.length > 0 && ended.every((taskId) => session.stoppedTasks.has(taskId))
   }
 
   private activeTurn(threadId: string): PendingTurn | null {
@@ -2147,7 +2153,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   }
 
   private maybeRelease(session: LiveSession): void {
-    if (session.closed || session.current || session.backlog.length > 0) return
+    if (session.closed || session.backlog.length > 0) return
+    if (session.current) {
+      if (session.current.awaitingShellReply && !session.cliRunning)
+        this.waitForShellReply(session, session.current)
+      return
+    }
     // Every message restarts the idle wait (routeMessage), and so does this:
     // a timer armed earlier and left running would close the session on its
     // old deadline while its background tasks are still reporting progress.
@@ -2185,6 +2196,31 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     if (this.holdForCronJobs(session)) return
     this.closeSession(session)
+  }
+
+  // Use the same bounded waits as an idle CLI session. A missing notification
+  // or reply fails the waiting turn while independent background work stays live.
+  private waitForShellReply(session: LiveSession, pending: PendingTurn): void {
+    this.clearSessionTimers(session)
+    const shells = pending.foregroundShells.running
+    const live = [...shells.keys()].some((id) => !session.levelSeen || session.liveTasks.has(id))
+    const timer = setTimeout(
+      () => {
+        void this.serialize(session, async () => {
+          if (session.idleTimer !== timer || session.current !== pending || pending.resolved) return
+          const error = new Error(
+            'Claude Code did not report the result of the foreground command.',
+          )
+          await this.stopSessionTasks(session, new Set(shells.keys()))
+          await this.finishTurnAtSessionEnd(pending, error)
+          this.detach(session, pending)
+          this.maybeRelease(session)
+        })
+      },
+      live ? backgroundIdleMs() : sessionSettleMs(),
+    )
+    session.idleTimer = timer
+    timer.unref()
   }
 
   // Keeps an idle session open until its last scheduled job is done; a cron
@@ -2314,6 +2350,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   private async finishTurnAtSessionEnd(pending: PendingTurn, failure: Error | null): Promise<void> {
     const { context, handlers } = pending
+    if (!failure && (pending.awaitingShellReply || pending.foregroundShells.running.size > 0))
+      failure = new Error(
+        'Claude Code exited before reporting the result of the foreground command.',
+      )
     if (failure) {
       await this.stopWorkflowTasks(pending)
       pending.resolved = true
@@ -2425,6 +2465,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (runId) {
       const latest = session.taskRuns.get(taskId)
       if (latest !== undefined && runId < latest) return 'late'
+      if (latest !== undefined && latest !== runId) session.requestedStops.delete(taskId)
       session.taskRuns.set(taskId, runId)
     }
     const known = session.tasks.get(taskId)
@@ -2496,18 +2537,26 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const rawStatus = String(message.status ?? '')
     const status =
       rawStatus === 'failed' ? 'failed' : rawStatus === 'stopped' ? 'stopped' : 'completed'
-    // Interrupting a turn also stops the background agents it launched. Like
-    // a stop from the user, that is no news to wake the thread with.
-    if (status === 'stopped') session.stoppedTasks.add(taskId)
+    // A monitor reaching its deadline also reports "stopped". Interrupting its
+    // follow-up writes a spurious user interruption into Claude's transcript.
+    const requestedStop = session.requestedStops.delete(taskId) && status === 'stopped'
     // A shell that did not complete says how it ended after its output (a
     // stop, its background time limit, a failed exit).
+    const exit = { taskId, status, summary: String(message.summary ?? '') }
+    const pending = session.current
+    const shellCall = pending?.foregroundShells.notified(
+      exit,
+      toolUseId,
+      pending.awaitingShellReply && !session.cliRunning ? runId : null,
+    )
+    if (pending && shellCall) await pending.handlers.onEvent(shellExitEvent(shellCall, exit))
     session.commandOutputs.taskNotified(
       taskId,
-      status === 'completed' ? null : stringOrNull(message.summary),
+      shellCall || status === 'completed' ? null : stringOrNull(message.summary),
     )
     // An interrupted turn answers nothing more: what ends while it drains is
     // left for the turn after it, same as when the CLI is idle.
-    if (!session.cliRunning || session.sink) session.endedWhileIdle.push(taskId)
+    if (!session.cliRunning || session.sink) session.endedWhileIdle.push({ taskId, requestedStop })
     const outputFile = stringOrNull(message.output_file) ?? known?.outputFile ?? null
     const result =
       listener && outputFile && (taskType === 'local_agent' || taskType == null)
@@ -3264,8 +3313,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           ...(agentId ? { agentId } : {}),
         })
         if (isWorkflowTool(name)) pending.workflowToolUseIds.add(id)
-        if (name === 'Bash' && !nestedMessage)
+        if (name === 'Bash' && !nestedMessage) {
+          if (pending.session.reusable && input.run_in_background !== true)
+            pending.foregroundShells.start(id)
           pending.session.commandOutputs.call(id, this.commandOutputSink(pending, id))
+        }
       }
     }
   }
@@ -3280,7 +3332,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   // The Bash call returned. A shell it left running in the background goes on
   // reporting its output to the thread.
-  private endCommandOutput(session: LiveSession, toolUseId: string): void {
+  private endCommandOutput(session: LiveSession, toolUseId: string, keepOutput = false): void {
     const listener = session.reusable ? this.listener : null
     const background: BackgroundSink | null = listener
       ? (taskId) => ({
@@ -3294,8 +3346,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
             }),
         })
       : null
-    session.commandOutputs.callEnded(toolUseId, background, (taskId) =>
-      session.liveTasks.has(taskId),
+    session.commandOutputs.callEnded(
+      toolUseId,
+      background,
+      (taskId) => session.liveTasks.has(taskId),
+      keepOutput,
     )
   }
 
@@ -3327,6 +3382,22 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // server's subagent state machine closes the collabAgentToolCall.
       const isError = Boolean(block.is_error)
       const bodyContent = block.content
+      if (!message.parent_tool_use_id && pending.session?.reusable) {
+        const handoff = pending.foregroundShells.handoff(toolUseId, isError ? null : structured)
+        if (handoff) {
+          await pending.handlers.onEvent({
+            type: 'tool_output_delta',
+            toolUseId,
+            delta:
+              typeof bodyContent === 'string'
+                ? bodyContent
+                : 'Command is continuing in the background.',
+          })
+          this.endCommandOutput(pending.session, toolUseId, true)
+          if (handoff.exit) await pending.handlers.onEvent(shellExitEvent(toolUseId, handoff.exit))
+          continue
+        }
+      }
       // An agent whose request failed for good ends its call with the error.
       const failedRequest = pending.failedSubagentCalls.delete(toolUseId) && isError
       await pending.handlers.onEvent({
@@ -3684,8 +3755,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // A resumed session can answer queued work of its own first, and a
     // queued steer gets a result of its own; only the result that answers
     // everything this turn sent completes it.
+    const origin = recordOrNull(message.origin)
     if (
-      (pending.autonomous
+      pending.awaitingShellReply &&
+      origin?.kind === 'task-notification' &&
+      typeof origin.runId === 'string' &&
+      !pending.foregroundShells.acceptsReply(origin.runId)
+    )
+      return
+    if (
+      (pending.autonomous || pending.awaitingShellReply
         ? pending.input.classifyAutonomousResult(message)
         : pending.input.classifyResult(message)) !== 'final'
     )
@@ -3707,6 +3786,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       numTurns: numberOrNull(message.num_turns),
       costUsd: numberOrNull(message.total_cost_usd),
     })
+    if (success && pending.foregroundShells.running.size > 0) {
+      pending.awaitingShellReply = true
+      await pending.handlers.onEvent({ type: 'message_boundary' })
+      return
+    }
     // A structured turn's answer is what Claude passed to StructuredOutput,
     // which the CLI reports as structured_output; text Claude wrote around
     // the call is not. Only a turn that never called it falls back to the

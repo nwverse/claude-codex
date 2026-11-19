@@ -744,6 +744,8 @@ export type RuntimeEvent =
       toolUseId: string
       content: unknown
       isError?: boolean
+      // A background shell's exit notification supplies a summary and, when known, its code.
+      commandExitCode?: number | null
       // Claude Code's structured tool result (e.g. Agent `async_launched`,
       // SendMessage `resumedAgentId`) when the backend exposes it.
       structured?: Record<string, unknown> | null
