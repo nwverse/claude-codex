@@ -1,7 +1,7 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { existsSync, type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
@@ -49,6 +49,7 @@ import {
   dynamicToolsEnabled,
   parseDynamicTools,
 } from './dynamic-tools.mjs'
+import { type PathWatch, watchPath } from './fs-watch.mjs'
 import { gitInfoFor, patchGitInfo } from './git-info.mjs'
 import {
   continuePrompt,
@@ -517,6 +518,38 @@ function goalBudget(value: unknown): number | null {
   return value
 }
 
+// command/exec answers a timed-out command with Codex's EXEC_TIMEOUT_EXIT_CODE,
+// and waits this long for its pipes after it exits (Codex's IO_DRAIN_TIMEOUT_MS).
+const COMMAND_EXEC_TIMEOUT_EXIT_CODE = 124
+const COMMAND_EXEC_IO_DRAIN_MS = 2_000
+// How long a stopped command has to exit on SIGTERM before it gets SIGKILL.
+const COMMAND_EXEC_KILL_GRACE_MS = 1_000
+
+// Signals a child's process group when it leads one (spawned detached),
+// else the child alone.
+function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid && process.platform !== 'win32') {
+    try {
+      process.kill(-child.pid, signal)
+      return
+    } catch {
+      // Not a group leader, or the group is gone: fall back to the child.
+    }
+  }
+  try {
+    child.kill(signal)
+  } catch {
+    // Already gone.
+  }
+}
+
+// SIGTERM to the group, then SIGKILL to whatever ignores it.
+function stopProcessGroup(child: ChildProcess): void {
+  signalProcessGroup(child, 'SIGTERM')
+  const kill = setTimeout(() => signalProcessGroup(child, 'SIGKILL'), COMMAND_EXEC_KILL_GRACE_MS)
+  kill.unref()
+}
+
 function isUsageLimitError(error: unknown): boolean {
   const message = typeof asRecord(error).message === 'string' ? String(asRecord(error).message) : ''
   return /usage limit|rate limit|quota|\b429\b/i.test(message)
@@ -642,7 +675,8 @@ export class CodexClaudeAppServer {
   // below one, is refused rather than starting a turn on a thread that is
   // about to go.
   private deletingThreads = new Set<string>()
-  // Turns whose runtime run has not returned yet. A running turn outside this
+  private readonly startingTurnByThread = new Map<string, Promise<void>>()
+  // Turns whose runtime run is scheduled or has not returned yet. A turn outside this
   // set has nothing left that would ever end it.
   private runtimeRuns = new Set<string>()
   private subagentStateByTurn = new Map<string, ActiveSubagentState>()
@@ -677,7 +711,8 @@ export class CodexClaudeAppServer {
   private sessionApprovals = new Map<string, Set<string>>()
   private commandProcesses = new Map<string, ChildProcess>()
   private processHandles = new Map<string, ChildProcess>()
-  private fsWatchers = new Map<string, FSWatcher>()
+  // A watch belongs to the connection that made it: ids are unique per connection.
+  private fsWatchers = new WeakMap<RpcPeer, Map<string, PathWatch>>()
   // Goal state lives in the store. These track the hidden continuation turns
   // the adapter starts, how many of them in a row made no progress, and when
   // goal time was last accrued for a thread's running turn.
@@ -823,11 +858,16 @@ export class CodexClaudeAppServer {
         this.subscribersByThread.delete(threadId)
     }
     for (const pending of this.pendingServerRequests.values()) pending.targets.delete(peer.id)
+    for (const watch of this.fsWatchers.get(peer)?.values() ?? []) watch.close()
+    this.fsWatchers.delete(peer)
   }
 
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
+    // command/exec runs in its own process group, out of reach of a signal to
+    // the adapter's group (launchd job stop, Ctrl-C): end what is still running.
+    for (const child of this.commandProcesses.values()) signalProcessGroup(child, 'SIGTERM')
     this.stopCommandsListener()
     this.sleepMonitor.stop?.()
     this.idleSleep.stop()
@@ -1309,7 +1349,7 @@ export class CodexClaudeAppServer {
       case 'fs/watch':
         return this.fsWatch(peer, asRecord(params))
       case 'fs/unwatch':
-        return this.fsUnwatch(asRecord(params))
+        return this.fsUnwatch(peer, asRecord(params))
       case 'command/exec':
         return this.commandExec(peer, asRecord(params))
       case 'command/exec/write':
@@ -3528,11 +3568,9 @@ export class CodexClaudeAppServer {
     const thread = this.store.getThread(threadId)
     if (!thread) throw unknownThread(threadId)
     const runningTurnId = this.activeTurnByThread.get(threadId)
-    if (runningTurnId) {
-      const activeTurn = this.store.getTurn(runningTurnId)
-      if (activeTurn && activeTurn.status === 'inProgress') {
-        throw invalidRequest(`cannot start review while a turn is running on thread ${threadId}`)
-      }
+    const activeTurn = runningTurnId ? this.store.getTurn(runningTurnId) : null
+    if (this.startingTurnByThread.has(threadId) || activeTurn?.status === 'inProgress') {
+      throw invalidRequest(`cannot start review while a turn is running on thread ${threadId}`)
     }
     this.checkModelProfileBinding(thread)
     this.subscribe(threadId, peer)
@@ -3613,11 +3651,9 @@ export class CodexClaudeAppServer {
     const thread = this.store.getThread(threadId)
     if (!thread) throw unknownThread(threadId)
     const runningTurnId = this.activeTurnByThread.get(threadId)
-    if (runningTurnId) {
-      const activeTurn = this.store.getTurn(runningTurnId)
-      if (activeTurn && activeTurn.status === 'inProgress') {
-        throw invalidRequest(`cannot compact thread ${threadId} while a turn is running`)
-      }
+    const activeTurn = runningTurnId ? this.store.getTurn(runningTurnId) : null
+    if (this.startingTurnByThread.has(threadId) || activeTurn?.status === 'inProgress') {
+      throw invalidRequest(`cannot compact thread ${threadId} while a turn is running`)
     }
     this.checkModelProfileBinding(thread)
     this.subscribe(threadId, peer)
@@ -3781,7 +3817,7 @@ export class CodexClaudeAppServer {
         // An interrupt already ended the turn and told the client.
         const completed = this.endTurn(turn, 'completed', null)
         if (completed) {
-          this.clearActiveTurn(threadId)
+          this.clearActiveTurn(threadId, turnId)
           this.setThreadStatus(peer, threadId, { type: 'idle' })
           this.notify(peer, {
             method: 'turn/completed',
@@ -4001,6 +4037,26 @@ export class CodexClaudeAppServer {
 
   private async turnStart(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
+    while (this.startingTurnByThread.has(threadId)) {
+      await this.startingTurnByThread.get(threadId)
+    }
+    let releaseStarting: () => void = () => {}
+    const startingPromise = new Promise<void>((resolve) => {
+      releaseStarting = resolve
+    })
+    this.startingTurnByThread.set(threadId, startingPromise)
+    try {
+      return await this.startClaimedTurn(peer, params)
+    } finally {
+      if (this.startingTurnByThread.get(threadId) === startingPromise) {
+        this.startingTurnByThread.delete(threadId)
+      }
+      releaseStarting()
+    }
+  }
+
+  private async startClaimedTurn(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
+    const threadId = stringOr(params.threadId, '')
     let thread = this.startableThread(threadId)
     this.checkModelProfileBinding(thread)
     // Follow-up turns the adapter starts itself have no requesting peer.
@@ -4037,8 +4093,9 @@ export class CodexClaudeAppServer {
     // A turn/start can race a turn the adapter has just opened itself (for a
     // background agent's or workflow's report); a second turn would orphan
     // it, and it would never complete.
-    if (resumed) {
-      // Pressed while a turn runs: that turn is already carrying on.
+    if (resumed || hiddenPrompt != null) {
+      // Pressed while a turn runs, or a goal continuation that waited on a
+      // turn start: that turn is already carrying on.
       const runningTurnId = this.activeTurnByThread.get(threadId)
       const running = runningTurnId ? this.store.getTurn(runningTurnId) : null
       if (running?.status === 'inProgress') return { turn: this.toLifecycleTurn(running) }
@@ -4167,7 +4224,11 @@ export class CodexClaudeAppServer {
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     const publicTurn = this.toLifecycleTurn(turn)
 
+    // Steering may arrive before the scheduled runtime starts. It must wait,
+    // not mistake this turn for a run that already returned.
+    this.runtimeRuns.add(turnId)
     setImmediate(() => {
+      this.runtimeRuns.delete(turnId)
       // stop() has already settled this turn; starting it now would launch
       // Claude after the runtime stopped.
       if (this.stopped) return
@@ -4307,7 +4368,7 @@ export class CodexClaudeAppServer {
       durationMs: completed.durationMs,
       command: 'workflows.list',
     })
-    this.clearActiveTurn(thread.id)
+    this.clearActiveTurn(thread.id, turn.id)
     this.setThreadStatus(peer, thread.id, { type: 'idle' })
     this.notify(peer, {
       method: 'turn/completed',
@@ -6401,7 +6462,7 @@ export class CodexClaudeAppServer {
       completed.numTurns = collectedMetrics.numTurns
       completed.costUsd = collectedMetrics.costUsd
     }
-    this.clearActiveTurn(thread.id)
+    this.clearActiveTurn(thread.id, turn.id)
     this.setThreadStatus(peer, thread.id, { type: 'idle' })
     // Codex runs the config's notify program for its own threads' turns.
     if (params.outputSchema == null && thread.runtimeBackend !== 'codex' && !thread.ephemeral)
@@ -8174,7 +8235,7 @@ export class CodexClaudeAppServer {
       }
     }
     this.pendingAutonomousTurns.delete(threadId)
-    this.clearActiveTurn(threadId)
+    this.clearActiveTurn(threadId, turnId)
     this.setThreadStatus(peer, threadId, { type: 'idle' })
   }
 
@@ -8269,7 +8330,7 @@ export class CodexClaudeAppServer {
     debugLog('turn.lost', { threadId, turnId })
     const turn = this.store.getTurn(turnId)
     if (!turn) {
-      this.clearActiveTurn(threadId)
+      this.clearActiveTurn(threadId, turnId)
       return
     }
     const error = new Error('Claude stopped working on this turn before it finished.')
@@ -8814,13 +8875,22 @@ export class CodexClaudeAppServer {
   }
 
   private async fsGetMetadata(params: Record<string, unknown>): Promise<unknown> {
-    const { stat } = await import('node:fs/promises')
+    const { lstat, stat } = await import('node:fs/promises')
     const path = stringOr(params.path, '')
-    const metadata = await stat(path)
+    const entry = await lstat(path)
+    const isSymlink = entry.isSymbolicLink()
+    let metadata = entry
+    if (isSymlink) {
+      try {
+        metadata = await stat(path)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+    }
     return {
       isDirectory: metadata.isDirectory(),
       isFile: metadata.isFile(),
-      isSymlink: metadata.isSymbolicLink(),
+      isSymlink,
       createdAtMs: metadata.birthtimeMs,
       modifiedAtMs: metadata.mtimeMs,
     }
@@ -8856,27 +8926,32 @@ export class CodexClaudeAppServer {
     const { cp } = await import('node:fs/promises')
     await cp(stringOr(params.sourcePath, ''), stringOr(params.destinationPath, ''), {
       recursive: params.recursive === true,
+      verbatimSymlinks: true,
     })
     return {}
   }
 
   private async fsWatch(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
-    const { realpath } = await import('node:fs/promises')
     const watchId = stringOr(params.watchId, newId())
-    const path = await realpath(stringOr(params.path, process.cwd()))
-    this.fsWatchers.get(watchId)?.close()
-    const watcher = watch(path, { persistent: false }, (_eventType, filename) => {
-      const changedPath = filename ? `${path}/${String(filename)}` : path
-      this.notify(peer, { method: 'fs/changed', params: { watchId, changedPaths: [changedPath] } })
+    let watches = this.fsWatchers.get(peer)
+    if (watches?.has(watchId)) throw invalidRequest(`watchId already exists: ${watchId}`)
+    const path = resolve(stringOr(params.path, process.cwd()))
+    const watcher = watchPath(path, (changedPaths) => {
+      this.notify(peer, { method: 'fs/changed', params: { watchId, changedPaths } })
     })
-    this.fsWatchers.set(watchId, watcher)
+    if (!watches) {
+      watches = new Map()
+      this.fsWatchers.set(peer, watches)
+    }
+    watches.set(watchId, watcher)
     return { path }
   }
 
-  private fsUnwatch(params: Record<string, unknown>): unknown {
+  private fsUnwatch(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const watchId = stringOr(params.watchId, '')
-    this.fsWatchers.get(watchId)?.close()
-    this.fsWatchers.delete(watchId)
+    const watches = this.fsWatchers.get(peer)
+    watches?.get(watchId)?.close()
+    watches?.delete(watchId)
     return {}
   }
 
@@ -8906,6 +8981,8 @@ export class CodexClaudeAppServer {
       cwd,
       env: commandEnv(params.env),
       stdio: 'pipe',
+      // Its own process group, so a timeout or terminate ends what it started too.
+      detached: process.platform !== 'win32',
     })
     this.commandProcesses.set(processId, child)
 
@@ -8962,11 +9039,16 @@ export class CodexClaudeAppServer {
 
     const timeoutMs = params.disableTimeout === true ? null : numberOr(params.timeoutMs, 60_000)
     let timeout: NodeJS.Timeout | null = null
+    let timedOut = false
     if (timeoutMs != null && timeoutMs > 0) {
-      timeout = setTimeout(() => child.kill('SIGTERM'), timeoutMs)
+      timeout = setTimeout(() => {
+        timedOut = true
+        stopProcessGroup(child)
+      }, timeoutMs)
     }
 
     return new Promise((resolve, reject) => {
+      let settled = false
       child.once('error', (error) => {
         debugLog('command.exec.error', {
           processId,
@@ -8975,17 +9057,40 @@ export class CodexClaudeAppServer {
         })
         if (timeout) clearTimeout(timeout)
         this.commandProcesses.delete(processId)
+        if (settled) return
+        settled = true
         reject(error)
       })
-      child.once('close', (code, signal) => {
-        debugLog('command.exec.close', { processId, code, signal, stdoutBytes, stderrBytes })
+      // Answered when the command's own process exits. Processes it left in
+      // the background may hold its pipes open: they get a bounded drain, not
+      // the request's lifetime.
+      child.once('exit', (code, signal) => {
         if (timeout) clearTimeout(timeout)
         this.commandProcesses.delete(processId)
-        resolve({
-          exitCode: code ?? 1,
-          stdout: streamOutput ? '' : Buffer.concat(stdout).toString('utf8'),
-          stderr: streamOutput ? '' : Buffer.concat(stderr).toString('utf8'),
-        })
+        // A child forked as the group was signalled can have missed it.
+        if (timedOut) signalProcessGroup(child, 'SIGKILL')
+        const finish = () => {
+          clearTimeout(drain)
+          if (settled) return
+          settled = true
+          child.stdout?.destroy()
+          child.stderr?.destroy()
+          debugLog('command.exec.close', {
+            processId,
+            code,
+            signal,
+            timedOut,
+            stdoutBytes,
+            stderrBytes,
+          })
+          resolve({
+            exitCode: timedOut ? COMMAND_EXEC_TIMEOUT_EXIT_CODE : (code ?? 1),
+            stdout: streamOutput ? '' : Buffer.concat(stdout).toString('utf8'),
+            stderr: streamOutput ? '' : Buffer.concat(stderr).toString('utf8'),
+          })
+        }
+        const drain = setTimeout(finish, COMMAND_EXEC_IO_DRAIN_MS)
+        child.once('close', finish)
       })
     })
   }
@@ -9007,7 +9112,7 @@ export class CodexClaudeAppServer {
     const processId = stringOr(params.processId, '')
     const child = this.commandProcesses.get(processId)
     if (!child) throw invalidRequest(`unknown command process: ${processId}`)
-    child.kill('SIGTERM')
+    stopProcessGroup(child)
     return {}
   }
 
@@ -9498,26 +9603,50 @@ export class CodexClaudeAppServer {
     roots: string[],
   ): Promise<Array<Record<string, unknown>>> {
     const query = rawQuery.toLowerCase()
-    const files: Array<Record<string, unknown>> = []
+    const files: Array<{
+      root: string
+      path: string
+      match_type: string
+      file_name: string
+      score: number
+      indices: null
+    }> = []
     for (const root of roots) {
       const paths = await listFiles(root)
       for (const path of paths) {
         const fileName = path.split('/').at(-1) ?? path
         const haystack = path.toLowerCase()
         if (query && !haystack.includes(query)) continue
+        const name = fileName.toLowerCase()
+        const stem = name.replace(/\.[^.]+$/, '')
+        const score = !query
+          ? 1
+          : name === query || stem === query
+            ? 1000
+            : name.startsWith(query)
+              ? 800
+              : name.includes(query)
+                ? 500 - name.indexOf(query)
+                : Math.max(1, 100 - haystack.indexOf(query))
         files.push({
           root,
           path,
           match_type: 'file',
           file_name: fileName,
-          score: query ? Math.max(1, 100 - haystack.indexOf(query)) : 1,
+          score,
           indices: null,
         })
-        if (files.length >= 100) break
       }
-      if (files.length >= 100) break
     }
     return files
+      .sort(
+        (a, b) =>
+          b.score - a.score ||
+          a.path.length - b.path.length ||
+          a.path.localeCompare(b.path) ||
+          a.root.localeCompare(b.root),
+      )
+      .slice(0, 100)
   }
 
   private fuzzySessionStart(params: Record<string, unknown>): unknown {
@@ -9964,6 +10093,7 @@ export class CodexClaudeAppServer {
     threadId: string,
     status: ThreadRecord['status'],
   ): void {
+    if (status.type === 'idle' && this.activeTurnByThread.has(threadId)) return
     // The client's view comes first: a status it never hears about leaves the
     // thread spinning. A stored status the write missed is repaired at startup.
     try {
@@ -10121,8 +10251,9 @@ export class CodexClaudeAppServer {
     }
   }
 
-  private clearActiveTurn(threadId: string): void {
+  private clearActiveTurn(threadId: string, expectedTurnId: string): void {
     const turnId = this.activeTurnByThread.get(threadId)
+    if (turnId !== expectedTurnId) return
     const existed = this.activeTurnByThread.delete(threadId)
     if (turnId) {
       this.closeStreamingItemsByTurn.delete(turnId)
@@ -10278,7 +10409,7 @@ export class CodexClaudeAppServer {
       // Its end was recorded, but whatever ended it never let go of the
       // thread.
       if (this.activeTurnByThread.get(threadId) === turn.id) {
-        this.clearActiveTurn(threadId)
+        this.clearActiveTurn(threadId, turn.id)
         this.setThreadStatus(peer, threadId, { type: 'idle' })
       }
       return false
@@ -10291,7 +10422,7 @@ export class CodexClaudeAppServer {
       method: 'turn/completed',
       params: { threadId, turn: this.toLifecycleTurn(completed) },
     })
-    this.clearActiveTurn(threadId)
+    this.clearActiveTurn(threadId, turn.id)
     this.setThreadStatus(peer, threadId, { type: 'idle' })
     return true
   }
