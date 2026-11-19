@@ -3,13 +3,10 @@ set -euo pipefail
 
 STATE_DIR="${CLAUDE_CODEX_STATE_DIR:-$HOME/.claude-codex}"
 ENV_FILE="${CLAUDE_CODEX_RUNTIME_ENV:-$STATE_DIR/runtime.env}"
-ADAPTER_DEBUG_LOG="${CLAUDE_CODEX_DEBUG_LOG:-${CODEX_HOME:-$HOME/.codex}/claude-codex-adapter/debug.jsonl}"
 AGENT_HTTP_LOG="$STATE_DIR/agent-http.log"
 AGENTAPI_LOG="$STATE_DIR/agentapi.log"
 BRIDGE_LOCK="$STATE_DIR/bridge.lock"
 BRIDGE_POOL_DIR="$STATE_DIR/bridges"
-BRIDGE_PORT_START="${CLAUDE_CODEX_BRIDGE_PORT_START:-3284}"
-BRIDGE_PORT_END="${CLAUDE_CODEX_BRIDGE_PORT_END:-3384}"
 
 mkdir -p "$STATE_DIR" "$BRIDGE_POOL_DIR"
 
@@ -17,6 +14,12 @@ if [ -f "$ENV_FILE" ]; then
   # shellcheck source=/dev/null
   source "$ENV_FILE"
 fi
+
+# After runtime.env, so settings kept there count. The adapter's debug log is
+# debug.jsonl in its home, as adapterHome() in src/util.mts resolves it.
+ADAPTER_DEBUG_LOG="${CLAUDE_CODEX_DEBUG_LOG:-${CLAUDE_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}/claude-codex-adapter}/debug.jsonl}"
+BRIDGE_PORT_START="${CLAUDE_CODEX_BRIDGE_PORT_START:-3284}"
+BRIDGE_PORT_END="${CLAUDE_CODEX_BRIDGE_PORT_END:-3384}"
 
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.local/node-v24.11.0-linux-x64/bin:$HOME/.bun/bin:$PATH"
 

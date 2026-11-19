@@ -110,6 +110,24 @@ test('runtime config keeps legacy defaults and accepts explicit backends', () =>
   )
 })
 
+test("the shim's native codex values are refused with the reason, not as unknown", () => {
+  for (const value of ['codex', 'native']) {
+    assert.throws(
+      () => resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_TYPE: value }),
+      {
+        message:
+          `CLAUDE_CODEX_RUNTIME_TYPE=${value} is the codex shim's native Codex passthrough: ` +
+          'the shim runs the real codex app-server and the adapter does not start. Unset it, ' +
+          'or choose an adapter route such as agent-sdk-sidecar, to run the adapter directly.',
+      },
+      value,
+    )
+  }
+  assert.throws(() => resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_TYPE: 'bogus' }), {
+    message: 'unknown CLAUDE_CODEX_RUNTIME_TYPE: bogus',
+  })
+})
+
 test('native SDK runtime ignores bridge session markers when resuming SDK turns', () => {
   assert.equal(sdkResumeSessionId(null), null)
   assert.equal(sdkResumeSessionId('agent-http:http://127.0.0.1:3284'), null)
