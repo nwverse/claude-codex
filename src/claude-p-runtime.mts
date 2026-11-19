@@ -128,9 +128,11 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     // route passes them; claude-p hands the flag on to Claude Code.
     if (context.disallowedTools && context.disallowedTools.length > 0)
       args.push('--disallowedTools', context.disallowedTools.join(','))
+    // A read-only thread that never asks keeps to the read tools allowed
+    // above: skipping permissions would let every other tool run too.
     if (
       this.options.skipPermissions ||
-      context.approvalPolicy === 'never' ||
+      (context.approvalPolicy === 'never' && context.sandboxMode !== 'read-only') ||
       context.sandboxMode === 'danger-full-access'
     ) {
       args.push('--dangerously-skip-permissions')

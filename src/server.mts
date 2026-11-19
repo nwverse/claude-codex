@@ -242,6 +242,7 @@ import {
   failedImageRead,
   imageReadPath,
   isExploreTool,
+  readsOnly,
   splitMcpToolName,
 } from './tool-items.mjs'
 import {
@@ -4000,7 +4001,7 @@ export class CodexClaudeAppServer {
         addDirs: [],
         enableFileCheckpointing: false,
         outputFormat: null,
-        approvalPolicy: 'never',
+        approvalPolicy: 'on-request',
         sandboxMode: 'read-only',
         systemPromptAddendum: null,
         planMode: false,
@@ -4023,8 +4024,10 @@ export class CodexClaudeAppServer {
             throw new Error(event.result ?? 'compaction turn failed')
           }
         },
-        // Compaction never asks for approvals — it's read-only summarisation.
-        onPermissionRequest: async () => ({ decision: 'accept' }),
+        // The summary needs no tool beyond the reads allowed up front;
+        // anything else is refused, never approved. A decline, not a cancel,
+        // so Claude goes on writing the summary.
+        onPermissionRequest: async () => ({ decision: 'decline' }),
         // Compaction shouldn't ever invoke AskUserQuestion; if it does, return
         // an empty answer so the model proceeds with its summary.
         onUserInputRequest: async (event) => ({
@@ -7810,6 +7813,10 @@ export class CodexClaudeAppServer {
       thread &&
       (thread.approvalPolicy === 'never' || thread.sandboxMode === 'danger-full-access')
     ) {
+      // A read-only sandbox that never asks runs reads alone and refuses the
+      // rest: nothing would confine another call to reading.
+      if (thread.sandboxMode === 'read-only' && !readsOnly(event.toolName))
+        return { decision: 'decline' }
       return { decision: 'accept' }
     }
     // App rule: mcp-tool-approval

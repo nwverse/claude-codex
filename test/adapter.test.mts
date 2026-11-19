@@ -22,6 +22,7 @@ import type { ProviderLoopConfigProjectionResult } from '../src/provider-loop-co
 import { QUIET_TURN_HEARTBEAT } from '../src/quiet-turns.mjs'
 import { fileChangeFromTool } from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
+import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
 const shim = resolve('scripts/codex-shim')
@@ -5664,6 +5665,42 @@ test('Codex App approvalPolicy=never + sandbox=danger-full-access auto-accepts t
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
+})
+
+test('approvalPolicy=never with a read-only sandbox runs reads and refuses the rest without a card', async () => {
+  const decisions: Array<[string, string]> = []
+  const calls: Array<[string, Record<string, unknown>]> = [
+    ['Bash', { command: 'rm -rf build' }],
+    ['Write', { file_path: '/etc/hosts', content: '' }],
+    ['Read', { file_path: '/etc/hosts' }],
+  ]
+  const runtime = scriptedRuntime(async (_context, handlers) => {
+    for (const [toolName, input] of calls) {
+      const decision = await handlers.onPermissionRequest({
+        type: 'permission_request',
+        requestId: `perm-${toolName}`,
+        toolUseId: `tool-${toolName}`,
+        toolName,
+        input,
+      })
+      decisions.push([toolName, decision.decision])
+    }
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread({ approvalPolicy: 'never', sandbox: 'read-only' })
+    const turnId = await app.startTurn(threadId, 'look around')
+    assert.equal((await app.turnCompleted(turnId)).status, 'completed')
+    assert.deepEqual(decisions, [
+      ['Bash', 'decline'],
+      ['Write', 'decline'],
+      ['Read', 'accept'],
+    ])
+    assert.deepEqual(
+      app.messages.filter((message) => /requestApproval$/.test(message.method ?? '')),
+      [],
+    )
+  })
 })
 
 test('Task subagent emits the canonical activity lifecycle and leaves wait as the terminal display state', async () => {

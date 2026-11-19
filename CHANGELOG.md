@@ -627,6 +627,17 @@ versioning or publishing metadata.
   included, and "Allow for this session" covers only that call.
 - When Claude Code withdraws a pending approval or question mid-turn, its card
   closes, the call is declined, and a late Cancel no longer interrupts the turn.
+- A thread whose approval policy is `never` keeps a read-only sandbox
+  read-only: Read, Grep, Glob, LS and WebSearch run, and any other call is
+  refused without a card, with Claude told the sandbox is read-only. Before,
+  `never` approved every tool whatever the sandbox, so Bash and file edits ran
+  in a read-only thread. The `claude-p` backend no longer adds
+  `--dangerously-skip-permissions` there, so only the read tools it
+  pre-approves run. The summary `/compact` writes in place of compacting
+  Claude's session (on a Codex model, or when that compaction fails) now
+  declines any tool beyond its reads instead of approving it. `never` with
+  any other sandbox still runs every tool unasked: the adapter has no OS
+  sandbox to confine workspace-write.
 
 ### Trustworthy history and settings
 
