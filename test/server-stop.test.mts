@@ -4,6 +4,9 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { MockRuntime } from '../src/mock-runtime.mjs'
 import { withInProcessApp } from './fixtures/in-process-app.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 // What a stopped server leaves behind: a terminal its client still has open
 // has no timeout, and a daemon's child would outlive it.
 
