@@ -2,10 +2,20 @@ import assert from 'node:assert/strict'
 import { type ChildProcess, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readlink,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { parseProxySockArg, startWebSocketTransport } from '../src/transports.mjs'
 
@@ -16,7 +26,7 @@ async function tempDir(): Promise<string> {
   return await mkdtemp(join(tmpdir(), 'ccx-'))
 }
 
-function startDaemon(home: string, sock: string): ChildProcess {
+function startDaemon(home: string, sock: string, env: NodeJS.ProcessEnv = {}): ChildProcess {
   return spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: {
@@ -25,6 +35,7 @@ function startDaemon(home: string, sock: string): ChildProcess {
       CODEX_HOME: home,
       CLAUDE_CODEX_MOCK: '1',
       NODE_NO_WARNINGS: '1',
+      ...env,
     },
   })
 }
@@ -144,6 +155,89 @@ test('a socket at the exact platform byte limit accepts a connection on its full
     }
   } finally {
     await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('Unix daemons preserve existing parent modes and create private sockets and new directories', {
+  skip: process.platform === 'win32',
+  timeout: 20_000,
+}, async () => {
+  const root = await mkdtemp('/tmp/ccx-modes-')
+  try {
+    for (const [name, existingMode] of [
+      ['explicit', 0o755],
+      ['new', 0],
+      ['fallback', 0o1777],
+    ] as const) {
+      const parent = join(root, name)
+      if (existingMode) {
+        await mkdir(parent)
+        await chmod(parent, existingMode)
+      }
+      const fallback = name === 'fallback'
+      const home = join(root, fallback ? 'x'.repeat(110) : name + '-home')
+      const sock = fallback ? '' : join(parent, 'sock')
+      const daemon = startDaemon(home, sock, { TMPDIR: fallback ? parent : root })
+      const stderr = collectStderr(daemon)
+      try {
+        assert.ok(await waitFor(() => /listening on/.test(stderr()), 5000), stderr())
+        const bound = /listening on ([^\n]+)/.exec(stderr())?.[1]
+        assert.ok(bound)
+        assert.equal(dirname(bound), parent)
+        assert.equal((await stat(parent)).mode & 0o7777, existingMode || 0o700)
+        assert.equal((await stat(bound)).mode & 0o077, 0)
+        assert.equal((await stat(bound + '.pid')).mode & 0o077, 0)
+        const probe = net.createConnection(bound)
+        try {
+          await once(probe, 'connect')
+        } finally {
+          probe.destroy()
+        }
+      } finally {
+        daemon.kill('SIGTERM')
+        await waitForExit(daemon, 4000)
+      }
+    }
+    const unlocked = join(root, 'shared')
+    await mkdir(unlocked)
+    await chmod(unlocked, 0o777)
+    const socket = join(unlocked, 's')
+    const daemon = startDaemon(join(root, 'unused-home'), socket)
+    const stderr = collectStderr(daemon)
+    try {
+      assert.equal(await waitForExit(daemon, 4000), 1)
+      assert.match(stderr(), /directory .* is writable by others/)
+      assert.equal((await stat(unlocked)).mode & 0o7777, 0o777)
+      assert.equal(existsSync(socket + '.pid'), false)
+    } finally {
+      if (daemon.exitCode === null && daemon.signalCode === null) daemon.kill('SIGKILL')
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('binding a private Unix socket restores the caller umask', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const dir = await mkdtemp('/tmp/ccx-mask-')
+  const previous = process.umask(0o002)
+  try {
+    const path = join(dir, 'socket')
+    const transport = await startWebSocketTransport(
+      `unix://${path}`,
+      () => {},
+      () => {},
+    )
+    try {
+      assert.equal(process.umask(), 0o002)
+      assert.equal((await stat(path)).mode & 0o077, 0)
+    } finally {
+      await transport.close()
+    }
+  } finally {
+    process.umask(previous)
+    await rm(dir, { recursive: true, force: true })
   }
 })
 

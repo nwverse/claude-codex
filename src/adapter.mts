@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-import { chmodSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { lstatSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { APP_PLUGIN_SERVER_ENV, setAppPluginConfigOverrides } from './app-plugin-mcp.mjs'
 import { sweepCliMcpConfigs } from './cli-mcp-config.mjs'
 import { reapOrphanedCliChildren } from './cli-orphans.mjs'
 import { daemonProbe, listening, startupConfigProbe } from './cli-probes.mjs'
 import { inheritedHooksWarning } from './inherited-config.mjs'
+import { replaceJsonFile } from './json-file.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
 import { SessionStore } from './store.mjs'
@@ -13,6 +13,7 @@ import {
   normalizeListenUrl,
   parseListenUrl,
   parseProxySockArg,
+  prepareUnixSocketParent,
   prepareWebSocketAuth,
   type RunningTransport,
   removeStaleSocket,
@@ -21,7 +22,7 @@ import {
   startWebSocketTransport,
 } from './transports.mjs'
 import type { RpcPeer } from './types.mjs'
-import { debugLog, defaultSocketPath, ensureParent, sleep } from './util.mjs'
+import { debugLog, defaultSocketPath, sleep } from './util.mjs'
 
 // Install global crash guards FIRST, before anything else can fail. Without
 // these, a single uncaught rejection or a synchronous EPIPE from a write to a
@@ -324,8 +325,8 @@ const DAEMON_STARTUP_GRACE_MS = 10_000
 async function ensureSingleUnixDaemon(listen: string): Promise<string> {
   const socketPath = listen === 'unix://' ? defaultSocketPath() : listen.slice('unix://'.length)
   const pidFile = `${socketPath}.pid`
-  ensureParent(socketPath)
-  const pid = readDaemonPid(pidFile)
+  const shared = checkOptions(() => prepareUnixSocketParent(socketPath))
+  const pid = checkOptions(() => readDaemonPid(pidFile, shared))
   if (pid !== null && (await daemonIsRunning(pid, socketPath, pidFile))) {
     process.stderr.write(
       `[claude-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`,
@@ -333,18 +334,24 @@ async function ensureSingleUnixDaemon(listen: string): Promise<string> {
     process.exit(0)
   }
   // The pid file may be stale. Only a socket can be reclaimed at the listen path.
-  checkOptions(() => removeStaleSocket(socketPath))
-  writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o600 })
-  try {
-    chmodSync(dirname(socketPath), 0o700)
-  } catch {}
+  checkOptions(() => removeStaleSocket(socketPath, shared))
+  // In a sticky temporary directory publish the decimal pid by rename, without
+  // following an entry which appeared while the daemon was starting.
+  if (shared) replaceJsonFile(pidFile, process.pid)
+  else writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o600 })
   return pidFile
 }
 
 // The pid in the file, or null when it is missing or could not name another
 // daemon. Number('') is 0, and kill(0) or kill(-n) signals a process group,
 // so only a plain positive pid other than init and this process counts.
-function readDaemonPid(pidFile: string): number | null {
+function readDaemonPid(pidFile: string, shared: boolean): number | null {
+  if (shared) {
+    const entry = lstatSync(pidFile, { throwIfNoEntry: false })
+    if (!entry) return null
+    if (!entry.isFile() || entry.uid !== process.getuid?.())
+      throw new Error(`expected an owned regular pid file at ${pidFile}`)
+  }
   let text: string
   try {
     text = readFileSync(pidFile, 'utf8').trim()

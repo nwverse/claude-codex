@@ -1,6 +1,7 @@
-import { lstatSync, rmSync } from 'node:fs'
+import { lstatSync, rmSync, statSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
+import { dirname } from 'node:path'
 import readline from 'node:readline'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { RpcPeer, WireMessage } from './types.mjs'
@@ -69,7 +70,7 @@ export interface RunningTransport {
 }
 
 export interface WebSocketTransportOptions {
-  // Applies to ws:// listeners; a unix socket is protected by its directory.
+  // Applies to ws:// listeners; Unix listeners use filesystem permissions.
   // Resolved from the environment when absent.
   auth?: WebSocketAuth
 }
@@ -151,9 +152,17 @@ export async function startWebSocketTransport(
     server.once('error', reject)
     server.once('listening', resolve)
     if (parsed.kind === 'unix') {
-      ensureParent(parsed.path)
-      removeStaleSocket(parsed.path)
-      server.listen(parsed.path)
+      const shared = prepareUnixSocketParent(parsed.path)
+      removeStaleSocket(parsed.path, shared)
+      // Bind with owner-only access even when the chosen directory is shared.
+      // Change the mask only for the synchronous bind, before user commands run.
+      const previous = process.umask()
+      try {
+        process.umask(previous | 0o177)
+        server.listen(parsed.path)
+      } finally {
+        process.umask(previous)
+      }
     } else {
       server.listen(parsed.port, unbracketHost(parsed.host))
     }
@@ -201,12 +210,30 @@ export async function startWebSocketTransport(
   }
 }
 
+// ensureParent creates missing directories with mode 0700. Leave existing
+// directories alone, including the system temp directory used for long homes.
+export function prepareUnixSocketParent(path: string): boolean {
+  ensureParent(path)
+  if (!process.getuid) return false
+  const parent = dirname(path)
+  const { mode } = statSync(parent)
+  if (!(mode & 0o022)) return false
+  if (!(mode & 0o1000)) {
+    throw new Error(
+      `Unix socket directory ${parent} is writable by others; choose a private directory or a sticky temporary directory`,
+    )
+  }
+  return true
+}
+
 // Clears the way for a listener at the path: a socket there is one an earlier
 // daemon left behind, anything else is the user's and is never removed.
-export function removeStaleSocket(path: string): void {
+export function removeStaleSocket(path: string, shared = false): void {
   const stat = lstatSync(path, { throwIfNoEntry: false })
   if (!stat) return
   if (!stat.isSocket()) throw new Error(`refusing to replace non-socket file at ${path}`)
+  if (shared && stat.uid !== process.getuid?.())
+    throw new Error(`Unix socket at ${path} belongs to another user`)
   rmSync(path, { force: true })
 }
 
