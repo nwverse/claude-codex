@@ -10821,6 +10821,200 @@ test('turn interrupt completes requested in-progress turn after reconnect', asyn
   }
 })
 
+test('stale interrupt for a completed turn leaves the active turn running', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import assert from 'node:assert/strict'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const running = new Map()
+      const interrupted = []
+      let runCount = 0
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context) {
+          runCount += 1
+          if (runCount > 1) {
+            await new Promise((resolve) => running.set(context.turnId, resolve))
+          }
+        },
+        async steer() {},
+        async interrupt(id) {
+          interrupted.push(id)
+        },
+        async stop() {},
+      })
+      const messages = []
+      const peer = {
+        id: 'peer',
+        send(message) {
+          messages.push(message)
+        },
+        close() {},
+      }
+      let requestId = 0
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const waitFor = async (condition) => {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (condition()) return
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+        throw new Error('timed out waiting for turn state')
+      }
+
+      await server.handle(peer, {
+        id: ++requestId,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      })
+      const threadId = response(requestId).result.thread.id
+      await server.handle(peer, {
+        id: ++requestId,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'complete turn A', text_elements: [] }],
+        },
+      })
+      const completedTurnId = response(requestId).result.turn.id
+      await waitFor(() => store.getTurn(completedTurnId)?.status === 'completed')
+
+      await server.handle(peer, {
+        id: ++requestId,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'keep turn B running', text_elements: [] }],
+        },
+      })
+      const activeTurnId = response(requestId).result.turn.id
+      await waitFor(() => running.has(activeTurnId))
+
+      await server.handle(peer, {
+        id: ++requestId,
+        method: 'turn/interrupt',
+        params: { threadId, turnId: completedTurnId },
+      })
+
+      assert.deepEqual(response(requestId).result, {})
+      assert.equal(store.getTurn(completedTurnId)?.status, 'completed')
+      assert.equal(store.getTurn(activeTurnId)?.status, 'inProgress')
+      assert.deepEqual(interrupted, [])
+      assert.equal(
+        messages.some(
+          (message) =>
+            'method' in message &&
+            message.method === 'turn/completed' &&
+            message.params.turn.id === activeTurnId,
+        ),
+        false,
+      )
+
+      running.get(activeTurnId)?.()
+      await waitFor(() => store.getTurn(activeTurnId)?.status === 'completed')
+      await server.stop()
+    `,
+      ],
+      { cwd: resolve('.'), stdio: 'pipe' },
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('stale interrupt for a background child turn that reported leaves its resumed turn running', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+
+    // Child turn A ends on the agent's report, which Claude answers in a
+    // second turn of its own.
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('background subagent check delay=300') },
+      }),
+    )
+    await reader.nextResponse(2)
+    const reported: any[] = []
+    for (let turns = 0; turns < 2; turns += 1)
+      reported.push(...(await readUntil(reader, turnCompleted(threadId))))
+    const childStarted = reported.find(
+      (m) => m.method === 'turn/started' && m.params.threadId !== threadId,
+    )
+    const childThreadId = childStarted.params.threadId
+    const firstChildTurnId = childStarted.params.turn.id
+    assert.equal(reported.find(turnCompleted(childThreadId))?.params.turn.status, 'completed')
+
+    // SendMessage resumes the agent as child turn B.
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, input: textInput('background message check delay=30000') },
+      }),
+    )
+    await reader.nextResponse(3)
+    const sent = await readUntil(reader, turnCompleted(threadId))
+    const resumedTurnId = sent.find(
+      (m) => m.method === 'turn/started' && m.params.threadId === childThreadId,
+    )?.params.turn.id
+    assert.ok(resumedTurnId)
+    assert.notEqual(resumedTurnId, firstChildTurnId)
+
+    // A Stop the App sent for turn A arrives late.
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/interrupt',
+        params: { threadId: childThreadId, turnId: firstChildTurnId },
+      }),
+    )
+    const stale = await readUntil(reader, (m) => m.id === 4 && m.method == null)
+    assert.deepEqual(stale.at(-1).result, {})
+    assert.equal(stale.some(turnCompleted(childThreadId)), false)
+    proc.stdin.write(json({ id: 5, method: 'thread/read', params: { threadId: childThreadId } }))
+    const child = (await reader.nextResponse(5)).result.thread
+    assert.deepEqual(
+      child.turns.map((turn: any) => turn.status),
+      ['completed', 'inProgress'],
+    )
+
+    // A Stop for turn B still stops it.
+    proc.stdin.write(
+      json({
+        id: 6,
+        method: 'turn/interrupt',
+        params: { threadId: childThreadId, turnId: resumedTurnId },
+      }),
+    )
+    const stopped = await readUntil(reader, (m) => m.id === 6 && m.method == null)
+    const resumedDone = stopped.find(turnCompleted(childThreadId))
+    assert.equal(resumedDone?.params.turn.id, resumedTurnId)
+    assert.equal(resumedDone?.params.turn.status, 'interrupted')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('runtime settlement cannot overwrite an interrupted turn', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   try {

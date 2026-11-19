@@ -163,6 +163,14 @@ versioning or publishing metadata.
   workflow ran again after a stall ends as failed too, as soon as the next
   attempt starts, saying the workflow ran the agent again, instead of staying
   open. Claude Code's progress report does not keep that attempt's own error.
+- The `codex` shim no longer runs itself in an endless loop when its `PATH`
+  directory is a symlink, when it is on `PATH` twice (also as another version
+  of it), or when `CODEX_REAL` names a shim: it passes over every copy of
+  itself, runs the real Codex CLI later on `PATH`, or exits 127 and says to
+  set `CODEX_REAL`. `claude-codex-mode set` and `model` shell-quote the model
+  and bridge cwd they write to `runtime.env`, so `$`, quotes and backticks in
+  them are read back as written instead of being expanded or run each time
+  the shim sources the file, and a value with a line break is refused.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.
@@ -707,6 +715,12 @@ versioning or publishing metadata.
   included, and "Allow for this session" covers only that call.
 - When Claude Code withdraws a pending approval or question mid-turn, its card
   closes, the call is declined, and a late Cancel no longer interrupts the turn.
+- A turn that ends while an approval, question or MCP form waits now takes the
+  card down in every client that shows it (`serverRequest/resolved`), leaves
+  the thread idle instead of reporting it active again, and no longer leaves
+  the call Claude made hanging. A `turn/interrupt` naming a turn that already
+  ended, a background agent's earlier run included, is ignored instead of
+  stopping the turn or run that came after it.
 - A thread whose approval policy is `never` keeps a read-only sandbox
   read-only: Read, Grep, Glob, LS and WebSearch run, and any other call is
   refused without a card, with Claude told the sandbox is read-only. Before,

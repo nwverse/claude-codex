@@ -8003,7 +8003,9 @@ export class CodexClaudeAppServer {
       throw error
     } finally {
       this.notify(peer, { method: 'serverRequest/resolved', params: { threadId, requestId } })
-      this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
+      // A card its turn took down leaves the thread idle.
+      if (this.activeTurnByThread.get(threadId) === turnId)
+        this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     }
     const decision = normalizeDecision(response)
     if (decision === 'acceptForSession' && userOnly) return { decision: 'accept' }
@@ -8246,7 +8248,9 @@ export class CodexClaudeAppServer {
       )
     } finally {
       this.notify(peer, { method: 'serverRequest/resolved', params: { threadId, requestId } })
-      this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
+      // A form or card its turn took down leaves the thread idle.
+      if (this.activeTurnByThread.get(threadId) === params.turnId)
+        this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     }
   }
 
@@ -8259,12 +8263,19 @@ export class CodexClaudeAppServer {
     // A background child has no runtime turn of its own; stop its task.
     const background = this.backgroundSubagents.get(threadId)
     if (background?.running) {
+      // A Stop for a run that already reported must not stop the run a
+      // later message resumed.
+      if (requestedTurnId && requestedTurnId !== background.context.childTurnId) return {}
       await this.stopBackgroundSubagent(background)
       return {}
     }
     // Neither does a foreground child: it runs inside its parent's turn.
     if (await this.stopForegroundSubagent(peer, threadId)) return {}
     const activeTurnId = this.activeTurnByThread.get(threadId)
+    // A Stop sent for a turn that has since ended must not stop the turn
+    // that replaced it: a queued message, a goal continuation or Claude's
+    // own follow-up starts within a tick of the last turn ending.
+    if (activeTurnId && requestedTurnId && requestedTurnId !== activeTurnId) return {}
     this.settleInterruptedTurn(peer, threadId, activeTurnId || requestedTurnId)
     // Persist the terminal state before asking the SDK to abort. A few SDK
     // versions deliver one or two buffered tool events during interrupt; the
@@ -10287,6 +10298,9 @@ export class CodexClaudeAppServer {
         continue
       this.pendingServerRequests.delete(id)
       debugLog('rpc.serverRequest.dropped', { threadId, turnId, id, method: pending.method })
+      // No answer: the caller declines, sends serverRequest/resolved so every
+      // follower takes its card down, and the runtime's call returns.
+      pending.resolve(null)
     }
   }
 
