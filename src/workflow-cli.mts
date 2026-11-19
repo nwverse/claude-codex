@@ -105,16 +105,32 @@ export async function runWorkflowCli(
     }
     case 'ingest-github': {
       const source = requiredOption(parsed, 'github-json')
-      const result = parseGitHubQueueJson(await readFile(source, 'utf8'), now)
-      const nextState = result.tasks.reduce((current, task) => upsertTask(current, task), state)
-      await store.write(nextState)
+      const result = parseGitHubQueueJson(
+        await readFile(source, 'utf8'),
+        now,
+        state.tasks.map((task) => task.id),
+      )
+      const knownTaskIds = new Set(state.tasks.map((task) => task.id))
+      const existing: string[] = [...result.existing]
+      const newTasks = result.tasks.filter((task) => {
+        if (knownTaskIds.has(task.id)) {
+          existing.push(task.id)
+          return false
+        }
+        knownTaskIds.add(task.id)
+        return true
+      })
+      const nextState = { ...state, tasks: [...state.tasks, ...newTasks] }
+      // A duplicate-only import leaves the saved state file untouched.
+      if (newTasks.length > 0 || existing.length === 0) await store.write(nextState)
       writeJson(io.stdout, {
         status: 'ingested',
         statePath: store.path,
         source,
-        enqueued: result.tasks.length,
+        enqueued: newTasks.length,
+        existing,
         skipped: result.skipped,
-        taskIds: result.tasks.map((task) => task.id),
+        taskIds: newTasks.map((task) => task.id),
       })
       return 0
     }
@@ -126,14 +142,23 @@ export async function runWorkflowCli(
 }
 
 function taskFromArgs(args: ParsedArgs, now: Date): WorkflowTask {
+  const prompt = requiredOption(args, 'prompt')
+  const priority = numberOption(args, 'priority') ?? 0
+  const maxAttempts = numberOption(args, 'max-attempts') ?? 3
+  if (!Number.isInteger(priority)) {
+    throw new WorkflowCliInputError('--priority must be an integer')
+  }
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new WorkflowCliInputError('--max-attempts must be a positive integer')
+  }
   return {
     id: stringOption(args, 'id') ?? newId(),
     status: 'queued',
     updatedAt: now.toISOString(),
-    prompt: requiredOption(args, 'prompt'),
-    priority: numberOption(args, 'priority') ?? 0,
+    prompt,
+    priority,
     attempts: 0,
-    maxAttempts: numberOption(args, 'max-attempts') ?? 3,
+    maxAttempts,
     lease: null,
     blockedReason: null,
     lastError: null,
