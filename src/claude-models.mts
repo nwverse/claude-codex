@@ -1,6 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { adapterHome, debugLog } from './util.mjs'
+import { SharedClaudeCatalog } from './shared-claude-catalog.mjs'
+import { debugLog } from './util.mjs'
 
 // Claude Code knows which reasoning efforts each model takes: 'max' only on
 // the models built for it, none at all on Haiku. It reports that per model
@@ -38,22 +37,12 @@ export interface ClaudeModel {
   readonly efforts: readonly ClaudeEffort[]
 }
 
-let cache: { path: string; models: ClaudeModel[] } | null = null
-
-function catalogPath(): string {
-  return join(adapterHome(), 'claude-models.json')
-}
+const catalog = new SharedClaudeCatalog('claude-models.json', (data) => ({
+  models: Array.isArray(data.models) ? data.models.flatMap(storedModel) : [],
+}))
 
 export function listClaudeModels(): readonly ClaudeModel[] {
-  const path = catalogPath()
-  if (cache?.path === path) return cache.models
-  let models: ClaudeModel[] = []
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { models?: unknown }
-    if (Array.isArray(parsed.models)) models = parsed.models.flatMap(storedModel)
-  } catch {}
-  cache = { path, models }
-  return models
+  return catalog.read().models
 }
 
 // `models` is Query.supportedModels(). Rows are merged by value: the CLI adds
@@ -64,24 +53,19 @@ export function noteClaudeModels(models: unknown): void {
   if (!Array.isArray(models) || !models.some(reportsEffort)) return
   const reported = models.flatMap(reportedModel)
   if (reported.length === 0) return
-  const current = listClaudeModels()
-  const next = [...current]
-  for (const model of reported) {
-    const index = next.findIndex((entry) => entry.value === model.value)
-    if (index === -1) next.push(model)
-    else next[index] = model
-  }
-  if (JSON.stringify(next) === JSON.stringify(current)) return
-  const path = catalogPath()
-  cache = { path, models: next }
-  try {
-    mkdirSync(adapterHome(), { recursive: true })
-    writeFileSync(path, `${JSON.stringify({ models: next }, null, 2)}\n`)
-  } catch (error) {
-    debugLog('claudeModels.saveFailed', { message: (error as Error).message })
-  }
-  debugLog('claudeModels.updated', {
-    models: next.map((model) => `${model.value}:${model.efforts.join('/') || 'none'}`),
+  catalog.update((current, save) => {
+    const next = [...current.models]
+    for (const model of reported) {
+      const index = next.findIndex((entry) => entry.value === model.value)
+      if (index === -1) next.push(model)
+      else next[index] = model
+    }
+    if (JSON.stringify(next) === JSON.stringify(current.models)) return
+    current.models = next
+    save()
+    debugLog('claudeModels.updated', {
+      models: next.map((model) => `${model.value}:${model.efforts.join('/') || 'none'}`),
+    })
   })
 }
 
@@ -91,8 +75,10 @@ export function noteClaudeModels(models: unknown): void {
 // still finds its row. 'sonnet[1m]' falls back to 'sonnet' for its efforts
 // when the CLI does not list the 1M variant; the description is then left out
 // because it would describe the other variant.
-export function reportedClaudeModel(sdkModel: string | null): ClaudeModel | null {
-  const models = listClaudeModels()
+export function reportedClaudeModel(
+  sdkModel: string | null,
+  models: readonly ClaudeModel[] = listClaudeModels(),
+): ClaudeModel | null {
   if (models.length === 0) return null
   const wanted = (sdkModel ?? 'default').trim().toLowerCase()
   const exact = findModel(models, wanted)

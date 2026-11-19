@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { SharedClaudeCatalog } from './shared-claude-catalog.mjs'
 import { adapterHome, debugLog, stableHash } from './util.mjs'
 
 // Claude Code's own prompt skills (/simplify, /code-review, ...) live inside
@@ -116,14 +117,10 @@ const MAX_FOLDERS = 64
 // being evicted.
 const REFRESH_MS = 24 * 60 * 60 * 1000
 
-let cache: { readonly path: string; readonly catalog: Catalog } | null = null
+const catalog = new SharedClaudeCatalog<Catalog>('claude-commands.json', decodeCatalog)
 // Manifests this process has written, by path.
 const written = new Map<string, string>()
 const listeners = new Set<() => void>()
-
-function catalogPath(): string {
-  return join(adapterHome(), 'claude-commands.json')
-}
 
 export function claudeCommandsDir(): string {
   return join(adapterHome(), 'claude-commands')
@@ -145,13 +142,7 @@ function folderManifestDir(folder: string): string {
   return join(claudeCommandsDir(), FOLDER_MANIFESTS, key)
 }
 
-function catalog(): Catalog {
-  const path = catalogPath()
-  if (cache?.path === path) return cache.catalog
-  let parsed: { commands?: unknown; folders?: unknown } = {}
-  try {
-    parsed = JSON.parse(readFileSync(path, 'utf8')) ?? {}
-  } catch {}
+function decodeCatalog(parsed: Record<string, unknown>): Catalog {
   const value: Catalog = {
     commands: Array.isArray(parsed.commands) ? commandList(parsed.commands) : [...SEED],
     folders: {},
@@ -164,13 +155,13 @@ function catalog(): Catalog {
       value.folders[folder] = { commands: commandList(entry.commands), at }
     }
   }
-  cache = { path, catalog: value }
-  for (const command of value.commands) writeManifest(command)
   return value
 }
 
 export function listClaudeCommands(): ClaudeCommand[] {
-  return catalog().commands
+  const commands = catalog.read().commands
+  for (const command of commands) writeManifest(command)
+  return commands
 }
 
 // The commands of the user, the project, plugins and MCP servers that Claude
@@ -178,7 +169,7 @@ export function listClaudeCommands(): ClaudeCommand[] {
 // in yet has none until its first turn starts.
 export function listFolderCommands(cwd: string): ClaudeCommand[] {
   const folder = resolve(cwd)
-  const commands = catalog().folders[folder]?.commands ?? []
+  const commands = catalog.read().folders[folder]?.commands ?? []
   for (const command of commands) writeManifest(command, folder)
   return commands
 }
@@ -201,13 +192,16 @@ export function noteClaudeCommands(
     commands.filter((command) => command.builtin === true && skillNames.has(command.name)),
   )
   if (next.length === 0) return
-  const current = catalog()
-  if (sameCommands(current.commands, next)) return
-  current.commands = next
-  save(current)
-  for (const command of next) writeManifest(command)
-  debugLog('claudeCommands.updated', { names: next.map((command) => command.name) })
-  announce()
+  let changed = false
+  catalog.update((current, save) => {
+    if (sameCommands(current.commands, next)) return
+    current.commands = next
+    save()
+    for (const command of next) writeManifest(command)
+    debugLog('claudeCommands.updated', { names: next.map((command) => command.name) })
+    changed = true
+  })
+  if (changed) announce()
 }
 
 // The commands a session in `cwd` reports beyond Claude Code's own, from
@@ -223,42 +217,36 @@ export function noteFolderCommands(cwd: string, commands: readonly ReportedComma
   )
   const next = commandList(commands.filter((command) => !builtins.has(command.name)))
   const folder = resolve(cwd)
-  const current = catalog()
-  const previous = current.folders[folder]
-  const changed = !sameCommands(previous?.commands ?? [], next)
-  if (!changed && (!previous || Date.now() - previous.at < REFRESH_MS)) return
-  if (next.length === 0) delete current.folders[folder]
-  else current.folders[folder] = { commands: next, at: Date.now() }
-  const kept = Object.entries(current.folders)
-    .sort(([, a], [, b]) => b.at - a.at)
-    .slice(0, MAX_FOLDERS)
-  const evicted = Object.keys(current.folders).filter(
-    (name) => !kept.some(([keptName]) => keptName === name),
-  )
-  current.folders = Object.fromEntries(kept)
-  save(current)
-  for (const name of evicted) pruneManifests(name, [])
-  if (!changed) return
-  pruneManifests(folder, next)
-  for (const command of next) writeManifest(command, folder)
-  debugLog('claudeCommands.folderUpdated', {
-    folder,
-    names: next.map((command) => command.name),
+  let notify = false
+  catalog.update((current, save) => {
+    const previous = current.folders[folder]
+    const changed = !sameCommands(previous?.commands ?? [], next)
+    if (!changed && (!previous || Date.now() - previous.at < REFRESH_MS)) return
+    if (next.length === 0) delete current.folders[folder]
+    else current.folders[folder] = { commands: next, at: Date.now() }
+    const kept = Object.entries(current.folders)
+      .sort(([, a], [, b]) => b.at - a.at)
+      .slice(0, MAX_FOLDERS)
+    const evicted = Object.keys(current.folders).filter(
+      (name) => !kept.some(([keptName]) => keptName === name),
+    )
+    current.folders = Object.fromEntries(kept)
+    save()
+    for (const name of evicted) pruneManifests(name, [])
+    if (!changed) return
+    pruneManifests(folder, next)
+    for (const command of next) writeManifest(command, folder)
+    debugLog('claudeCommands.folderUpdated', {
+      folder,
+      names: next.map((command) => command.name),
+    })
+    notify = true
   })
-  announce()
+  if (notify) announce()
 }
 
 function announce(): void {
   for (const listener of listeners) listener()
-}
-
-function save(value: Catalog): void {
-  try {
-    mkdirSync(adapterHome(), { recursive: true })
-    writeFileSync(catalogPath(), `${JSON.stringify(value, null, 2)}\n`)
-  } catch (error) {
-    debugLog('claudeCommands.saveFailed', { message: (error as Error).message })
-  }
 }
 
 // Valid, not the App's own, one row per name (the first), sorted.

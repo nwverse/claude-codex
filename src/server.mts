@@ -1,15 +1,5 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import {
-  accessSync,
-  constants,
-  existsSync,
-  lstatSync,
-  readFileSync,
-  readlinkSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -42,6 +32,7 @@ import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.
 import {
   DEFAULT_EFFORTS,
   defaultReasoningEffort,
+  listClaudeModels,
   reasoningEffortOptions,
   reportedClaudeModel,
 } from './claude-models.mjs'
@@ -99,6 +90,7 @@ import {
 } from './host-methods.mjs'
 import { IdleSleepGuard, type IdleSleepGuardOptions } from './idle-sleep.mjs'
 import { inheritedAgents, inheritedHooks, inheritedPermissionRules } from './inherited-config.mjs'
+import { jsonFileTarget, replaceJsonFile } from './json-file.mjs'
 import { LEADER_APP_THREAD_TOOLS, LeaderThreads } from './leader-tools.mjs'
 import {
   callMcpTool,
@@ -329,7 +321,6 @@ import {
   codexUserAgent,
   debugLog,
   defaultAllowedTools,
-  ensureParent,
   extractImageInputs,
   GENERIC_MODEL_DESCRIPTION,
   isCodexOpenAiModel,
@@ -8987,13 +8978,14 @@ export class CodexClaudeAppServer {
 
   private modelList(): unknown {
     const defaultModel = this.configModel
+    const reportedModels = listClaudeModels()
     // Each Claude model offers the efforts Claude Code reported for it: 'max'
     // where the model takes it, none on a model without effort. Ids and names
     // stay the adapter's own; only the placeholder description gives way to
     // Claude Code's.
     // App rule: model-efforts
     const claudeOptions = claudeModelOptions().map((option) => {
-      const reported = reportedClaudeModel(option.sdkModel)
+      const reported = reportedClaudeModel(option.sdkModel, reportedModels)
       return {
         ...option,
         displayName: harnessLabelsEnabled()
@@ -11003,26 +10995,7 @@ export class CodexClaudeAppServer {
       ...edits,
     }
     if (isDeepStrictEqual(config, saved)) return
-    // Rename next to the target so a linked config stays linked, including
-    // when a user creates the link before the first save.
-    let target = this.configPath
-    const links = new Set<string>()
-    while (lstatSync(target, { throwIfNoEntry: false })?.isSymbolicLink()) {
-      if (links.has(target)) throw new Error(`symbolic link loop at ${target}`)
-      links.add(target)
-      target = resolve(dirname(target), readlinkSync(target))
-    }
-    // Renaming can replace a read-only file in a writable directory. Honor
-    // the file permissions that a direct config write would enforce.
-    if (existsSync(target)) accessSync(target, constants.W_OK)
-    const temp = `${target}.${newId()}.tmp`
-    try {
-      ensureParent(target)
-      writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: 'wx' })
-      renameSync(temp, target)
-    } finally {
-      rmSync(temp, { force: true })
-    }
+    replaceJsonFile(jsonFileTarget(this.configPath), config)
   }
 }
 
