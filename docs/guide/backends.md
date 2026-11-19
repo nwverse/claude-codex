@@ -36,18 +36,22 @@ the Codex App's model menu:
 | Codex · … | `gpt-*` | a real `codex app-server` on the `openai` provider (ChatGPT login) |
 | Codex+AsterGate · … | `codex-ag:<model>` | a real `codex app-server` on `CLAUDE_CODEX_CODEX_AG_PROVIDER` |
 
-Codex threads keep their sidebar record in the adapter and their conversation
-in Codex: every request about the conversation is forwarded to the child, and
-Codex's approvals, questions and notifications come back to the App as Codex
-sends them. The real codex runs a thread's turns on its own config's
-provider, so there is one child per provider, started on first use and stopped
-after `CLAUDE_CODEX_NATIVE_IDLE_MS` of nothing to do.
+The adapter keeps a native chat’s sidebar entry, project and section. Codex
+stores its conversation and handles approvals, streamed items, forks and
+history. The adapter starts one child process per provider on demand and stops
+idle children after `CLAUDE_CODEX_NATIVE_IDLE_MS`.
 
-A chat keeps its harness once it has a conversation: another model of the
-same harness is fine, another harness asks for a new chat. A new chat's thread
-exists before the user picks a model, so its first turn's model still picks the
-harness. The App's title and summary helper threads run on Claude Code, so
-they never spend the ChatGPT login.
+The first turn of a new chat selects its harness. Later turns and forks can
+switch models within the same harness. Each native chat stores its original
+provider, including across restarts and changes to the provider setting.
+Existing `codex exec` conversations continue on their original route. Turning
+native mode off keeps native sidebar entries. Re-enable it to reopen them.
+
+Fresh title helpers run on Claude. A description fork of a native chat uses
+its parent’s provider and rollout, so that provider processes the description.
+Search within a native chat reads its Codex history. Global sidebar search
+covers its name and preview. The child receives App dynamic tools when
+`CLAUDE_CODEX_DYNAMIC_TOOLS=1`.
 
 ## Switching routes
 
@@ -105,6 +109,41 @@ appears.
 claude-codex-mode set agentapi opus
 ```
 
+### agent-http and agentapi settings
+
+`claude-codex-mode set agent-http|agentapi` writes the ones it needs into
+`runtime.env`; set the others there or in the login shell.
+
+```bash
+# Bridge address (default http://127.0.0.1:3284). The first one set wins:
+# CLAUDE_CODEX_HTTP_BASE_URL, CLAUDE_CODEX_AGENT_HTTP_URL, CLAUDE_CODEX_AGENTAPI_URL.
+export CLAUDE_CODEX_HTTP_BASE_URL="http://127.0.0.1:3284"
+
+# Start a bridge per thread cwd and model through `claude-codex-mode
+# ensure-bridge` (45 s limit) and use the URL it prints; off by default, and
+# set to 1 by `claude-codex-mode set agent-http|agentapi`. Title and summary
+# turns never reach a bridge; the adapter answers them itself. The helper
+# command defaults to claude-codex-mode.
+export CLAUDE_CODEX_HTTP_MANAGE_BRIDGE="1"
+export CLAUDE_CODEX_MODE_COMMAND="claude-codex-mode"
+
+# agent-http also listens on GET /events (on by default; 0 polls only).
+# agentapi always polls.
+export CLAUDE_CODEX_HTTP_USE_SSE="1"
+
+# Poll interval in ms (default 500, kept within 100..60000) and how long a turn
+# may run before it fails (default 300000, 5 minutes, kept within 1 s..24 h).
+export CLAUDE_CODEX_HTTP_POLL_MS="500"
+export CLAUDE_CODEX_HTTP_TIMEOUT_MS="300000"
+
+# Also send Ctrl-C to the bridge as a raw message on interrupt (off by default).
+export CLAUDE_CODEX_HTTP_INTERRUPT_RAW="1"
+```
+
+Flags count as on for `1`, `true`, `yes` or `on`; any other non-empty value is
+off. A number that does not parse falls back to the default, one out of range
+is clamped.
+
 ## claude-p
 
 Runs `claude-p --output-format json --input-file ...` per turn and emits the
@@ -116,4 +155,21 @@ final assistant text. Not streaming, no `turn/steer`; defaults to one-shot turns
 export CLAUDE_CODEX_RUNTIME_TYPE="claude-p"
 export CLAUDE_CODEX_CLAUDE_P_COMMAND="claude-p"
 # export CLAUDE_CODEX_CLAUDE_P_RESUME=1   # only after verifying --resume + --input-file
+
+# Extra arguments placed before the adapter's own (a JSON array of strings, or
+# split on whitespace).
+# export CLAUDE_CODEX_CLAUDE_P_ARGS='["--flag","value"]'
+
+# Per-turn limit in ms (default 300000, kept within 1 s..24 h). The adapter
+# passes it on as --timeout in seconds and ends the process tree when it runs
+# out. A run that hits that limit, or prints nothing but a StopTimeout on
+# stderr, is retried this many times (default 1, kept within 0..5).
+export CLAUDE_CODEX_CLAUDE_P_TIMEOUT_MS="300000"
+export CLAUDE_CODEX_CLAUDE_P_STOP_TIMEOUT_RETRIES="1"
+
+# Always pass --dangerously-skip-permissions (off by default), so Claude runs
+# every tool without asking whatever the thread's approval policy. Without it
+# the flag is passed only for turns with approval policy "never" or the
+# danger-full-access sandbox.
+# export CLAUDE_CODEX_CLAUDE_P_SKIP_PERMISSIONS=1
 ```

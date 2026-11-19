@@ -2,7 +2,7 @@ import { join } from 'node:path'
 import type { ClaudeEffort } from './claude-models.mjs'
 import { readTomlFile } from './codex-config.mjs'
 import { readText } from './project-instructions.mjs'
-import { codexHome } from './util.mjs'
+import { codexHome, isCodexOpenAiModel } from './util.mjs'
 
 // The three harnesses a chat can run on, picked by the model id in the App's
 // model menu:
@@ -82,7 +82,7 @@ export function codexCatalogModels(): CatalogModel[] {
   const configured = typeof config?.model_catalog_json === 'string' ? config.model_catalog_json : ''
   const path = configured || join(codexHome(), 'model_catalog.json')
   const text = readText(path)
-  const key = `${path}:${text?.length ?? -1}:${text?.slice(0, 64) ?? ''}`
+  const key = `${path}\0${text ?? ''}`
   if (catalogCache?.key === key) return catalogCache.models
   let models: CatalogModel[] = []
   try {
@@ -142,7 +142,7 @@ export function agModelOptions(): Array<{
     envList('CLAUDE_CODEX_CODEX_AG_MODELS') ??
     codexCatalogModels()
       .map((model) => model.slug)
-      .filter((slug) => !/^gpt[-_]/.test(slug) && !/^o[0-9]/.test(slug))
+      .filter((slug) => !isCodexOpenAiModel(slug))
   return ids.map((slug) => {
     const entry = catalogModel(slug)
     return {

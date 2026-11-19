@@ -559,11 +559,12 @@ export class MockRuntime implements ClaudeRuntime {
         input: { command: 'echo mock approval', description: 'mock approval command' },
       })
       // Mirror the real sidecar: when the Codex App pinned approvalPolicy=never
-      // or Full access, skip the permission round-trip and run the tool.
-      const autoApprove =
+      // or Full access, skip the permission round-trip and run the tool, unless
+      // a read-only sandbox refuses it.
+      const neverAsks =
         context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access'
-      const decision: PermissionDecision = autoApprove
-        ? { decision: 'accept' }
+      const decision: PermissionDecision = neverAsks
+        ? { decision: context.sandboxMode === 'read-only' ? 'decline' : 'accept' }
         : await handlers.onPermissionRequest({
             type: 'permission_request',
             requestId: `perm-${toolUseId}`,
@@ -1778,7 +1779,7 @@ export class MockRuntime implements ClaudeRuntime {
             id: 'q0',
             header: 'Auth',
             question: 'Which auth method do you want?',
-            isOther: false,
+            isOther: true,
             isSecret: false,
             options: [
               { label: 'OAuth', description: 'Use OAuth' },

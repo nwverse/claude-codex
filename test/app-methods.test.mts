@@ -7,6 +7,8 @@ import { delimiter, join, resolve } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { isDeepStrictEqual } from 'node:util'
+import { searchPattern } from '../src/thread-history.mjs'
+import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 // The App methods end to end: each test drives its own mock app-server over
 // stdio, the way the App does.
@@ -319,6 +321,36 @@ test('thread/list pages through threads created in the same second', async () =>
       [2, 2, 1],
     )
     assert.deepEqual(pages.flat().toSorted(), threads.toSorted())
+  })
+})
+
+test('thread/list filters by title and leaves out excluded threads before the limit', async () => {
+  await withServer(async (server) => {
+    const apples = await server.startThread()
+    await server.runTurn(apples, 'alpha apples')
+    const bananas = await server.startThread()
+    await server.runTurn(bananas, 'beta bananas')
+    const grapes = await server.startThread()
+    await server.runTurn(grapes, 'gamma grapes')
+
+    assert.deepEqual(ids(await server.request('thread/list', { searchTerm: 'BANANAS' })), [bananas])
+    await server.request('thread/name/set', { threadId: grapes, name: 'fruit salad' })
+    assert.deepEqual(ids(await server.request('thread/list', { searchTerm: 'salad' })), [grapes])
+    // The title filter does not read messages: thread/search does.
+    assert.deepEqual(ids(await server.request('thread/list', { searchTerm: 'agentMessage' })), [])
+    assert.equal((await server.request('thread/list', { searchTerm: ' ' })).data.length, 3)
+
+    // The page stays full: the exclusion applies before the limit.
+    const page = ids(await server.request('thread/list', { excludedThreadIds: [grapes], limit: 2 }))
+    assert.deepEqual(page, [bananas, apples])
+
+    const list = (excludedThreadIds: unknown) =>
+      server.request('thread/list', { excludedThreadIds })
+    await assert.rejects(list([apples, 7]), /excludedThreadIds must be an array/)
+    await assert.rejects(list(apples), /excludedThreadIds must be an array/)
+    const tooMany = Array.from({ length: 101 }, (_, index) => `missing-${index}`)
+    await assert.rejects(list(tooMany), /at most 100/)
+    assert.equal((await list(tooMany.slice(1))).data.length, 3)
   })
 })
 
@@ -1494,6 +1526,12 @@ test('threads carry the git info of their workspace without listing running git'
       const plain = await server.startThread()
       const resumed = await server.request('thread/resume', { threadId: plain, cwd: repo })
       assert.deepEqual(resumed.thread.gitInfo, later)
+      // A lookup that fails there drops the git info of the workspace it left.
+      const gone = await server.request('thread/resume', {
+        threadId: plain,
+        cwd: join(server.home, 'gone'),
+      })
+      assert.equal(gone.thread.gitInfo, null)
       const back = await server.request('thread/resume', { threadId: plain, cwd: server.home })
       assert.equal(back.thread.gitInfo, null)
     }, env)
@@ -1882,5 +1920,125 @@ test('thread/delete removes a thread with its subagents, even mid-turn', async (
     await delay(300)
     await assert.rejects(server.request('thread/read', { threadId: busy }), /unknown thread/)
     assert.deepEqual(ids(await server.request('thread/list')), [fork.id])
+  })
+})
+
+test('literal search patterns accept hyphens, slashes and regex metacharacters', () => {
+  for (const term of [
+    'claude-codex',
+    '2026-11-06',
+    '--force',
+    'path/to-file',
+    'a.*+[b](c)?^$|{d}\\e',
+  ]) {
+    const pattern = searchPattern(term)
+    assert.ok(pattern)
+    const match = pattern.exec(`prefix ${term.toUpperCase()} suffix`)
+    assert.equal(match?.[0], term.toUpperCase())
+  }
+  assert.equal(searchPattern('  '), null)
+})
+
+test('thread searches match hyphenated terms literally in both RPCs', async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+    const turnId = await server.runTurn(threadId, 'CLAUDE-CODEX 2026-11-06 --force path/to-file')
+    const other = await server.startThread()
+    await server.runTurn(other, 'unrelated content')
+    for (const term of ['claude-codex', '2026-11-06', '--force', 'path/to-file']) {
+      const threads = await server.request('thread/search', { searchTerm: term })
+      assert.deepEqual(
+        threads.data.map((entry: any) => entry.thread.id),
+        [threadId],
+      )
+      const occurrences = await server.request('thread/searchOccurrences', {
+        threadId,
+        searchTerm: term,
+      })
+      assert.equal(occurrences.data.length, 2)
+      for (const entry of occurrences.data) {
+        assert.equal(entry.turnCursor, turnId)
+        const { start, end } = entry.snippetMatchRange
+        assert.equal(entry.snippet.slice(start, end).toLowerCase(), term)
+      }
+    }
+  })
+})
+
+test('review and compaction reject a running turn without losing its output', async () => {
+  let release!: () => void
+  const released = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let started!: () => void
+  const ready = new Promise<void>((resolve) => {
+    started = resolve
+  })
+  let runs = 0
+  const runtime = scriptedRuntime(async (_context, handlers) => {
+    runs++
+    await handlers.onEvent({ type: 'text_delta', delta: 'Before. ' })
+    started()
+    await released
+    await handlers.onEvent({ type: 'text_delta', delta: 'After.' })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'Before. After.' })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    const turnId = await app.startTurn(threadId, 'hold the original turn')
+    await ready
+    try {
+      assert.equal(app.store.getTurn(turnId)?.status, 'inProgress')
+      for (const [method, message] of [
+        ['review/start', 'cannot start review'],
+        ['thread/compact/start', 'cannot compact'],
+      ] as const) {
+        const reply = await app.call(method, { threadId, target: { type: 'uncommittedChanges' } })
+        assert.equal(reply.error?.code, -32600)
+        assert.ok(reply.error?.message.includes(message))
+      }
+    } finally {
+      release()
+    }
+    assert.equal((await app.turnCompleted(turnId)).status, 'completed')
+    assert.equal(runs, 1)
+    const { thread } = await app.request('thread/read', { threadId, includeTurns: true })
+    assert.equal(thread.turns.length, 1)
+    assert.equal(thread.turns[0].id, turnId)
+    assert.equal(
+      thread.turns[0].items.find((item: any) => item.type === 'agentMessage')?.text,
+      'Before. After.',
+    )
+  })
+})
+
+test('loaded thread pagination advances, terminates and validates its cursor', async () => {
+  await withServer(async (server) => {
+    assert.deepEqual(await server.request('thread/loaded/list'), { data: [], nextCursor: null })
+    const ids = [await server.startThread(), await server.startThread(), await server.startThread()]
+    const first = await server.request('thread/loaded/list', { limit: 2 })
+    assert.deepEqual(first, { data: ids.slice(0, 2), nextCursor: '2' })
+    const second = await server.request('thread/loaded/list', {
+      limit: 2,
+      cursor: first.nextCursor,
+    })
+    assert.deepEqual(second, { data: ids.slice(2), nextCursor: null })
+    assert.deepEqual([...first.data, ...second.data], ids)
+    assert.deepEqual(await server.request('thread/loaded/list', { limit: 0 }), {
+      data: ids.slice(0, 1),
+      nextCursor: '1',
+    })
+    assert.deepEqual(await server.request('thread/loaded/list'), { data: ids, nextCursor: null })
+    assert.deepEqual(await server.request('thread/loaded/list', { cursor: '3', limit: 2 }), {
+      data: [],
+      nextCursor: null,
+    })
+    await assert.rejects(
+      server.request('thread/loaded/list', { cursor: 'invalid' }),
+      (error: unknown) =>
+        error instanceof RpcError &&
+        error.code === -32600 &&
+        error.message.includes('invalid loaded thread cursor'),
+    )
   })
 })

@@ -42,7 +42,7 @@ export class CodexAppServerChild {
   private pending = new Map<number, PendingChildRequest>()
   private nextId = 1
   private buffer = ''
-  private stderrTail = ''
+  private dataDeferred = false
   generation = 0
 
   constructor(provider: string, listener: CodexChildListener, options: CodexChildOptions) {
@@ -98,9 +98,9 @@ export class CodexAppServerChild {
     const binary = (this.options.binary ?? resolveCodexBinary)()
     if (!binary) throw new RpcError('no real codex binary found (set CODEX_REAL)')
     const args = [
+      ...(this.options.configOverrides?.() ?? []).flatMap((override) => ['-c', override]),
       '-c',
       `model_provider=${JSON.stringify(this.provider)}`,
-      ...(this.options.configOverrides?.() ?? []).flatMap((override) => ['-c', override]),
       'app-server',
       '--listen',
       'stdio://',
@@ -110,24 +110,26 @@ export class CodexAppServerChild {
     const generation = this.generation
     this.proc = proc
     this.buffer = ''
-    this.stderrTail = ''
+    this.dataDeferred = false
     debugLog('codexChild.spawn', { provider: this.provider, pid: proc.pid, generation })
     proc.stdout.setEncoding('utf8')
-    proc.stdout.on('data', (chunk: string) => this.onData(chunk))
-    proc.stderr.setEncoding('utf8')
-    proc.stderr.on('data', (chunk: string) => {
-      this.stderrTail = (this.stderrTail + chunk).slice(-4000)
-    })
+    proc.stdout.on('data', (chunk: string) => this.onData(proc, chunk))
+    proc.stderr.resume()
     proc.on('error', (error) => this.onExit(proc, generation, error.message))
     proc.on('exit', (code, signal) =>
       this.onExit(proc, generation, `exited (${signal ?? code ?? 'unknown'})`),
     )
     // A broken pipe on a dying child shows up as its exit.
     proc.stdin.on('error', () => {})
-    await this.send('initialize', {
-      clientInfo: this.options.clientInfo(),
-      capabilities: { experimentalApi: true },
-    })
+    try {
+      await this.send('initialize', {
+        clientInfo: this.options.clientInfo(),
+        capabilities: { experimentalApi: true },
+      })
+    } catch (error) {
+      if (this.proc === proc) this.stop()
+      throw error
+    }
     proc.stdin.write(`${JSON.stringify({ method: 'initialized' })}\n`)
   }
 
@@ -142,18 +144,30 @@ export class CodexAppServerChild {
     })
   }
 
-  private onData(chunk: string): void {
+  private onData(proc: ChildProcessWithoutNullStreams, chunk: string): void {
+    if (proc !== this.proc) return
     this.buffer += chunk
+    if (this.dataDeferred) return
     let newline = this.buffer.indexOf('\n')
     while (newline >= 0) {
       const line = this.buffer.slice(0, newline).trim()
       this.buffer = this.buffer.slice(newline + 1)
-      if (line) this.onLine(line)
+      if (line && this.onLine(line)) {
+        // Let the request's continuations update the mapping and send the App
+        // its response before dispatching notifications from the same read.
+        this.dataDeferred = true
+        setImmediate(() => {
+          if (proc !== this.proc) return
+          this.dataDeferred = false
+          this.onData(proc, '')
+        })
+        return
+      }
       newline = this.buffer.indexOf('\n')
     }
   }
 
-  private onLine(line: string): void {
+  private onLine(line: string): true | undefined {
     let message: Record<string, unknown>
     try {
       message = JSON.parse(line)
@@ -180,7 +194,7 @@ export class CodexAppServerChild {
           ),
         )
       } else pending.resolve(message.result)
-      return
+      return true
     }
     if (method) this.listener.notification(this.provider, method, message.params)
   }
@@ -188,8 +202,7 @@ export class CodexAppServerChild {
   private onExit(proc: ChildProcessWithoutNullStreams, generation: number, reason: string): void {
     if (this.proc !== proc) return
     this.proc = null
-    const detail = this.stderrTail.trim().split('\n').slice(-3).join(' | ')
-    debugLog('codexChild.exit', { provider: this.provider, generation, reason, stderr: detail })
+    debugLog('codexChild.exit', { provider: this.provider, generation, reason })
     this.failPending(`codex app-server (${this.provider}) ${reason}`)
     this.listener.exited(this.provider, generation, reason)
   }

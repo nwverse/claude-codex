@@ -8,11 +8,13 @@ import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import WebSocket from 'ws'
 import { MockRuntime } from '../src/mock-runtime.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type { RpcPeer, WireMessage } from '../src/types.mjs'
+import { nativeCodexTestEnv } from './support/native-codex-fixture.mjs'
 
 // Several clients following one thread: two App windows on one chat, or the
 // App and another app-server client on the same daemon.
@@ -122,6 +124,80 @@ test('a pending approval reaches a peer that opens the thread later', {
   })
 })
 
+test('a turn/start racing thread/delete does not bring the thread back', {
+  timeout: 20_000,
+}, async () => {
+  await withServer(async (connect) => {
+    const a = connect('a')
+    const b = connect('b')
+    const threadId = await startThread(a)
+    await b.request('thread/resume', { threadId })
+    await a.request('turn/start', { threadId, input: textInput('please run approval bash') })
+    await b.until((message) => message.method === 'item/commandExecution/requestApproval')
+
+    // The delete interrupts the running turn first; the turn/start arrives meanwhile.
+    const [deleted, started] = await Promise.allSettled([
+      a.request('thread/delete', { threadId }),
+      b.request('turn/start', { threadId, input: textInput('hi') }),
+    ])
+    assert.equal(deleted.status, 'fulfilled')
+    assert.equal(started.status, 'rejected')
+    assert.match(String(started.reason), /unknown thread/)
+    await b.until((message) => message.method === 'thread/deleted')
+
+    const listed = await b.request('thread/list', {})
+    assert.equal(
+      listed.result.data.some((thread: any) => thread.id === threadId),
+      false,
+      'the deleted thread stays deleted',
+    )
+  })
+})
+
+test('a turn/start on a subagent thread of a chat being deleted is refused', {
+  timeout: 20_000,
+}, async () => {
+  await withServer(async (connect) => {
+    const a = connect('a')
+    const b = connect('b')
+    const threadId = await startThread(a)
+    // thread/delete takes a chat's subagent threads with it.
+    const fork = await b.request('thread/fork', { threadId, threadSource: 'subagent' })
+    const childId = fork.result.thread.id
+    await a.request('turn/start', { threadId, input: textInput('please run approval bash') })
+    await a.until((message) => message.method === 'item/commandExecution/requestApproval')
+
+    const [deleted, started] = await Promise.allSettled([
+      a.request('thread/delete', { threadId }),
+      b.request('turn/start', { threadId: childId, input: textInput('hi') }),
+    ])
+    assert.equal(deleted.status, 'fulfilled')
+    assert.equal(started.status, 'rejected')
+    assert.match(String(started.reason), /unknown thread/)
+    await b.until(
+      (message) => message.method === 'thread/deleted' && message.params.threadId === childId,
+    )
+  })
+})
+
+test('a turn/start keeps a rename that lands while it starts', { timeout: 20_000 }, async () => {
+  await withServer(async (connect) => {
+    const a = connect('a')
+    const b = connect('b')
+    const threadId = await startThread(a)
+    await b.request('thread/resume', { threadId })
+
+    await Promise.all([
+      a.request('turn/start', { threadId, input: textInput('hello') }),
+      b.request('thread/name/set', { threadId, name: 'Renamed' }),
+    ])
+    await a.until((message) => message.method === 'turn/completed')
+
+    const read = await b.request('thread/read', { threadId })
+    assert.equal(read.result.thread.name, 'Renamed')
+  })
+})
+
 test('an approval left by an interrupted turn is not shown to a later follower', {
   timeout: 20_000,
 }, async () => {
@@ -154,6 +230,29 @@ test('an approval left by an interrupted turn is not shown to a later follower',
       [],
       'nothing follows a late answer',
     )
+  })
+})
+
+test('an interrupted turn takes its approval card down on every follower', {
+  timeout: 20_000,
+}, async () => {
+  await withServer(async (connect) => {
+    const a = connect('a')
+    const b = connect('b')
+    const threadId = await startThread(a)
+    await b.request('thread/resume', { threadId })
+    await a.request('turn/start', { threadId, input: textInput('please run approval bash') })
+    const isApproval = (message: any) => message.method === 'item/commandExecution/requestApproval'
+    const request = (await a.until(isApproval)).at(-1)
+    await b.until(isApproval)
+
+    await a.request('turn/interrupt', { threadId })
+    for (const peer of [a, b]) {
+      const resolved = (
+        await peer.until((message) => message.method === 'serverRequest/resolved')
+      ).at(-1)
+      assert.deepEqual(resolved.params, { threadId, requestId: request.id })
+    }
   })
 })
 
@@ -328,6 +427,72 @@ test('unsubscribing stops one follower only', { timeout: 20_000 }, async () => {
   })
 })
 
+test('a client that disconnects takes its terminals and command/exec processes with it', {
+  timeout: 30_000,
+}, async () => {
+  await withDaemon(async (connect) => {
+    const a = await connect()
+    const b = await connect()
+    // A shell that prints its pid, then waits as an open terminal does.
+    const shell = ['sh', '-c', 'echo $$; exec sleep 300']
+    const terminal = (processHandle: string, extra: Record<string, unknown> = {}) => ({
+      processHandle,
+      command: shell,
+      cwd: process.cwd(),
+      streamStdoutStderr: true,
+      streamStdin: true,
+      ...extra,
+    })
+    const pids: number[] = []
+    const pidOf = async (peer: Client, key: string, id: string) => {
+      pids.push(await printedPid(peer, key, id))
+      return pids.at(-1) as number
+    }
+    try {
+      // The App's terminal (a pty), a streamed process and a command/exec:
+      // none of them has a timeout.
+      await a.request('process/spawn', terminal('a-tty', { tty: true }))
+      const aTty = await pidOf(a, 'processHandle', 'a-tty')
+      await a.request('process/spawn', terminal('a-term'))
+      const aTerm = await pidOf(a, 'processHandle', 'a-term')
+      // command/exec answers when its process ends, which a closed client never hears.
+      a.request('command/exec', {
+        processId: 'a-exec',
+        command: shell,
+        cwd: process.cwd(),
+        streamStdoutStderr: true,
+        disableTimeout: true,
+      }).catch(() => {})
+      const aExec = await pidOf(a, 'processId', 'a-exec')
+      // One that ignores SIGTERM.
+      await a.request('process/spawn', {
+        ...terminal('a-stubborn'),
+        command: ['sh', '-c', 'trap "" TERM; echo $$; while :; do sleep 0.1; done'],
+      })
+      const aStubborn = await pidOf(a, 'processHandle', 'a-stubborn')
+      await b.request('process/spawn', terminal('b-term'))
+      const bTerm = await pidOf(b, 'processHandle', 'b-term')
+
+      a.close()
+      for (const pid of [aTty, aTerm, aExec])
+        assert.ok(await exits(pid, 5_000), `process ${pid} of the closed client still runs`)
+      assert.equal(isAlive(bTerm), true, 'the other client keeps its terminal')
+      // A's handles are free at once, even one whose process has yet to exit.
+      await b.request('process/spawn', terminal('a-stubborn'))
+      const reused = await pidOf(b, 'processHandle', 'a-stubborn')
+      assert.ok(await exits(aStubborn, 5_000), 'SIGKILL follows a SIGTERM that is ignored')
+      // The old process's late exit leaves the handle to the new one.
+      await delay(300)
+      await b.request('process/kill', { processHandle: 'a-stubborn' })
+      assert.ok(await exits(reused, 5_000), 'the reused handle names the new process')
+      await b.request('process/kill', { processHandle: 'b-term' })
+      assert.ok(await exits(bTerm, 5_000), 'process/kill ends the terminal')
+    } finally {
+      for (const pid of pids) if (isAlive(pid)) process.kill(pid, 'SIGKILL')
+    }
+  })
+})
+
 interface Client {
   readonly received: any[]
   receive(message: any): void
@@ -337,7 +502,10 @@ interface Client {
   close(): void
 }
 
-async function withDaemon(body: (connect: () => Promise<Client>) => Promise<void>): Promise<void> {
+async function withDaemon(
+  body: (connect: () => Promise<Client>) => Promise<void>,
+  configure?: (home: string) => NodeJS.ProcessEnv,
+): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
@@ -349,6 +517,7 @@ async function withDaemon(body: (connect: () => Promise<Client>) => Promise<void
       CLAUDE_CODEX_MOCK: '1',
       CLAUDE_CODEX_IDLE_EXIT_MS: '0',
       NODE_NO_WARNINGS: '1',
+      ...configure?.(home),
     },
   })
   const sockets: WebSocket[] = []
@@ -525,6 +694,39 @@ function userMessages(messages: any[]): any[] {
   )
 }
 
+// The pid a process printed first, from the output it streamed to `peer`.
+async function printedPid(peer: Client, key: string, id: string): Promise<number> {
+  const end = Date.now() + 10_000
+  while (Date.now() < end) {
+    const printed = peer.received
+      .filter((message) => message.params?.[key] === id && message.params.deltaBase64)
+      .map((message) => Buffer.from(message.params.deltaBase64, 'base64').toString('utf8'))
+      .join('')
+    const pid = /^\s*(\d+)\s/.exec(printed)?.[1]
+    if (pid) return Number(pid)
+    await delay(20)
+  }
+  throw new Error(`${id} printed no pid`)
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function exits(pid: number, timeoutMs: number): Promise<boolean> {
+  const end = Date.now() + timeoutMs
+  while (isAlive(pid)) {
+    if (Date.now() > end) return false
+    await delay(50)
+  }
+  return true
+}
+
 async function waitForListening(proc: ChildProcess): Promise<void> {
   let output = ''
   proc.stderr?.setEncoding('utf8')
@@ -540,3 +742,30 @@ async function waitForListening(proc: ChildProcess): Promise<void> {
     proc.once('exit', () => reject(new Error(`daemon exited: ${output}`)))
   })
 }
+
+test('both followers receive native turn events and the same approval resolves once', async () => {
+  await withDaemon(async (connect) => {
+    const a = await connect()
+    const b = await connect()
+    const threadId = (await a.request('thread/start', { model: 'gpt-6.1-sol' })).result.thread.id
+    await b.request('thread/resume', { threadId })
+    await a.request('turn/start', { threadId, input: textInput('hello') })
+    const isApproval = (message: any) => message.method === 'item/commandExecution/requestApproval'
+    const approval = (await a.until(isApproval)).at(-1)
+    assert.equal((await b.until(isApproval)).at(-1).id, approval.id)
+    await b.respond(approval.id, { decision: 'decline' })
+    for (const peer of [a, b]) {
+      const stream = await peer.until((message) => message.method === 'turn/completed')
+      assert.deepEqual(
+        stream
+          .filter((message) => message.method === 'serverRequest/resolved')
+          .map((message) => message.params.requestId),
+        [approval.id],
+      )
+      assert.equal(
+        stream.find((message) => message.method === 'item/agentMessage/delta').params.threadId,
+        threadId,
+      )
+    }
+  }, nativeCodexTestEnv)
+})

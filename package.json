@@ -4,17 +4,18 @@
   "private": true,
   "description": "Remote-mode adapter that lets the Codex desktop app talk to Claude Code through the Codex app-server protocol.",
   "license": "MIT",
-  "homepage": "https://fuergaosi233.github.io/claude-codex/",
+  "homepage": "https://nwverse.github.io/claude-codex/",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/fuergaosi233/claude-codex.git"
+    "url": "git+https://github.com/nwverse/claude-codex.git"
   },
   "bugs": {
-    "url": "https://github.com/fuergaosi233/claude-codex/issues"
+    "url": "https://github.com/nwverse/claude-codex/issues"
   },
   "type": "module",
   "bin": {
-    "claude-codex-adapter": "dist/src/adapter.mjs"
+    "claude-codex-adapter": "dist/src/adapter.mjs",
+    "claude-codex-isolated": "dist/src/isolated-launch.mjs"
   },
   "files": [
     "dist/",
@@ -26,7 +27,7 @@
   ],
   "scripts": {
     "dev": "tsx src/adapter.mts",
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('dist/test',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "biome lint src test scripts",
     "format": "biome format --write src test scripts",
@@ -37,7 +38,7 @@
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs",
-    "test": "npm run build && node --test dist/test/*.mjs",
+    "test": "npm run build && node --test --test-timeout=120000 --test-force-exit dist/test/*.mjs",
     "doctor": "node scripts/doctor.mjs",
     "workflow": "npm run build && node dist/src/workflow-cli.mjs",
     "workflow:schedule": "npm run workflow -- schedule",
@@ -51,13 +52,13 @@
     "generate:schema": "codex app-server generate-ts --experimental --out generated/codex-app-server"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.304",
-    "ws": "^8.21.3"
+    "@anthropic-ai/claude-agent-sdk": "^0.3.322",
+    "ws": "^8.23.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.14",
-    "@types/node": "^26.6.2",
-    "@types/ws": "^8.18.1",
+    "@biomejs/biome": "^2.6.4",
+    "@types/node": "^26.6.6",
+    "@types/ws": "^8.18.2",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitepress": "^1.6.4"

@@ -6,14 +6,20 @@ Tests run with the built-in `node:test` runner against compiled output. See the
 ## Layout
 
 - `*.test.mts` — sources compiled to `dist/test/*.mjs`.
+- `adapter-*.test.mts` — end-to-end suites that spawn the mock adapter, split
+  by area (protocol, models-config, daemon, turn-items, subagents, approvals,
+  turn-lifecycle, mcp-skills).
+- `support/` — shared helpers, such as `support/adapter-harness.mts` for the
+  `adapter-*` suites. They compile to `dist/test/support/`, outside the
+  `npm test` glob, so they never run as suites.
 - `fixtures/` — shared test fixtures.
 
 ## Running
 
 ```bash
-npm test            # builds, then runs node --test dist/test/*.mjs
+npm test            # builds, then runs node --test dist/test/*.mjs, 2 min per test
 npm run build       # if you want to compile without running
-node --test dist/test/adapter.test.mjs   # a single suite, after a build
+node --test dist/test/adapter-daemon.test.mjs   # a single suite, after a build
 ```
 
 ## Conventions
@@ -24,4 +30,12 @@ node --test dist/test/adapter.test.mjs   # a single suite, after a build
 - Use `CLAUDE_CODEX_MOCK=1` to exercise protocol behavior without Claude
   credentials. Credentialed end-to-end checks live in `scripts/acceptance-*`,
   not here.
+- Keep suites independent of the developer's machine: a suite that runs
+  adapter code in-process sets `process.env.CLAUDE_CODEX_DEBUG_LOG = '0'` (or
+  a temp `CLAUDE_CODEX_HOME`) so nothing lands in the real `~/.codex`, and a
+  test `git commit` passes `-c commit.gpgsign=false`.
 - Add new suites as `<area>.test.mts`; the `npm test` glob picks them up.
+- `node --test` runs files in parallel but the tests in one file in order, so
+  the slowest file sets the wall time. Add a slow mock-adapter test to the
+  `adapter-*` suite of its area, or start a new one, rather than growing a
+  single suite.

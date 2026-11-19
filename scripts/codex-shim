@@ -18,20 +18,24 @@ COMPAT_VERSION="${CLAUDE_CODEX_COMPAT_VERSION:-${CODEX_SHIM_COMPAT_VERSION:-0.16
 VERSION_SUFFIX="${CLAUDE_CODEX_VERSION_SUFFIX-claude-codex}"
 MODE="${CLAUDE_CODEX_ROUTE:-${CLAUDE_CODEX_RUNTIME_TYPE:-agent-sdk-sidecar}}"
 
+# Whether $1 is this shim, also through a symlinked PATH dir or a link (-ef),
+# or any other copy of it, even of another version (by the marker that
+# resolveCodexBinary() in src/util.mts skips): exec'ing one loops forever.
+is_codex_shim() {
+  [ "$1" -ef "${BASH_SOURCE[0]}" ] || head -c 512 "$1" 2>/dev/null | grep -q CLAUDE_CODEX_ADAPTER
+}
+
 resolve_real_codex() {
-  if [ -n "${CODEX_REAL:-}" ] && [ -x "$CODEX_REAL" ]; then
+  if [ -n "${CODEX_REAL:-}" ] && [ -x "$CODEX_REAL" ] && ! is_codex_shim "$CODEX_REAL"; then
     printf '%s\n' "$CODEX_REAL"
     return 0
   fi
 
-  local self
-  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
-
   local candidate
   while IFS= read -r candidate; do
     [ -n "$candidate" ] || continue
-    [ "$candidate" != "$self" ] || continue
     [ -x "$candidate" ] || continue
+    is_codex_shim "$candidate" && continue
     printf '%s\n' "$candidate"
     return 0
   done < <({ type -P -a codex 2>/dev/null || which -a codex 2>/dev/null; } | awk '!seen[$0]++')
@@ -82,6 +86,21 @@ no_daemon_running() {
   echo "Error: no app-server daemon is running at $socket" >&2
 }
 
+# `app-server generate-ts` / `generate-json-schema` (and the hidden
+# `generate-internal-json-schema`) write the protocol bindings and exit. The
+# adapter has no such subcommands (it would start a stdio server instead), so
+# these always belong to the real codex.
+is_schema_generator() {
+  shift
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      generate-ts | generate-json-schema | generate-internal-json-schema) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 REAL_CODEX="$(resolve_real_codex || true)"
 
 case "${1:-}" in
@@ -98,6 +117,13 @@ case "${1:-}" in
         exec "$REAL_CODEX" "$@"
       fi
       echo "codex shim is in native Codex mode, but no real codex binary was found; set CODEX_REAL" >&2
+      exit 127
+    fi
+    if is_schema_generator "$@"; then
+      if [ -n "$REAL_CODEX" ]; then
+        exec "$REAL_CODEX" "$@"
+      fi
+      echo "codex app-server schema generation needs the real codex binary, but none was found; set CODEX_REAL" >&2
       exit 127
     fi
     # One-shot probes the shim can settle on its own. The adapter answers

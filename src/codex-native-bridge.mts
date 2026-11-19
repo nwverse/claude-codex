@@ -5,10 +5,10 @@ import {
   codexProviderForModel,
   isAgModel,
 } from './harness-models.mjs'
-import { RpcError, SERVER_ERROR } from './host-methods.mjs'
+import { invalidRequest, RpcError, SERVER_ERROR } from './host-methods.mjs'
 import type { SessionStore } from './store.mjs'
 import type { RpcPeer, ThreadRecord } from './types.mjs'
-import { debugLog } from './util.mjs'
+import { debugLog, isCodexOpenAiModel } from './util.mjs'
 
 // Codex threads on the native harness: the adapter keeps the thread's sidebar
 // record (name, project, section, archive, preview), a real `codex
@@ -30,14 +30,16 @@ export interface CodexBridgeHost {
   readonly detachedPeer: RpcPeer
   subscribe(threadId: string, peer: RpcPeer): void
   notifyThread(threadId: string, notification: { method: string; params: unknown }): void
+  sidebarMetadata(thread: ThreadRecord): Record<string, unknown>
   notifyAll(notification: { method: string; params: unknown }): void
   sendServerRequest(peer: RpcPeer, method: string, id: string, params: unknown): Promise<unknown>
   dropServerRequest(id: string): void
   // Validates and applies a model change the way the model menu would, and
   // saves the thread; throws the menu's refusal.
-  applyModel(thread: ThreadRecord, params: Record<string, unknown>): void
+  applyModel(thread: ThreadRecord, params: Record<string, unknown>, persist: boolean): void
   clientInfo(): Record<string, unknown>
   configOverrides(): readonly string[]
+  finishMirror(peer: RpcPeer, method: string, params: Record<string, unknown>): unknown
   checkIdle(): void
 }
 
@@ -76,7 +78,11 @@ const FORWARDED = new Set([
 
 // The adapter answers these from its own record; the child hears them too so
 // its rollout stays in step.
-const MIRRORED = new Set(['thread/name/set', 'thread/archive', 'thread/unarchive'])
+const MIRRORED = new Set(['thread/name/set', 'thread/archive', 'thread/unarchive', 'thread/delete'])
+
+export function isNativeConversationMethod(method: string): boolean {
+  return FORWARDED.has(method) || MIRRORED.has(method)
+}
 
 // About the child process itself, not about a thread the App shows.
 const DROPPED_NOTIFICATIONS = [
@@ -102,11 +108,12 @@ export class CodexNativeBridge {
   private readonly adapterIdByChild = new Map<string, string>()
   // provider -> child generation -> threads loaded in that child.
   private readonly loaded = new Map<string, { generation: number; ids: Set<string> }>()
-  // Threads the child made for the adapter; their thread/started is the
-  // adapter's to announce.
-  private readonly ownStarts = new Set<string>()
+  // Completed turns reported before turn/start answers, while the App waits for its id.
+  private readonly startingTurns = new Map<string, Set<string>>()
+  private requestsInFlight = 0
   private readonly activeTurns = new Map<string, ActiveTurn>()
-  private readonly pendingRequests = new Set<string>()
+  private readonly pendingRequests = new Map<string, { threadId: string; turnId: string | null }>()
+  private readonly changesInFlight = new Set<string>()
   private idleTimer: NodeJS.Timeout | null = null
 
   constructor(host: CodexBridgeHost) {
@@ -114,52 +121,124 @@ export class CodexNativeBridge {
   }
 
   busy(): boolean {
-    return this.activeTurns.size > 0 || this.pendingRequests.size > 0
+    return this.requestsInFlight > 0 || this.activeTurns.size > 0 || this.pendingRequests.size > 0
   }
 
   stop(): void {
     this.clearIdleTimer()
     for (const child of this.children.values()) child.stop()
     this.children.clear()
+    for (const id of this.pendingRequests.keys()) this.finishRequest(id)
+    this.activeTurns.clear()
   }
 
   // The thread's record when the native harness runs it.
   owned(threadId: string): ThreadRecord | null {
     if (!threadId) return null
     const thread = this.host.store.getThread(threadId)
-    return thread?.runtimeBackend === 'codex' ? thread : null
+    if (!thread || thread.runtimeBackend !== 'codex') return null
+    if (thread.nativeCodexProvider && thread.codexSessionId) {
+      this.adapterIdByChild.set(thread.codexSessionId, thread.id)
+      return thread
+    }
+    // Existing exec chats have no record of the Codex provider that owns
+    // their rollout. Continue them through exec and its original config.
+    if (thread.codexSessionId || thread.forkedFromId || this.host.store.lastTurn(threadId))
+      return null
+    return isCodexOpenAiModel(thread.model) ? thread : null
   }
 
   async route(peer: RpcPeer, method: string, rawParams: unknown): Promise<unknown> {
-    if (!FORWARDED.has(method) && !MIRRORED.has(method) && method !== 'thread/delete')
-      return NOT_ROUTED
+    if (!isNativeConversationMethod(method)) return NOT_ROUTED
     const params = asRecord(rawParams)
-    const threadId = typeof params.threadId === 'string' ? params.threadId : ''
-    // The model menu may move a new chat between harnesses before its first
-    // message, so a model change is applied first, whichever harness has it.
-    if ((method === 'thread/settings/update' || method === 'turn/start') && hasModel(params)) {
-      const any = threadId ? this.host.store.getThread(threadId) : null
-      if (any && (any.runtimeBackend === 'codex' || modelIsCodex(params)))
-        this.host.applyModel(any, params)
+    const threadId = stringField(params.threadId)
+    if (!threadId) return NOT_ROUTED
+    if (
+      this.changesInFlight.has(threadId) ||
+      (this.startingTurns.has(threadId) &&
+        (method === 'turn/start' || method === 'thread/settings/update' || MIRRORED.has(method)))
+    )
+      throw invalidRequest('another change is in progress on this thread; retry when it finishes')
+    const model = requestedModel(params)
+    if (model && ['thread/resume', 'thread/settings/update', 'turn/start'].includes(method)) {
+      const current = this.host.store.getThread(threadId)
+      if (current?.nativeCodexProvider) {
+        // Validate before forwarding. Commit the change only if the child accepts it.
+        this.host.applyModel(current, params, false)
+      } else if (
+        current &&
+        !current.codexSessionId &&
+        !current.ephemeral &&
+        (current.runtimeBackend === 'codex' || isCodexOpenAiModel(model))
+      ) {
+        this.host.applyModel(current, params, true)
+      }
     }
     const thread = this.owned(threadId)
-    if (!thread) return NOT_ROUTED
-    if (MIRRORED.has(method) || method === 'thread/delete') {
-      if (thread.codexSessionId) void this.forwardQuietly(thread, method, params)
-      return NOT_ROUTED
-    }
-    // A model change is the model menu's: the adapter checks it against the
-    // thread's harness first.
-    if (!thread.codexSessionId) {
-      // Nothing in Codex yet: only a turn makes the conversation.
-      if (method !== 'turn/start') return NOT_ROUTED
-      await this.createChildThread(thread)
+    if (!thread || (!thread.codexSessionId && method !== 'turn/start')) return NOT_ROUTED
+    if (method === 'thread/fork') {
+      // A description fork needs its native parent's conversation. The App's
+      // default summary model can belong to a different provider.
+      if (params.ephemeral === true && params.threadSource === 'thread_description')
+        params.model = thread.model
+      const model = requestedModel(params)
+      if (model && (!isCodexOpenAiModel(model) || isAgModel(model) !== isAgModel(thread.model)))
+        throw invalidRequest(
+          'a fork uses its parent’s Codex provider; start a new chat to switch providers',
+        )
     }
     this.host.subscribe(thread.id, peer)
+    this.requestsInFlight += 1
     this.clearIdleTimer()
+    if (method === 'turn/start') this.startingTurns.set(threadId, new Set())
+    if (MIRRORED.has(method)) this.changesInFlight.add(threadId)
     try {
-      return await this.forward(thread, method, params)
+      if (!thread.codexSessionId) await this.createChildThread(thread)
+      if (MIRRORED.has(method)) {
+        // Keep the local sidebar record until the owner of the rollout accepts the change.
+        const child = this.child(thread.nativeCodexProvider as string)
+        const childId = thread.codexSessionId as string
+        const active = this.activeTurns.get(threadId)
+        const stopsWork = method === 'thread/archive' || method === 'thread/delete'
+        if (stopsWork && active) {
+          try {
+            await child.request('turn/interrupt', { threadId: childId, turnId: active.turnId })
+          } catch (error) {
+            if (this.activeTurns.get(threadId) === active) throw error
+          }
+        }
+        const result = asRecord(
+          await child.request(method, this.inbound(params, thread.id, childId, child.provider)),
+        )
+        if (stopsWork) {
+          this.activeTurns.delete(threadId)
+          this.finishThreadRequests(threadId)
+          this.loaded.get(child.provider)?.ids.delete(childId)
+        }
+        const local = await this.host.finishMirror(peer, method, params)
+        if (method === 'thread/unarchive') {
+          const history = asRecord(result.thread)
+          if (Array.isArray(history.turns) && history.turns.length)
+            return this.outboundResult(result, child.provider)
+          const resumed = asRecord(await this.forward(thread, 'thread/resume', { threadId }))
+          return { thread: resumed.thread }
+        }
+        if (method === 'thread/delete')
+          this.adapterIdByChild.delete(thread.codexSessionId as string)
+        return local
+      }
+      const result = await this.forward(thread, method, params)
+      if (method === 'thread/settings/update') return NOT_ROUTED
+      if (model && (method === 'turn/start' || method === 'thread/resume')) {
+        const current = this.host.store.getThread(threadId)
+        if (current) this.host.applyModel(current, params, true)
+      }
+      return result
     } finally {
+      if (MIRRORED.has(method)) this.changesInFlight.delete(threadId)
+      if (method === 'turn/start') this.startingTurns.delete(threadId)
+      this.requestsInFlight -= 1
+      this.host.checkIdle()
       this.scheduleIdleStop()
     }
   }
@@ -189,12 +268,21 @@ export class CodexNativeBridge {
     method: string,
     params: Record<string, unknown>,
   ): Promise<unknown> {
-    const provider = codexProviderForModel(thread.model)
+    const provider = thread.nativeCodexProvider as string
     const child = this.child(provider)
     const childId = thread.codexSessionId as string
     if (method !== 'thread/resume') await this.ensureLoaded(child, thread)
     if (method === 'turn/start' && !thread.preview) this.rememberPreview(thread, params)
-    const outgoing = this.inbound(params, thread.id, childId)
+    const outgoing = asRecord(this.inbound(params, thread.id, childId, provider))
+    if (method === 'thread/resume' || method === 'thread/fork') {
+      // Both fields override threadId in Codex. An adapter id names a single
+      // persisted rollout and the provider that created it.
+      delete outgoing.path
+      delete outgoing.history
+      outgoing.modelProvider = provider
+      if (outgoing.config)
+        outgoing.config = { ...asRecord(outgoing.config), model_provider: provider }
+    }
     let result: unknown
     try {
       result = await child.request(method, outgoing)
@@ -203,25 +291,29 @@ export class CodexNativeBridge {
     }
     if (method === 'thread/resume') this.markLoaded(child, childId)
     if (method === 'thread/fork') return this.adoptFork(thread, result, params, child)
+    if (method === 'review/start') {
+      const reviewId = stringField(asRecord(result).reviewThreadId)
+      if (reviewId && reviewId !== childId)
+        this.adoptFork(thread, { thread: { id: reviewId, modelProvider: provider } }, {}, child)
+    }
     if (method === 'turn/start') {
       const turnId = stringField(asRecord(asRecord(result).turn).id)
-      if (turnId) this.activeTurns.set(thread.id, { turnId, provider })
+      const status = asRecord(asRecord(result).turn).status
+      if (turnId && status === 'inProgress' && !this.startingTurns.get(thread.id)?.has(turnId))
+        this.activeTurns.set(thread.id, { turnId, provider })
     }
-    return this.outbound(result, provider)
+    return this.outboundResult(result, provider)
   }
 
-  private async forwardQuietly(
-    thread: ThreadRecord,
-    method: string,
-    params: Record<string, unknown>,
-  ): Promise<void> {
-    try {
-      const child = this.child(codexProviderForModel(thread.model))
-      await this.ensureLoaded(child, thread)
-      await child.request(method, this.inbound(params, thread.id, thread.codexSessionId as string))
-    } catch (error) {
-      debugLog('codexBridge.mirror_failed', { method, threadId: thread.id, error: String(error) })
-    }
+  private outboundResult(result: unknown, provider: string): unknown {
+    const outgoing = this.outbound(result, provider)
+    const fields = asRecord(outgoing)
+    const native = asRecord(fields.thread)
+    const id = stringField(native.id)
+    const thread = id ? this.host.store.getThread(id) : null
+    return thread
+      ? { ...fields, thread: { ...native, ...this.host.sidebarMetadata(thread) } }
+      : outgoing
   }
 
   private async createChildThread(thread: ThreadRecord): Promise<void> {
@@ -233,7 +325,11 @@ export class CodexNativeBridge {
         modelProvider: provider,
         cwd: thread.cwd,
         approvalPolicy: thread.approvalPolicy,
-        sandbox: thread.sandboxMode,
+        ...(thread.permissionProfileId
+          ? { permissions: thread.permissionProfileId }
+          : { sandbox: thread.sandboxMode }),
+        ...(thread.approvalsReviewer ? { approvalsReviewer: thread.approvalsReviewer } : {}),
+        dynamicTools: this.host.store.getDynamicTools(thread.id),
         ...(thread.baseInstructions ? { baseInstructions: thread.baseInstructions } : {}),
         ...(thread.developerInstructions
           ? { developerInstructions: thread.developerInstructions }
@@ -244,10 +340,15 @@ export class CodexNativeBridge {
     )
     const childId = stringField(asRecord(result.thread).id)
     if (!childId) throw new RpcError('codex app-server started no thread')
-    this.ownStarts.add(childId)
+    if (!this.host.store.bindNativeCodexThread(thread, provider, childId)) {
+      // A second adapter or a sidebar change won while the child started.
+      // Nobody sent a turn to this empty rollout.
+      await child.request('thread/archive', { threadId: childId }).catch(() => {})
+      throw invalidRequest('the thread changed while Codex was starting; retry the turn')
+    }
+    thread.nativeCodexProvider = provider
     if (childId !== thread.id) this.adapterIdByChild.set(childId, thread.id)
     thread.codexSessionId = childId
-    this.host.store.upsertThread(thread)
     this.markLoaded(child, childId)
     debugLog('codexBridge.thread', { threadId: thread.id, childId, provider })
   }
@@ -263,7 +364,6 @@ export class CodexNativeBridge {
     const record = asRecord(result)
     const forkId = stringField(asRecord(record.thread).id)
     if (forkId && !this.host.store.getThread(forkId)) {
-      this.ownStarts.add(forkId)
       const model = typeof params.model === 'string' && params.model ? params.model : parent.model
       this.host.store.upsertThread({
         ...parent,
@@ -277,15 +377,25 @@ export class CodexNativeBridge {
         name: null,
         model: isAgModel(parent.model) && !isAgModel(model) ? `${AG_MODEL_PREFIX}${model}` : model,
         ephemeral: params.ephemeral === true,
+        threadSource: stringField(params.threadSource) ?? parent.threadSource,
+        agentNickname: stringField(asRecord(record.thread).agentNickname),
+        agentRole: stringField(asRecord(record.thread).agentRole),
         codexSessionId: forkId,
         claudeSessionId: null,
         createdAt: Math.floor(Date.now() / 1000),
         updatedAt: Math.floor(Date.now() / 1000),
         status: { type: 'idle' },
       })
+      if (parent.projectId) this.host.store.setThreadProject(forkId, parent.projectId)
+      this.host.store.putDynamicTools(forkId, this.host.store.getDynamicTools(parent.id))
+      if (!params.ephemeral) this.host.store.copyThreadAttachments(parent.id, forkId)
       this.markLoaded(child, forkId)
+      this.host.notifyThread(parent.id, {
+        method: 'thread/started',
+        params: { thread: this.outbound(record.thread, child.provider) },
+      })
     }
-    return this.outbound(result, child.provider)
+    return this.outboundResult(result, child.provider)
   }
 
   private async ensureLoaded(child: CodexAppServerChild, thread: ThreadRecord): Promise<void> {
@@ -318,8 +428,7 @@ export class CodexNativeBridge {
       .join(' ')
       .trim()
     if (!text) return
-    thread.preview = text.slice(0, 200)
-    this.host.store.upsertThread(thread)
+    this.host.store.rememberNativePreview(thread.id, text.slice(0, 200))
   }
 
   private child(provider: string): CodexAppServerChild {
@@ -348,9 +457,16 @@ export class CodexNativeBridge {
   }
 
   // Adapter ids -> child ids, and the harness prefix off model ids.
-  private inbound(params: Record<string, unknown>, adapterId: string, childId: string): unknown {
+  private inbound(
+    params: Record<string, unknown>,
+    adapterId: string,
+    childId: string,
+    provider: string,
+  ): unknown {
     return rewrite(params, (value, key) => {
-      if (value === adapterId) return childId
+      if ((key === 'modelProvider' || key === 'model_provider') && value === 'claude-code')
+        return provider
+      if (value === adapterId && isThreadIdField(key)) return childId
       if ((key === 'model' || key === 'toModel') && isAgModel(value)) return bareCodexModel(value)
       return value
     })
@@ -364,7 +480,7 @@ export class CodexNativeBridge {
     const ag = provider !== 'openai'
     return rewrite(payload, (value, key) => {
       const mapped = this.adapterIdByChild.get(value)
-      if (mapped) return mapped
+      if (mapped && isThreadIdField(key)) return mapped
       if (key === 'modelProvider' || key === 'model_provider') return 'claude-code'
       if (
         ag &&
@@ -381,24 +497,28 @@ export class CodexNativeBridge {
     if (DROPPED_NOTIFICATIONS.some((prefix) => method.startsWith(prefix))) return
     const fields = asRecord(params)
     const childThreadId = stringField(fields.threadId) ?? stringField(asRecord(fields.thread).id)
-    if (method === 'thread/started' && childThreadId && this.ownStarts.has(childThreadId)) return
+    // The adapter announces the sidebar thread. The native child can report
+    // thread/started before its thread/start response supplies the child id.
+    if (method === 'thread/started') {
+      const record = asRecord(fields.thread)
+      const parentId = stringField(record.parentThreadId)
+      const parent = parentId ? this.host.store.getThread(this.adapterId(parentId)) : null
+      if (parent?.nativeCodexProvider === provider && childThreadId)
+        this.adoptFork(parent, fields, { threadSource: 'subagent' }, this.child(provider))
+      return
+    }
     if (method === 'serverRequest/resolved') {
       const id = this.resolvedRequestId(provider, fields.requestId)
       if (!id) return
-      this.pendingRequests.delete(id)
-      this.host.dropServerRequest(id)
-      const resolved = { ...asRecord(this.outbound(params, provider)), requestId: id }
-      if (childThreadId)
-        this.host.notifyThread(this.adapterId(childThreadId), { method, params: resolved })
-      else this.host.notifyAll({ method, params: resolved })
+      this.finishRequest(id)
       return
     }
     const threadId = childThreadId ? this.adapterId(childThreadId) : null
     const notification = { method, params: this.outbound(params, provider) }
     if (threadId) this.track(threadId, method, asRecord(notification.params))
-    if (threadId && this.host.store.getThread(threadId))
-      this.host.notifyThread(threadId, notification)
-    else this.host.notifyAll(notification)
+    if (threadId) {
+      if (this.host.store.getThread(threadId)) this.host.notifyThread(threadId, notification)
+    } else this.host.notifyAll(notification)
   }
 
   // The sidebar record follows the conversation.
@@ -411,14 +531,17 @@ export class CodexNativeBridge {
         if (turnId)
           this.activeTurns.set(threadId, {
             turnId,
-            provider: codexProviderForModel(thread.model),
+            provider: thread.nativeCodexProvider as string,
           })
         thread.updatedAt = Math.floor(Date.now() / 1000)
         this.host.store.upsertThread(thread)
         return
       }
       case 'turn/completed': {
-        this.activeTurns.delete(threadId)
+        const turnId = stringField(asRecord(params.turn).id)
+        if (turnId) this.startingTurns.get(threadId)?.add(turnId)
+        if (this.activeTurns.get(threadId)?.turnId === turnId) this.activeTurns.delete(threadId)
+        if (turnId) this.finishThreadRequests(threadId, turnId)
         thread.updatedAt = Math.floor(Date.now() / 1000)
         thread.status = { type: 'idle' }
         this.host.store.upsertThread(thread)
@@ -450,31 +573,66 @@ export class CodexNativeBridge {
   ): void {
     const child = this.children.get(provider)
     if (!child) return
-    const id = `cx:${provider}:${child.generation}:${childRequestId}`
+    const generation = child.generation
+    const id = `cx:${provider}:${generation}:${childRequestId}`
     const outgoing = this.outbound(params, provider)
     const threadId = stringField(asRecord(outgoing).threadId)
-    this.pendingRequests.add(id)
+    // Detached reviews and provider-created threads have no adapter sidebar
+    // owner. Fail their request explicitly instead of stranding an approval.
+    if (!threadId || !this.host.store.getThread(threadId)) {
+      child.respond(childRequestId, undefined, {
+        code: SERVER_ERROR,
+        message: 'native thread is not attached to the adapter',
+      })
+      return
+    }
+    this.pendingRequests.set(id, { threadId, turnId: stringField(asRecord(outgoing).turnId) })
     this.host
       .sendServerRequest(this.host.detachedPeer, method, id, outgoing)
       .then((result) => {
-        child.respond(childRequestId, this.childResult(result, threadId))
+        if (child.generation === generation && this.pendingRequests.has(id))
+          child.respond(childRequestId, this.childResult(result, threadId))
       })
       .catch((error: unknown) => {
+        if (child.generation !== generation || !this.pendingRequests.has(id)) return
         child.respond(childRequestId, undefined, {
           code: SERVER_ERROR,
           message: error instanceof Error ? error.message : String(error),
         })
       })
       .finally(() => {
-        this.pendingRequests.delete(id)
-        this.host.checkIdle()
+        this.finishRequest(id)
       })
+  }
+
+  private finishThreadRequests(threadId: string, turnId?: string): void {
+    for (const [id, request] of this.pendingRequests) {
+      if (request.threadId === threadId && (!turnId || request.turnId === turnId))
+        this.finishRequest(id)
+    }
+  }
+
+  private finishRequest(id: string): void {
+    const request = this.pendingRequests.get(id)
+    if (!request) return
+    this.pendingRequests.delete(id)
+    this.host.dropServerRequest(id)
+    this.host.notifyThread(request.threadId, {
+      method: 'serverRequest/resolved',
+      params: { threadId: request.threadId, requestId: id },
+    })
+    this.host.checkIdle()
   }
 
   private childResult(result: unknown, threadId: string | null): unknown {
     const thread = threadId ? this.host.store.getThread(threadId) : null
     if (!thread?.codexSessionId) return result
-    return this.inbound(asRecord(result), thread.id, thread.codexSessionId)
+    return this.inbound(
+      asRecord(result),
+      thread.id,
+      thread.codexSessionId,
+      thread.nativeCodexProvider as string,
+    )
   }
 
   private onExit(provider: string, generation: number, reason: string): void {
@@ -492,10 +650,8 @@ export class CodexNativeBridge {
       })
       this.host.store.updateThreadStatus(threadId, { type: 'idle' })
     }
-    for (const id of [...this.pendingRequests]) {
-      if (!id.startsWith(`cx:${provider}:${generation}:`)) continue
-      this.pendingRequests.delete(id)
-      this.host.dropServerRequest(id)
+    for (const id of this.pendingRequests.keys()) {
+      if (id.startsWith(`cx:${provider}:${generation}:`)) this.finishRequest(id)
     }
     this.host.checkIdle()
   }
@@ -514,18 +670,19 @@ function requestedModel(params: Record<string, unknown>): string | null {
   return typeof nested === 'string' && nested ? nested : null
 }
 
-function modelIsCodex(params: Record<string, unknown>): boolean {
-  const model = requestedModel(params)
+function isThreadIdField(key: string | null): boolean {
   return (
-    model !== null &&
-    (/^gpt[-_]/.test(model) || /^o[0-9]/.test(model) || model.startsWith('codex-'))
-  )
-}
-
-function hasModel(params: Record<string, unknown>): boolean {
-  return (
-    (typeof params.model === 'string' && params.model.length > 0) ||
-    typeof asRecord(asRecord(params.collaborationMode).settings).model === 'string'
+    key === 'id' ||
+    key === 'threadId' ||
+    key === 'thread_id' ||
+    key === 'sessionId' ||
+    key === 'parent_thread_id' ||
+    key === 'attachedToThreadId' ||
+    key === 'forkedFromId' ||
+    key === 'parentThreadId' ||
+    key === 'reviewThreadId' ||
+    key === 'receiverThreadIds' ||
+    key === 'senderThreadId'
   )
 }
 
@@ -539,7 +696,18 @@ function stringField(value: unknown): string | null {
   return typeof value === 'string' && value ? value : null
 }
 
-// Every string value of the payload passed through `map`, with its key.
+const OPAQUE_FIELDS = new Set([
+  'input',
+  'content',
+  'arguments',
+  'inputSchema',
+  'dynamicTools',
+  'config',
+  'outputSchema',
+  'output',
+])
+
+// Rewrite protocol fields while retaining user and tool payloads.
 function rewrite(
   value: unknown,
   map: (value: string, key: string | null) => string,
@@ -549,7 +717,10 @@ function rewrite(
   if (Array.isArray(value)) return value.map((entry) => rewrite(entry, map, key))
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {}
-    for (const [field, entry] of Object.entries(value)) out[field] = rewrite(entry, map, field)
+    for (const [field, entry] of Object.entries(value)) {
+      // User input, schemas, dynamic tool arguments and tool results are opaque.
+      out[field] = OPAQUE_FIELDS.has(field) ? entry : rewrite(entry, map, field)
+    }
     return out
   }
   return value

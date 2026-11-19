@@ -5,6 +5,9 @@ import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import { TOOL_INPUT_PREVIEW_INTERVAL_MS } from '../src/tool-input-preview.mjs'
 import type { RuntimeEvent, RuntimeTurnContext, RuntimeTurnSettings } from '../src/types.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 const context: RuntimeTurnContext = {
   threadId: 'thread',
   turnId: 'turn',

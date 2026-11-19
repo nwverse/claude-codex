@@ -9,6 +9,9 @@ import {
   type TaskOutputTail,
 } from '../src/command-output.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 function tail(
   output: string,
   totalBytes = Buffer.byteLength(output),
@@ -200,6 +203,29 @@ test('a call two tasks name, or a task naming no call of the main loop, shows no
   await sleep(30)
   assert.deepEqual(cli.reads, [])
   assert.deepEqual(thread.deltas, [])
+  outputs.close()
+})
+
+test('a timed-out foreground command keeps its streamed output when its sink changes', async () => {
+  const cli = fakeCli()
+  const outputs = new CommandOutputs(cli.read, 5)
+  const turn = recordingSink()
+  const thread = recordingSink()
+  cli.outputs.set('job', 'first\n')
+  outputs.call('call', turn)
+  outputs.taskStarted('job', 'call', false)
+  await waitFor(() => turn.deltas.length > 0, 'foreground output')
+  outputs.taskBackgrounded('job')
+  outputs.callEnded(
+    'call',
+    () => thread,
+    () => true,
+    true,
+  )
+  cli.outputs.set('job', 'first\nlast\n')
+  await waitFor(() => thread.deltas.length > 0, 'new output')
+  assert.equal(turn.deltas.join(''), 'first\n')
+  assert.equal(thread.deltas.join('').trim(), 'last')
   outputs.close()
 })
 

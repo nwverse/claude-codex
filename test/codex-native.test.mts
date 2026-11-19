@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict'
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { once } from 'node:events'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { after, test } from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
+import { nativeCodexTestEnv } from './support/native-codex-fixture.mjs'
 
 // The native Codex harness: Codex threads run in a real `codex app-server`
 // child, here a fake one that answers like codex and logs what it hears.
@@ -15,68 +19,8 @@ after(() => {
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true })
 })
 
-const FAKE_CODEX = `
-const fs = require('node:fs')
-const provider = (process.argv.find((arg) => arg.startsWith('model_provider=')) || '').slice(15).replace(/"/g, '')
-const log = (entry) => fs.appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify({ provider, ...entry }) + '\\n')
-const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n')
-const models = new Map()
-const waiting = new Map()
-let next = 0
-let buffer = ''
-process.stdin.setEncoding('utf8')
-process.stdin.on('data', (chunk) => {
-  buffer += chunk
-  let newline
-  while ((newline = buffer.indexOf('\\n')) >= 0) {
-    const line = buffer.slice(0, newline)
-    buffer = buffer.slice(newline + 1)
-    if (line.trim()) handle(JSON.parse(line))
-  }
-})
-function handle(message) {
-  log(message)
-  if (message.method === undefined) {
-    const resume = waiting.get(message.id)
-    if (resume) { waiting.delete(message.id); resume(message.result) }
-    return
-  }
-  const p = message.params || {}
-  const reply = (result) => send({ id: message.id, result })
-  switch (message.method) {
-    case 'initialize': return reply({ userAgent: 'fake' })
-    case 'initialized': return
-    case 'thread/start': {
-      const id = provider + '-thread-' + (++next)
-      models.set(id, p.model)
-      send({ method: 'thread/started', params: { thread: { id, modelProvider: provider } } })
-      return reply({ thread: { id, modelProvider: provider, turns: [] }, model: p.model, modelProvider: provider })
-    }
-    case 'thread/resume':
-      return reply({ thread: { id: p.threadId, modelProvider: provider, turns: [{ id: 'turn-old' }] }, model: models.get(p.threadId) || 'unknown', modelProvider: provider })
-    case 'thread/settings/update':
-      if (p.model) models.set(p.threadId, p.model)
-      return reply({})
-    case 'turn/start': {
-      const turnId = 'turn-' + (++next)
-      reply({ turn: { id: turnId, status: 'inProgress', items: [] } })
-      send({ method: 'turn/started', params: { threadId: p.threadId, turn: { id: turnId, status: 'inProgress', items: [] } } })
-      const requestId = 900 + next
-      waiting.set(requestId, (result) => {
-        send({ method: 'serverRequest/resolved', params: { threadId: p.threadId, requestId } })
-        const text = provider + ':' + models.get(p.threadId) + ':' + (result && result.decision)
-        send({ method: 'item/agentMessage/delta', params: { threadId: p.threadId, turnId, itemId: 'm1', delta: text } })
-        send({ method: 'turn/completed', params: { threadId: p.threadId, turn: { id: turnId, status: 'completed', items: [] } } })
-      })
-      send({ id: requestId, method: 'item/commandExecution/requestApproval', params: { threadId: p.threadId, turnId, itemId: 'c1', command: 'ls' } })
-      return
-    }
-    default: return reply({})
-  }
-}
-`
-
 class Reader {
+  readonly received: any[] = []
   private buffer = ''
   private readonly queue: any[] = []
   private waiter: ((value: any) => void) | null = null
@@ -94,6 +38,7 @@ class Reader {
     })
   }
   private push(message: any): void {
+    this.received.push(message)
     if (this.waiter) {
       const waiter = this.waiter
       this.waiter = null
@@ -104,7 +49,7 @@ class Reader {
     const queued = this.queue.shift()
     if (queued !== undefined) return Promise.resolve(queued)
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('no message within 10s')), 10_000)
+      const timer = setTimeout(() => reject(new Error('no message within 30s')), 30_000)
       this.waiter = (message) => {
         clearTimeout(timer)
         resolve(message)
@@ -114,46 +59,42 @@ class Reader {
   // Messages a wait passed over, for later waits: a notification can come
   // before the response of the request that caused it.
   private readonly passed: any[] = []
-  async until(done: (message: any) => boolean, seen: any[] = []): Promise<any> {
+  async until(done: (message: any) => boolean, seen?: any[]): Promise<any> {
     const index = this.passed.findIndex(done)
     if (index >= 0) {
-      seen.push(...this.passed.slice(0, index + 1))
-      return this.passed.splice(index, 1)[0]
+      if (!seen) return this.passed.splice(index, 1)[0]
+      const prefix = this.passed.splice(0, index + 1)
+      seen.push(...prefix)
+      return prefix.at(-1)
     }
+    if (seen) seen.push(...this.passed.splice(0))
     for (let i = 0; i < 500; i += 1) {
       const message = await this.next()
-      seen.push(message)
+      seen?.push(message)
       if (done(message)) return message
-      this.passed.push(message)
+      if (!seen) this.passed.push(message)
     }
     throw new Error('expected message never arrived')
   }
 }
 
-function startAdapter() {
-  const home = mkdtempSync(join(tmpdir(), 'codex-native-'))
-  dirs.push(home)
-  const script = join(home, 'fake-codex.cjs')
-  writeFileSync(script, FAKE_CODEX)
-  const binary = join(home, 'codex')
-  writeFileSync(binary, `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`)
-  chmodSync(binary, 0o755)
+function startAdapter(options: { home?: string; env?: NodeJS.ProcessEnv; args?: string[] } = {}) {
+  const home = options.home ?? mkdtempSync(join(tmpdir(), 'codex-native-'))
+  if (!options.home) dirs.push(home)
   const log = join(home, 'fake.log')
-  writeFileSync(log, '')
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: {
-      ...process.env,
-      CODEX_HOME: home,
-      CLAUDE_CODEX_MOCK: '1',
-      CLAUDE_CODEX_NATIVE_CODEX: 'on',
-      CLAUDE_CODEX_CODEX_MODELS: 'gpt-6.1-sol',
-      CLAUDE_CODEX_CODEX_AG_MODELS: 'claude-opus-5-5',
-      CODEX_REAL: binary,
-      FAKE_CODEX_LOG: log,
-      NODE_NO_WARNINGS: '1',
+  const proc = spawn(
+    process.execPath,
+    [adapter, 'app-server', '--listen', 'stdio://', ...(options.args ?? [])],
+    {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        PATH: process.env.PATH,
+        SYSTEMROOT: process.env.SYSTEMROOT,
+        ...nativeCodexTestEnv(home),
+        ...options.env,
+      },
     },
-  })
+  )
   const reader = new Reader(proc)
   let id = 0
   const request = async (method: string, params: unknown) => {
@@ -167,7 +108,13 @@ function startAdapter() {
       .split('\n')
       .filter(Boolean)
       .map((line) => JSON.parse(line))
-  return { proc, reader, request, childLog, home }
+  const stop = async () => {
+    if (proc.exitCode !== null || proc.signalCode !== null) return
+    const exited = once(proc, 'exit')
+    proc.stdin.end()
+    await exited
+  }
+  return { proc, reader, request, childLog, home, stop }
 }
 
 async function initialize(app: ReturnType<typeof startAdapter>) {
@@ -220,7 +167,7 @@ test('model/list offers the three harnesses', async () => {
       ),
     )
   } finally {
-    app.proc.kill()
+    await app.stop()
   }
 })
 
@@ -255,7 +202,7 @@ test('a Codex+AsterGate chat runs in the child on its provider, approvals round-
     assert.equal(resumed.result.model, 'codex-ag:claude-opus-5-5')
     assert.equal(resumed.result.modelProvider, 'claude-code')
   } finally {
-    app.proc.kill()
+    await app.stop()
   }
 })
 
@@ -269,7 +216,7 @@ test('a GPT chat runs in the ChatGPT child', async () => {
     const delta = seen.find((message) => message.method === 'item/agentMessage/delta')
     assert.equal(delta.params.delta, 'openai:gpt-6.1-sol:decline')
   } finally {
-    app.proc.kill()
+    await app.stop()
   }
 })
 
@@ -300,6 +247,265 @@ test('a chat keeps its harness once it has a conversation; a new one can still m
     assert.equal(delta.params.threadId, freshId)
     assert.equal(delta.params.delta, 'openai:gpt-6.1-sol:accept')
   } finally {
-    app.proc.kill()
+    await app.stop()
+  }
+})
+
+async function startChat(app: ReturnType<typeof startAdapter>, model = 'codex-ag:claude-opus-5-5') {
+  await initialize(app)
+  const answer = await app.request('thread/start', { model, cwd: app.home })
+  assert.equal(answer.error, undefined)
+  return answer.result.thread.id as string
+}
+
+test('a native chat resumes on its original provider and adapter id after a restart', async () => {
+  const first = startAdapter({ env: { CLAUDE_CODEX_CODEX_AG_PROVIDER: 'fixture_a' } })
+  const threadId = await startChat(first)
+  try {
+    await runTurn(first, threadId, 'accept')
+  } finally {
+    await first.stop()
+  }
+  const app = startAdapter({
+    home: first.home,
+    env: { CLAUDE_CODEX_CODEX_AG_PROVIDER: 'fixture_b' },
+  })
+  try {
+    await initialize(app)
+    const resumed = await app.request('thread/resume', { threadId, modelProvider: 'claude-code' })
+    assert.equal(resumed.result.thread.id, threadId)
+    assert.deepEqual(resumed.result.thread.turns, [{ id: 'turn-old' }])
+    const { approval, seen } = await runTurn(app, threadId, 'decline')
+    assert.equal(approval.params.threadId, threadId)
+    assert.equal(
+      seen.find((message) => message.method === 'item/agentMessage/delta').params.threadId,
+      threadId,
+    )
+    const restore = app.childLog().find((entry) => entry.method === 'thread/resume')
+    assert.equal(restore.provider, 'fixture_a')
+    assert.equal(restore.params.modelProvider, 'fixture_a')
+  } finally {
+    await app.stop()
+  }
+  const disabled = startAdapter({ home: first.home, env: { CLAUDE_CODEX_NATIVE_CODEX: 'off' } })
+  try {
+    await initialize(disabled)
+    assert.match(
+      (await disabled.request('thread/resume', { threadId })).error.message,
+      /enable CLAUDE_CODEX_NATIVE_CODEX/,
+    )
+    assert.ok(
+      (await disabled.request('thread/list', {})).result.data.some(
+        (row: any) => row.id === threadId,
+      ),
+    )
+    assert.deepEqual(disabled.childLog(), [])
+  } finally {
+    await disabled.stop()
+  }
+})
+
+test('persisted exec-proxy conversations keep their route when native mode is enabled', async () => {
+  const first = startAdapter()
+  const threadId = await startChat(first, 'gpt-6.1-sol')
+  try {
+    await runTurn(first, threadId, 'accept')
+  } finally {
+    await first.stop()
+  }
+  // A database created before native mode has an exec session id and no provider binding.
+  const db = new DatabaseSync(join(first.home, 'adapter', 'state.sqlite'))
+  try {
+    db.prepare('UPDATE threads SET native_codex_provider = NULL WHERE id = ?').run(threadId)
+  } finally {
+    db.close()
+  }
+  const app = startAdapter({ home: first.home })
+  try {
+    await initialize(app)
+    const resumed = await app.request('thread/resume', { threadId })
+    assert.equal(resumed.result.thread.id, threadId)
+    assert.deepEqual(app.childLog(), [])
+  } finally {
+    await app.stop()
+  }
+})
+
+test('native forks keep their provider in both directions, including description forks', async () => {
+  const app = startAdapter()
+  try {
+    for (const [model, other] of [
+      ['gpt-6.1-sol', 'codex-ag:claude-opus-5-5'],
+      ['codex-ag:claude-opus-5-5', 'gpt-6.1-sol'],
+    ] as const) {
+      const threadId = await startChat(app, model)
+      await runTurn(app, threadId, 'accept')
+      const refused = await app.request('thread/fork', { threadId, model: other })
+      assert.equal(refused.error.code, -32600)
+      const fork = await app.request('thread/fork', { threadId, model })
+      assert.equal(fork.result.model, model)
+      assert.equal(fork.result.thread.forkedFromId, threadId)
+      const forkResume = await app.request('thread/resume', { threadId: fork.result.thread.id })
+      assert.equal(forkResume.result.model, model)
+      const helper = await app.request('thread/fork', {
+        threadId,
+        model: 'gpt-summary',
+        ephemeral: true,
+        threadSource: 'thread_description',
+      })
+      assert.equal(helper.result.model, model)
+    }
+    assert.equal(app.childLog().filter((entry) => entry.method === 'thread/fork').length, 4)
+  } finally {
+    await app.stop()
+  }
+})
+
+test('rejected archive or delete leaves the local record available', async () => {
+  const app = startAdapter({ env: { FAKE_REFUSE_CHANGES: '1' } })
+  try {
+    const threadId = await startChat(app)
+    await runTurn(app, threadId, 'decline')
+    for (const method of ['thread/archive', 'thread/delete']) {
+      assert.match((await app.request(method, { threadId })).error.message, /rollout unavailable/)
+      const list = await app.request('thread/list', { archived: false })
+      assert.ok(list.result.data.some((row: any) => row.id === threadId))
+    }
+  } finally {
+    await app.stop()
+  }
+})
+
+test('archive stops an active native turn, withdraws its approval, and unarchive restores history', async () => {
+  const app = startAdapter()
+  try {
+    const threadId = await startChat(app)
+    await app.request('turn/start', { threadId, input: [{ type: 'text', text: 'hello' }] })
+    const approval = await app.reader.until((message) =>
+      message.method?.endsWith('requestApproval'),
+    )
+    assert.equal((await app.request('thread/archive', { threadId })).error, undefined)
+    assert.ok(
+      app.reader.received.some(
+        (message) =>
+          message.method === 'serverRequest/resolved' && message.params.requestId === approval.id,
+      ),
+    )
+    const log = app.childLog().map((entry) => entry.method)
+    assert.ok(
+      log.indexOf('turn/interrupt') >= 0 &&
+        log.indexOf('turn/interrupt') < log.indexOf('thread/archive'),
+    )
+    assert.ok(
+      (await app.request('thread/list', { archived: true })).result.data.some(
+        (row: any) => row.id === threadId,
+      ),
+    )
+    const restored = await app.request('thread/unarchive', { threadId })
+    assert.equal(restored.result.thread.id, threadId)
+    assert.deepEqual(restored.result.thread.turns, [{ id: 'turn-old' }])
+  } finally {
+    await app.stop()
+  }
+})
+
+test('the child receives App config and enabled dynamic tools, with its provider pinned last', async () => {
+  const app = startAdapter({
+    args: ['-c', 'native_probe=true', '--config', 'model_provider="other"'],
+    env: { CLAUDE_CODEX_DYNAMIC_TOOLS: '1' },
+  })
+  try {
+    await initialize(app)
+    const tools = [
+      {
+        type: 'namespace',
+        name: 'sample',
+        description: 'fixture',
+        tools: [
+          {
+            type: 'function',
+            name: 'about',
+            description: 'fixture',
+            inputSchema: { type: 'object', properties: {} },
+          },
+        ],
+      },
+    ]
+    const start = await app.request('thread/start', {
+      model: 'gpt-6.1-sol',
+      cwd: app.home,
+      permissions: ':read-only',
+      dynamicTools: tools,
+    })
+    await runTurn(app, start.result.thread.id, 'decline')
+    const spawn = app.childLog().find((entry) => entry.event === 'spawn')
+    assert.deepEqual(spawn.argv.slice(0, 6), [
+      '-c',
+      'native_probe=true',
+      '-c',
+      'model_provider="other"',
+      '-c',
+      'model_provider="openai"',
+    ])
+    const params = app.childLog().find((entry) => entry.method === 'thread/start').params
+    assert.equal(params.permissions, ':read-only')
+    assert.equal(params.sandbox, undefined)
+    assert.equal(params.dynamicTools[0].tools[0].name, 'about')
+  } finally {
+    await app.stop()
+  }
+})
+
+test('native menus split a mixed default catalog and exclude the internal reviewer', async () => {
+  const app = startAdapter({
+    env: { CLAUDE_CODEX_CODEX_MODELS: '', CLAUDE_CODEX_CODEX_AG_MODELS: '' },
+  })
+  try {
+    writeFileSync(
+      join(app.home, 'model_catalog.json'),
+      JSON.stringify({
+        models: ['gpt-fixture', 'claude-fixture', 'codex-auto-review'].map((slug) => ({ slug })),
+      }),
+    )
+    await initialize(app)
+    const ids = (await app.request('model/list', {})).result.data.map((entry: any) => entry.id)
+    assert.ok(ids.includes('gpt-fixture') && ids.includes('codex-ag:claude-fixture'))
+    assert.ok(
+      !ids.includes('claude-fixture') &&
+        !ids.includes('codex-auto-review') &&
+        !ids.includes('codex-ag:codex-auto-review'),
+    )
+  } finally {
+    await app.stop()
+  }
+})
+
+test('a single child write with a reply and a completed turn keeps wire order and allows idle stop', async () => {
+  const app = startAdapter({
+    env: { FAKE_IMMEDIATE_COMPLETION: '1', CLAUDE_CODEX_NATIVE_IDLE_MS: '75' },
+  })
+  try {
+    const threadId = await startChat(app)
+    const reply = await app.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'hello' }],
+    })
+    await app.reader.until((message) => message.method === 'turn/completed')
+    const trace = app.reader.received
+    assert.ok(
+      trace.indexOf(reply) < trace.findIndex((message) => message.method === 'turn/started'),
+    )
+    assert.deepEqual(
+      trace
+        .filter((message) => message.method === 'thread/started')
+        .map((message) => message.params.thread.id),
+      [threadId],
+    )
+    const end = Date.now() + 5000
+    while (!app.childLog().some((entry) => entry.event === 'exit') && Date.now() < end)
+      await delay(25)
+    assert.ok(app.childLog().some((entry) => entry.event === 'exit'))
+  } finally {
+    await app.stop()
   }
 })

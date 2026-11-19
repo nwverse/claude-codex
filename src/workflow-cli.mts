@@ -1,6 +1,8 @@
 #!/usr/bin/env node
+import { realpathSync } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { parseGitHubQueueJson } from './github-queue.mjs'
 import { runRegistryPath } from './run-registry.mjs'
 import { adapterHome, newId } from './util.mjs'
@@ -105,16 +107,32 @@ export async function runWorkflowCli(
     }
     case 'ingest-github': {
       const source = requiredOption(parsed, 'github-json')
-      const result = parseGitHubQueueJson(await readFile(source, 'utf8'), now)
-      const nextState = result.tasks.reduce((current, task) => upsertTask(current, task), state)
-      await store.write(nextState)
+      const result = parseGitHubQueueJson(
+        await readFile(source, 'utf8'),
+        now,
+        state.tasks.map((task) => task.id),
+      )
+      const knownTaskIds = new Set(state.tasks.map((task) => task.id))
+      const existing: string[] = [...result.existing]
+      const newTasks = result.tasks.filter((task) => {
+        if (knownTaskIds.has(task.id)) {
+          existing.push(task.id)
+          return false
+        }
+        knownTaskIds.add(task.id)
+        return true
+      })
+      const nextState = { ...state, tasks: [...state.tasks, ...newTasks] }
+      // A duplicate-only import leaves the saved state file untouched.
+      if (newTasks.length > 0 || existing.length === 0) await store.write(nextState)
       writeJson(io.stdout, {
         status: 'ingested',
         statePath: store.path,
         source,
-        enqueued: result.tasks.length,
+        enqueued: newTasks.length,
+        existing,
         skipped: result.skipped,
-        taskIds: result.tasks.map((task) => task.id),
+        taskIds: newTasks.map((task) => task.id),
       })
       return 0
     }
@@ -126,14 +144,23 @@ export async function runWorkflowCli(
 }
 
 function taskFromArgs(args: ParsedArgs, now: Date): WorkflowTask {
+  const prompt = requiredOption(args, 'prompt')
+  const priority = numberOption(args, 'priority') ?? 0
+  const maxAttempts = numberOption(args, 'max-attempts') ?? 3
+  if (!Number.isInteger(priority)) {
+    throw new WorkflowCliInputError('--priority must be an integer')
+  }
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new WorkflowCliInputError('--max-attempts must be a positive integer')
+  }
   return {
     id: stringOption(args, 'id') ?? newId(),
     status: 'queued',
     updatedAt: now.toISOString(),
-    prompt: requiredOption(args, 'prompt'),
-    priority: numberOption(args, 'priority') ?? 0,
+    prompt,
+    priority,
     attempts: 0,
-    maxAttempts: numberOption(args, 'max-attempts') ?? 3,
+    maxAttempts,
     lease: null,
     blockedReason: null,
     lastError: null,
@@ -241,7 +268,18 @@ function isErrno(error: unknown, code: string): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === code
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+function isMainModule(): boolean {
+  const entry = process.argv[1]
+  if (entry === undefined) return false
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    // Imports from eval or other hosts may have an argv[1] that is not a file.
+    return false
+  }
+}
+
+if (isMainModule()) {
   runWorkflowCli().then(
     (code) => {
       process.exitCode = code
