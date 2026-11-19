@@ -294,7 +294,12 @@ export class SessionStore {
     this.sanitizeLegacyEnumColumns()
   }
 
+  // Read first: INSERT OR IGNORE takes the write lock even when it inserts
+  // nothing, and every adapter process opening the shared store runs this.
   private ensurePinnedSection(): void {
+    if (this.db.prepare('SELECT 1 FROM thread_sections WHERE id = ?').get(PINNED_SECTION_ID)) {
+      return
+    }
     const now = nowSeconds()
     this.db
       .prepare(
@@ -305,27 +310,44 @@ export class SessionStore {
       .run(PINNED_SECTION_ID, PINNED_SECTION_NAME, now, now)
   }
 
+  // Rows that predate sections: a pin flag with no section, a pin flag that
+  // disagrees with the row's section, or ordering left on an unsectioned row.
+  // Each UPDATE matches only rows it would change, and the probe skips them
+  // all when none would, so opening a clean store writes nothing.
   private migrateLegacyPinState(): void {
+    const needsPinnedSection = `is_pinned = 1 AND (section_id IS NULL OR section_id = '')`
+    const wrongPinFlag = `(section_id IS NOT NULL OR is_pinned = 1)
+      AND is_pinned IS NOT (CASE WHEN section_id = ? THEN 1 ELSE 0 END)`
+    const strayOrdering = `section_id IS NULL
+      AND (section_entered_at IS NOT NULL OR section_position IS NOT NULL)`
+    if (
+      !this.threadsMatch(
+        `(${needsPinnedSection}) OR (${wrongPinFlag}) OR (${strayOrdering})`,
+        PINNED_SECTION_ID,
+      )
+    ) {
+      return
+    }
     this.db
       .prepare(
         `UPDATE threads
          SET section_id = ?,
              section_entered_at = COALESCE(section_entered_at, updated_at),
              section_position = COALESCE(section_position, rowid)
-         WHERE is_pinned = 1 AND (section_id IS NULL OR section_id = '')`,
+         WHERE ${needsPinnedSection}`,
       )
       .run(PINNED_SECTION_ID)
     this.db
       .prepare(
         `UPDATE threads
          SET is_pinned = CASE WHEN section_id = ? THEN 1 ELSE 0 END
-         WHERE section_id IS NOT NULL OR is_pinned = 1`,
+         WHERE ${wrongPinFlag}`,
       )
-      .run(PINNED_SECTION_ID)
+      .run(PINNED_SECTION_ID, PINNED_SECTION_ID)
     this.db.exec(
       `UPDATE threads
        SET section_entered_at = NULL, section_position = NULL
-       WHERE section_id IS NULL`,
+       WHERE ${strayOrdering}`,
     )
   }
 
@@ -333,24 +355,37 @@ export class SessionStore {
   // `app_server` source) in columns the Codex App treats as strict enums.
   // Codex App's ts-rs deserializer rejects the invalid values on `thread/list`
   // / `thread/read`, surfacing as the generic "Oops, an error has occurred"
-  // toast when reopening a page. Repair the rows in place once on startup so
-  // a downgrade-then-upgrade cycle doesn't leave permanent landmines.
+  // toast when reopening a page. Repair the rows in place on startup so a
+  // downgrade-then-upgrade cycle doesn't leave permanent landmines. The check
+  // runs on every open for that reason; it is a single read-only scan, and
+  // octet_length (SQLite 3.43+, bundled with Node 24) tests the instruction
+  // columns for '' without reading their (often large) text.
   private sanitizeLegacyEnumColumns(): void {
+    const invalidThreadSource = `thread_source IS NOT NULL
+      AND thread_source NOT IN ('user', 'subagent', 'memory_consolidation')`
+    const repairs: Array<[string, string]> = [
+      ['thread_source = NULL', invalidThreadSource],
+      ['agent_role = NULL', `agent_role = ''`],
+      ['agent_nickname = NULL', `agent_nickname = ''`],
+      ['base_instructions = NULL', 'octet_length(base_instructions) = 0'],
+      ['developer_instructions = NULL', 'octet_length(developer_instructions) = 0'],
+      [`source = 'appServer'`, `source = 'app_server'`],
+    ]
     try {
-      this.db.exec(`
-        UPDATE threads
-        SET thread_source = NULL
-        WHERE thread_source IS NOT NULL
-          AND thread_source NOT IN ('user', 'subagent', 'memory_consolidation');
-        UPDATE threads SET agent_role = NULL WHERE agent_role = '';
-        UPDATE threads SET agent_nickname = NULL WHERE agent_nickname = '';
-        UPDATE threads SET base_instructions = NULL WHERE base_instructions = '';
-        UPDATE threads SET developer_instructions = NULL WHERE developer_instructions = '';
-        UPDATE threads SET source = 'appServer' WHERE source = 'app_server';
-      `)
+      if (!this.threadsMatch(repairs.map(([, where]) => `(${where})`).join(' OR '))) return
+      for (const [set, where] of repairs) this.db.exec(`UPDATE threads SET ${set} WHERE ${where}`)
     } catch {
       // Migrations are best-effort; never block adapter startup on cleanup.
     }
+  }
+
+  // Whether any thread row matches the condition. A read, so it takes no
+  // write lock on a store other adapter processes share.
+  private threadsMatch(where: string, ...params: string[]): boolean {
+    const row = this.db
+      .prepare(`SELECT EXISTS (SELECT 1 FROM threads WHERE ${where}) AS found`)
+      .get(...params) as { found: number }
+    return row.found === 1
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -477,6 +512,10 @@ export class SessionStore {
       // Keeps threads whose name, preview or stored items contain the text.
       // A prefilter: a match inside item JSON may be a key, not visible text.
       searchTerm?: string | undefined
+      // Keeps threads whose name or preview contains the text.
+      titleSearch?: string | undefined
+      // Leaves out these threads before the page limit applies.
+      excludedThreadIds?: string[]
       // Leaves out threads that have no turn and no preview yet.
       excludeEmpty?: boolean
       sortKey?: 'created_at' | 'updated_at' | 'recency_at' | 'section_position'
@@ -545,6 +584,15 @@ export class SessionStore {
              WHERE h.thread_id = t.id AND h.items_json LIKE ? ESCAPE '\\'))`,
       )
       args.push(text, text, json, json)
+    }
+    if (options.titleSearch) {
+      const text = likePattern(options.titleSearch)
+      where.push(`(t.name LIKE ? ESCAPE '\\' OR t.preview LIKE ? ESCAPE '\\')`)
+      args.push(text, text)
+    }
+    if (options.excludedThreadIds && options.excludedThreadIds.length > 0) {
+      where.push(`t.id NOT IN (${options.excludedThreadIds.map(() => '?').join(', ')})`)
+      args.push(...options.excludedThreadIds)
     }
     const parentThreadId = options.parentThreadId ?? null
     const ancestorThreadId = options.ancestorThreadId ?? null

@@ -328,9 +328,10 @@ counts. Its arguments narrow it:
 Outside a git work tree the system prompt tells Claude to call it where a
 command reads its changes from git. What shell commands changed is not in the
 transcripts and not shown, and a subagent's change to a file whose earlier
-text cannot be worked out is shown on its own. The switch is off by default
-because it adds a tool and, outside git, a system prompt line to every Claude
-thread's turns.
+text cannot be worked out is shown on its own. Line endings are compared as
+LF, so a CRLF file diffs line by line and a change that only converts a file's
+line endings is not shown. The switch is off by default because it adds a tool
+and, outside git, a system prompt line to every Claude thread's turns.
 
 ## App settings
 
