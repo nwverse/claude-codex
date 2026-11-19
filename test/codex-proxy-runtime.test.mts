@@ -6,6 +6,9 @@ import test from 'node:test'
 import { CodexProxyRuntime } from '../src/codex-proxy-runtime.mjs'
 import type { RuntimeEvent, RuntimeHandlers, RuntimeTurnContext } from '../src/types.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 // A fake `codex` that records its argv (one per line) and its stdin, then
 // prints the smallest JSONL turn the proxy accepts.
 const FAKE_CODEX = `#!/bin/sh

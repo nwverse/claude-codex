@@ -9,6 +9,9 @@ import {
   type TaskOutputTail,
 } from '../src/command-output.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 function tail(
   output: string,
   totalBytes = Buffer.byteLength(output),

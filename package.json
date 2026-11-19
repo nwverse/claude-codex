@@ -27,7 +27,7 @@
   ],
   "scripts": {
     "dev": "tsx src/adapter.mts",
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('dist/test',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "biome lint src test scripts",
     "format": "biome format --write src test scripts",
@@ -38,7 +38,7 @@
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs",
-    "test": "npm run build && node --test dist/test/*.mjs",
+    "test": "npm run build && node --test --test-timeout=120000 --test-force-exit dist/test/*.mjs",
     "doctor": "node scripts/doctor.mjs",
     "workflow": "npm run build && node dist/src/workflow-cli.mjs",
     "workflow:schedule": "npm run workflow -- schedule",

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { type ChildProcess, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import type { IncomingMessage } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -203,7 +203,8 @@ test('websocket token file is created once with mode 0600', async () => {
     assert.equal(await readFile(path, 'utf8'), first)
 
     const loose = join(home, 'loose-token')
-    await writeFile(loose, `${TOKEN}\n`, { mode: 0o644 })
+    await writeFile(loose, `${TOKEN}\n`)
+    await chmod(loose, 0o644) // umask only strips bits at creation
     if (process.platform !== 'win32') {
       assert.throws(
         () => resolveWebSocketAuth('127.0.0.1', 1, { tokenFile: loose }, {}),

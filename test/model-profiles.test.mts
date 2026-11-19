@@ -28,6 +28,9 @@ import {
   resolveClaudeSummaryModelIdentity,
 } from '../src/util.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 const baseContext: RuntimeTurnContext = {
   threadId: 'thread',
   turnId: 'turn',

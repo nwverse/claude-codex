@@ -9,6 +9,9 @@ import { SessionStore } from '../src/store.mjs'
 import type { ThreadItem, ThreadRecord, TurnRecord } from '../src/types.mjs'
 import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 const DELTAS = 500
 
 function thread(id: string): ThreadRecord {

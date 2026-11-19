@@ -53,6 +53,9 @@ import { parseToml } from '../src/toml.mjs'
 import type { ClaudeRuntime, RpcPeer, RuntimeTurnContext } from '../src/types.mjs'
 import { tempRootOutsideGit } from './support/temp-root.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 async function write(path: string, text: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
   await writeFile(path, text)
@@ -718,7 +721,14 @@ test('a .git file counts only as far as git vouches for it', async () => {
   const codexHome = join(root, 'codex-home')
   const trusted = join(root, 'trusted')
   const git = (cwd: string, ...args: string[]) => {
-    const identity = ['-c', 'user.name=Test', '-c', 'user.email=test@example.com']
+    const identity = [
+      '-c',
+      'user.name=Test',
+      '-c',
+      'user.email=test@example.com',
+      '-c',
+      'commit.gpgsign=false',
+    ]
     const ran = spawnSync('git', [...identity, ...args], { cwd, stdio: 'ignore' })
     assert.equal(ran.status, 0, `git ${args.join(' ')}`)
   }

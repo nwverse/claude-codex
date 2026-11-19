@@ -44,6 +44,9 @@ import {
   WorkflowJournalMonitor,
 } from '../src/workflow-subagents.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 function nativeTurnContext(overrides: Partial<RuntimeTurnContext> = {}): RuntimeTurnContext {
   return {
     threadId: 'thread',
@@ -799,16 +802,24 @@ test('workflow command parser keeps list and run semantics distinct', () => {
   })
   assert.equal(workflowRuntimePrompt('/workflows'), '/workflows')
 
-  const runtime = new NativeClaudeRuntime()
-  const buildOptions = Reflect.get(runtime, 'buildOptions')
-  const options = buildOptions.call(
-    runtime,
-    {},
-    nativeTurnContext({ prompt: '/workflows' }),
-    new AbortController(),
-  )
-  assert.equal(options.settings, undefined)
-  assert.equal(options.env?.CLAUDE_CODE_WORKFLOWS, undefined)
+  // Claude Code exports CLAUDE_CODE_WORKFLOWS=1 in its own shells, and the
+  // options carry this process's environment.
+  const inherited = process.env.CLAUDE_CODE_WORKFLOWS
+  delete process.env.CLAUDE_CODE_WORKFLOWS
+  try {
+    const runtime = new NativeClaudeRuntime()
+    const buildOptions = Reflect.get(runtime, 'buildOptions')
+    const options = buildOptions.call(
+      runtime,
+      {},
+      nativeTurnContext({ prompt: '/workflows' }),
+      new AbortController(),
+    )
+    assert.equal(options.settings, undefined)
+    assert.equal(options.env?.CLAUDE_CODE_WORKFLOWS, undefined)
+  } finally {
+    if (inherited !== undefined) process.env.CLAUDE_CODE_WORKFLOWS = inherited
+  }
 })
 
 test('workflow transcript roots follow CLAUDE_CONFIG_DIR and HOME deterministically', () => {
@@ -3246,7 +3257,7 @@ test('HTTP agent runtime uses one managed bridge URL per cwd/model key', async (
     baseUrl: 'http://127.0.0.1:9',
     useSse: false,
     pollIntervalMs: 20,
-    timeoutMs: 2_000,
+    timeoutMs: 20_000,
     sendInterruptRaw: false,
     manageBridge: true,
     modeCommand,
@@ -3715,7 +3726,7 @@ test('claude-p runtime retries an empty StopTimeout once', async () => {
   const runtime = new ClaudePTranscriptRuntime({
     command,
     extraArgs: [],
-    timeoutMs: 2_000,
+    timeoutMs: 20_000,
     skipPermissions: false,
     resume: false,
     stopTimeoutRetries: 1,

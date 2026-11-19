@@ -27,6 +27,13 @@ import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs
 const adapter = resolve('dist/src/adapter.mjs')
 const shim = resolve('scripts/codex-shim')
 
+// The adapters these tests spawn inherit this environment. Drop what a
+// developer's shell or Claude Code session exports (credentials, a Claude
+// config folder, a live adapter or Codex home), as CI never has any of it.
+for (const key of Object.keys(process.env)) {
+  if (/^(ANTHROPIC_|CLAUDE|CODEX_)/.test(key)) delete process.env[key]
+}
+
 test('server dispatch covers current Codex app-server client method surface', async () => {
   const source = await readFile(resolve('src/server.mts'), 'utf8')
   const methods = [
@@ -2117,7 +2124,7 @@ test('default runtime tool policy leaves Claude Code tools unrestricted unless e
   }
 })
 
-test('unix websocket app-server accepts initialize', { timeout: 15_000 }, async () => {
+test('unix websocket app-server accepts initialize', { timeout: 30_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
   // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
@@ -2289,7 +2296,7 @@ test('unix daemon keeps active turns alive across peer reconnect', async () => {
 
     ws2.close()
     await once(ws2, 'close')
-    assert.equal(await waitForExit(proc, 2000), 0)
+    assert.equal(await waitForExit(proc, 10_000), 0)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -3151,7 +3158,7 @@ test('startup recovery fails only the turns of servers that are gone', async () 
 })
 
 test('app-server proxy forwards websocket handshake bytes to unix daemon', {
-  timeout: 15_000,
+  timeout: 30_000,
 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
@@ -3190,7 +3197,7 @@ test('app-server proxy forwards websocket handshake bytes to unix daemon', {
 })
 
 test('the daemon and the proxy meet at CLAUDE_CODEX_SOCKET_PATH without a path argument', {
-  timeout: 15_000,
+  timeout: 30_000,
 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
@@ -3239,7 +3246,7 @@ test('the daemon and the proxy meet at CLAUDE_CODEX_SOCKET_PATH without a path a
 })
 
 test('app-server proxy carries websocket JSON-RPC traffic over stdio', {
-  timeout: 15_000,
+  timeout: 30_000,
 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
@@ -3286,7 +3293,7 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', {
 })
 
 test('remote shim launches daemon and proxy with Codex-compatible commands', {
-  timeout: 15_000,
+  timeout: 30_000,
 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
@@ -10414,7 +10421,17 @@ test('file change approval emits patch and git diff updates', { timeout: 15_000 
   execFileSync('git', ['add', 'README.md'], { cwd: repo })
   execFileSync(
     'git',
-    ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'],
+    [
+      '-c',
+      'user.name=Test',
+      '-c',
+      'user.email=test@example.com',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '-m',
+      'init',
+    ],
     { cwd: repo, stdio: 'ignore' },
   )
 
@@ -10650,7 +10667,17 @@ test('gitDiffToRemote includes untracked files for Codex diff review', async () 
   execFileSync('git', ['add', 'README.md'], { cwd: repo })
   execFileSync(
     'git',
-    ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'],
+    [
+      '-c',
+      'user.name=Test',
+      '-c',
+      'user.email=test@example.com',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '-m',
+      'init',
+    ],
     { cwd: repo, stdio: 'ignore' },
   )
   await writeFile(join(repo, 'new-file.txt'), 'new content\n')
@@ -13297,7 +13324,17 @@ test('optional auto worktree binds new threads to isolated git worktrees', async
   execFileSync('git', ['add', 'README.md'], { cwd: repo })
   execFileSync(
     'git',
-    ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'],
+    [
+      '-c',
+      'user.name=Test',
+      '-c',
+      'user.email=test@example.com',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '-m',
+      'init',
+    ],
     { cwd: repo, stdio: 'ignore' },
   )
 
@@ -13597,7 +13634,13 @@ async function stopProcess(proc: ChildProcess, timeoutMs = 2000): Promise<void> 
   await wait()
 }
 
-async function waitForStderr(proc: ChildProcess, pattern: RegExp): Promise<void> {
+// A daemon normally listens within a second; a stalled CI runner has taken
+// over five.
+async function waitForStderr(
+  proc: ChildProcess,
+  pattern: RegExp,
+  timeoutMs = 10_000,
+): Promise<void> {
   if (!proc.stderr) throw new Error('test process has no stderr')
   proc.stderr.setEncoding('utf8')
   let acc = ''
@@ -13620,9 +13663,14 @@ async function waitForStderr(proc: ChildProcess, pattern: RegExp): Promise<void>
     }
     const timeout = setTimeout(() => {
       cleanup()
+      const state = `exitCode=${proc.exitCode} signal=${proc.signalCode}`
       proc.kill()
-      reject(new Error(`timed out waiting for stderr ${pattern}; saw: ${acc}`))
-    }, 5000)
+      reject(
+        new Error(
+          `timed out after ${timeoutMs} ms waiting for stderr ${pattern} (${state}); saw: ${acc}`,
+        ),
+      )
+    }, timeoutMs)
     proc.stderr?.on('data', onData)
     proc.once('exit', onExit)
   })

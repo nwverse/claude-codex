@@ -6,6 +6,9 @@ import test from 'node:test'
 import { CodexProxyRuntime } from '../src/codex-proxy-runtime.mjs'
 import type { RuntimeEvent, RuntimeTurnContext } from '../src/types.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 test('Codex initial and resumed turns retain exec options and process cwd', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'codex-resume-'))
   const oldBinary = process.env.CODEX_REAL

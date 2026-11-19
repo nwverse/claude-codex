@@ -4,6 +4,9 @@ import { MockRuntime } from '../src/mock-runtime.mjs'
 import type { PermissionDecision, RuntimeTurnContext } from '../src/types.mjs'
 import { type InProcessApp, scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 // The App draws a stored contextCompaction, or one item/completed closed, as
 // "Context compacted", and an open one as compacting while its turn runs and
 // as interrupted after it. So a compaction is stored only once it completes,

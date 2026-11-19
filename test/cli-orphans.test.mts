@@ -7,6 +7,9 @@ import { join, resolve } from 'node:path'
 import test from 'node:test'
 import { parseProcessRows, reapOrphanedCliChildren } from '../src/cli-orphans.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 const modulePath = resolve('dist/src/cli-orphans.mjs')
 
 function alive(pid: number): boolean {

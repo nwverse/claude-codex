@@ -15,6 +15,9 @@ import {
   parseDynamicTools,
 } from '../src/dynamic-tools.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 const adapter = resolve('dist/src/adapter.mjs')
 
 const listArtifacts = {
