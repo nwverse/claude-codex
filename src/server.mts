@@ -859,7 +859,7 @@ export class CodexClaudeAppServer {
     // Startup also drops legacy overrides, including private desktop MCP
     // settings. Keep the server available if the settings file is unreadable.
     try {
-      this.loadPersistedConfig(true)
+      this.loadPersistedConfig('startup')
     } catch (error) {
       debugLog('config.load.failed', {
         path: this.configPath,
@@ -1482,6 +1482,9 @@ export class CodexClaudeAppServer {
   }
 
   private threadStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    // Another adapter can tighten the defaults between starts. Read them
+    // before creating a worktree or thread, even if this peer skips config/read.
+    this.loadPersistedConfig('thread')
     // Specs Codex would reject fail the request, as they do there. With the
     // switch off they are ignored.
     // App rule: dynamic-tools
@@ -10694,10 +10697,12 @@ export class CodexClaudeAppServer {
     for (const id of this.store.descendantThreadIds(rootThreadId)) this.subscribe(id, peer)
   }
 
-  private loadPersistedConfig(repairLegacyOverrides = false): Record<string, unknown> | null {
+  private loadPersistedConfig(
+    purpose: 'read' | 'startup' | 'thread' = 'read',
+  ): Record<string, unknown> | null {
     // Read first. A transient I/O error must leave the last good in-memory
     // settings intact, and prevent a writer from replacing the unread file.
-    const saved = this.savedConfig()
+    const saved = this.savedConfig(purpose === 'thread')
     const parsed = saved ?? {}
     const fallback = defaultSelectableModelId()
     this.configModel =
@@ -10728,7 +10733,7 @@ export class CodexClaudeAppServer {
       : []
     // A model missing from this adapter's picker can be valid for a different
     // adapter. Keep its on-disk selection until an explicit model edit.
-    if (repairLegacyOverrides && pruned) {
+    if (purpose === 'startup' && pruned) {
       // A clean startup only reads. Recheck inside the writer lock before
       // migrating, in case another process saved since the initial read.
       this.store.transaction(() => {
@@ -10740,14 +10745,20 @@ export class CodexClaudeAppServer {
     return saved
   }
 
-  private savedConfig(): Record<string, unknown> | null {
+  private savedConfig(forThreadStart: boolean): Record<string, unknown> | null {
     try {
-      return asTable(JSON.parse(readFileSync(this.configPath, 'utf8')))
+      const parsed = asTable(JSON.parse(readFileSync(this.configPath, 'utf8')))
+      if (parsed || !forThreadStart) return parsed
     } catch (error) {
-      if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === 'ENOENT')
-        return null
-      throw error
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      if (!(error instanceof SyntaxError)) throw error
+      if (!forThreadStart) return null
     }
+    // A settings edit can repair malformed JSON. Starting a new thread
+    // without its saved permission defaults must wait for that repair.
+    throw new Error(
+      `Cannot start a thread because ${this.configPath} must contain a valid JSON object.`,
+    )
   }
 
   private persistConfig(

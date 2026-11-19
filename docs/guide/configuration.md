@@ -350,6 +350,12 @@ and reports it back with `config/read`, except for settings Claude threads have
 no counterpart for: a write that sets one of those fails, and the App shows
 "Couldn't update this setting" next to it.
 
+Adapters sharing a home read the latest settings when a client requests them
+or starts a thread. A thread that omits a permission setting uses the most
+recently saved default for it. If the settings file cannot be read or parsed
+as a JSON object, the start returns an error. A settings write can repair
+malformed JSON.
+
 | Setting | Written by | For Claude threads |
 | --- | --- | --- |
 | `model`, `model_reasoning_effort` | the App | the model and effort of new threads |

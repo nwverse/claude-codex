@@ -275,7 +275,7 @@ const requiresFilePermissions = {
 }
 
 test(
-  'an unreadable settings file retains its contents and the last loaded model',
+  'an unreadable settings file blocks a new thread and preserves the last loaded model',
   requiresFilePermissions,
   async () => {
     await withServer(async (server) => {
@@ -284,6 +284,8 @@ test(
         edits: [
           { keyPath: 'model', value: 'opus' },
           { keyPath: 'web_search', value: 'disabled' },
+          { keyPath: 'approval_policy', value: 'never' },
+          { keyPath: 'sandbox_mode', value: 'danger-full-access' },
         ],
       })
       const before = await readFile(file, 'utf8')
@@ -294,7 +296,11 @@ test(
           server.request('config/value/write', { keyPath: 'model_reasoning_effort', value: 'low' }),
           /EACCES|EPERM/,
         )
-        assert.equal((await server.request('thread/start', { cwd: server.home })).model, 'opus')
+        const from = server.mark()
+        await assert.rejects(server.request('thread/start', { cwd: server.home }), /EACCES|EPERM/)
+        assert.deepEqual(server.notified('thread/started', from), [])
+        const { data } = await server.request('model/list')
+        assert.equal(data.find((model: { isDefault: boolean }) => model.isDefault).id, 'opus')
       } finally {
         await chmod(file, 0o600)
       }
@@ -336,6 +342,61 @@ test(
     })
   },
 )
+
+test('a new thread reads the permission defaults another adapter just tightened', async () => {
+  await withServer(async (a) => {
+    await a.request('config/batchWrite', {
+      edits: [
+        { keyPath: 'approval_policy', value: 'never' },
+        { keyPath: 'sandbox_mode', value: 'danger-full-access' },
+      ],
+    })
+    const b = new AppServer(a.home)
+    try {
+      const before = await b.request('thread/start', { cwd: a.home })
+      assert.equal(before.approvalPolicy, 'never')
+      assert.equal(before.sandbox.type, 'dangerFullAccess')
+      await a.request('config/batchWrite', {
+        edits: [
+          { keyPath: 'approval_policy', value: 'on-request' },
+          { keyPath: 'sandbox_mode', value: 'read-only' },
+        ],
+      })
+      const after = await b.request('thread/start', { cwd: a.home })
+      assert.equal(after.approvalPolicy, 'on-request')
+      assert.equal(after.sandbox.type, 'readOnly')
+      const original = await b.request('thread/resume', { threadId: before.thread.id })
+      assert.equal(original.approvalPolicy, 'never')
+      assert.equal(original.sandbox.type, 'dangerFullAccess')
+    } finally {
+      await b.close()
+    }
+  })
+})
+
+test('a new thread waits for a malformed settings file to be repaired', async () => {
+  await withServer(async (server) => {
+    await server.request('config/batchWrite', {
+      edits: [
+        { keyPath: 'approval_policy', value: 'never' },
+        { keyPath: 'sandbox_mode', value: 'danger-full-access' },
+      ],
+    })
+    const file = join(server.home, 'claude-codex-adapter', 'config.json')
+    for (const content of ['{"model":', '[]']) {
+      await writeFile(file, content)
+      await assert.rejects(
+        server.request('thread/start', { cwd: server.home }),
+        /valid JSON object/,
+      )
+      assert.equal(await readFile(file, 'utf8'), content)
+    }
+    await server.request('config/value/write', { keyPath: 'sandbox_mode', value: 'read-only' })
+    const repaired = await server.request('thread/start', { cwd: server.home })
+    assert.equal(repaired.approvalPolicy, 'on-request')
+    assert.equal(repaired.sandbox.type, 'readOnly')
+  })
+})
 
 test('opening clean settings takes no database writer lock', async (t) => {
   await withInProcessApp(
