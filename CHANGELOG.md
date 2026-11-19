@@ -36,6 +36,16 @@ versioning or publishing metadata.
 - A refused listener or another bad listener option ends the adapter with
   exit code 1 and the message alone, without a stack trace.
 
+### Isolated launcher
+
+- New `claude-codex-isolated` bin
+  (`node dist/src/isolated-launch.mjs --state-dir PATH [--port PORT]`) runs a
+  foreground adapter on a loopback `ws://` port. It keeps its own Codex home,
+  adapter state, logs and capability token (token auth is on by default), so a
+  chosen native `codex --remote` CLI can use Claude while Orca and other
+  `codex app-server` clients keep their native route. The SSH shim is
+  unchanged.
+
 ### Failures you can see and act on
 
 - A turn that fails after the computer slept for a minute or more since
@@ -135,6 +145,11 @@ versioning or publishing metadata.
   `excludedThreadIds`, and the exclusion applies before the page limit. A
   malformed or oversized (more than 100) `excludedThreadIds` returns
   `invalidRequest`, for `thread/search` too.
+- Streamed `command/exec` output (`streamStdoutStderr` or `tty`) now honors
+  `outputBytesCap`, including its 1,000,000-byte default, as Codex does: each
+  stream is cut at the cap, the delta that reaches it carries `capReached:
+  true`, and later data on that stream is dropped while the process keeps
+  running. `disableOutputCap` keeps streaming everything.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the
