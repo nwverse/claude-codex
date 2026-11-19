@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { type ChildProcess, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -19,7 +19,13 @@ async function tempDir(): Promise<string> {
 function startDaemon(home: string, sock: string): ChildProcess {
   return spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    env: {
+      PATH: process.env.PATH,
+      HOME: home,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+    },
   })
 }
 
@@ -94,6 +100,11 @@ test('a unix listener refuses a path that holds a regular file or a directory', 
     await writeFile(file, 'keep\n')
     assert.equal(await listenError(file), `refusing to replace non-socket file at ${file}`)
     assert.equal(await readFile(file, 'utf8'), 'keep\n')
+
+    const link = join(dir, 'link')
+    await symlink(file, link)
+    assert.equal(await listenError(link), `refusing to replace non-socket file at ${link}`)
+    assert.equal(await readlink(link), file)
 
     const folder = join(dir, 'folder')
     await mkdir(folder)
