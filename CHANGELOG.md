@@ -196,6 +196,12 @@ versioning or publishing metadata.
   `excludedThreadIds`, and the exclusion applies before the page limit. A
   malformed or oversized (more than 100) `excludedThreadIds` returns
   `invalidRequest`, for `thread/search` too.
+- A symlink under `.claude/rules` or `.claude/agents` that points back up the
+  tree (such as `a -> .`) no longer stalls the adapter. Starting, resuming or
+  forking a Claude thread in such a project used to block every other request
+  for seconds and then fail with `Maximum call stack size exceeded`. Each
+  folder is now read once, by its real path, and its rules and agents load as
+  usual.
 - `fs/watch` follows Codex: it keeps the path the client sent instead of its
   realpath, watches a file (such as `.git/HEAD`) through its directory so the
   watch survives git's lock-file rename and reports the file's own path, accepts
@@ -302,6 +308,12 @@ versioning or publishing metadata.
   are read in UTC and the C locale, so two adapters with a different `TZ`
   (an App launch and a shell) no longer drop a live sibling's record or miss
   a killed adapter's Claude CLI.
+- On a busy machine, a `claude-p` turn that times out or is interrupted stops
+  the processes it started in their own process group too. Listing the
+  process tree (`ps`) gave up after 1 s, which a loaded Mac with a thousand
+  or more processes often needs, and the stop then reached only the
+  `claude-p` process; the list now runs without blocking the adapter and
+  gets 10 s.
 - A second adapter started on the same state dir (a startup probe, another
   window) no longer fails the turns a running adapter is still working on.
   Each turn records the process that wrote it, by pid and start time, and
@@ -765,6 +777,12 @@ versioning or publishing metadata.
   user, password, path (where a per-user server URL keeps its secret), query
   and fragment are replaced. Other values, such as a server's `command`, are
   still logged.
+- Writing a debug log line no longer creates the log's folder and reads the
+  file's size each time; the adapter logs every streaming notification, so
+  this was a mkdir and two stats on every delta. The folder is made once (and
+  again if it is removed), and the size is re-read at most once a second, so
+  rotation at `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` still notices lines other
+  adapter processes append.
 - Settings a Claude thread cannot honor are refused with `INVALID_REQUEST`
   instead of being saved and ignored, so the App shows "Couldn't update this
   setting": `model_verbosity`, a service tier other than the default, network
@@ -1026,6 +1044,12 @@ versioning or publishing metadata.
   parent's turn with "FOREIGN KEY constraint failed" when the agent ends, or
   stops the adapter's shutdown halfway; the agent's end leaves nothing in
   the deleted thread.
+- A client that resumes a thread now follows all of its subagents and their
+  subagents. It used to follow only the first 50 children of each thread,
+  so a workflow with more agents left the rest without live updates there.
+  Finding a thread's subagents and the newest-first thread list use indexes
+  instead of reading every thread: with 20,000 threads a list page takes
+  about 1 ms instead of 25 ms.
 
 ### Rust-first protocol groundwork
 
