@@ -51,6 +51,37 @@ test('workflow CLI enqueues and schedules a task through the state file', async 
   assert.equal(output.task.lease?.workerId, 'worker-a')
 })
 
+test('workflow CLI persists failure when the final lease expires on an idle schedule', async () => {
+  const statePath = await tempStatePath()
+  const run = async (...args: string[]) => {
+    const io = captureIo()
+    assert.equal(await runWorkflowCli([...args, '--state', statePath], io), 0)
+    return io.stdoutText()
+  }
+  const status = async () => jsonOf<StatusOutput>(await run('status')).state
+  const start = '2026-07-04T00:00:00.000Z'
+  const expiry = '2026-07-04T00:00:01.000Z'
+  await run('enqueue', '--id', 'one', '--prompt', 'Example', '--max-attempts', '1', '--now', start)
+  await run('schedule', '--ttl-ms', '1000', '--now', start)
+  const running = await status()
+  assert.equal(running.tasks[0]?.status, 'running')
+
+  await run('schedule', '--now', '2026-07-04T00:00:00.999Z')
+  assert.deepEqual(await status(), running)
+  assert.equal(jsonOf<ScheduleOutput>(await run('schedule', '--now', expiry)).type, 'idle')
+  const terminal = await status()
+  const failed = terminal.tasks[0]
+  assert.ok(failed)
+  assert.equal(failed.status, 'failed')
+  assert.equal(failed.lease, null)
+  assert.equal(failed.attempts, 1)
+  assert.equal(failed.updatedAt, expiry)
+  assert.match(failed.lastError ?? '', /lease expired.*final attempt/i)
+
+  await run('schedule', '--now', '2026-07-04T00:00:02.000Z')
+  assert.deepEqual(await status(), terminal)
+})
+
 test('workflow CLI heartbeat and complete update the claimed task', async () => {
   const statePath = await tempStatePath()
   await runWorkflowCli(
