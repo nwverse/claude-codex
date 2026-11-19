@@ -266,6 +266,12 @@ versioning or publishing metadata.
   are read in UTC and the C locale, so two adapters with a different `TZ`
   (an App launch and a shell) no longer drop a live sibling's record or miss
   a killed adapter's Claude CLI.
+- On a busy machine, a `claude-p` turn that times out or is interrupted stops
+  the processes it started in their own process group too. Listing the
+  process tree (`ps`) gave up after 1 s, which a loaded Mac with a thousand
+  or more processes often needs, and the stop then reached only the
+  `claude-p` process; the list now runs without blocking the adapter and
+  gets 10 s.
 - A second adapter started on the same state dir (a startup probe, another
   window) no longer fails the turns a running adapter is still working on.
   Each turn records the process that wrote it, by pid and start time, and
