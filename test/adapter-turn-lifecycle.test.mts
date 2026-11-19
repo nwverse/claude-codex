@@ -1377,6 +1377,7 @@ async function runWatchdogScript(windowMs: number, body: string): Promise<void> 
         `
       import assert from 'node:assert/strict'
       import { join } from 'node:path'
+      import { mock } from 'node:test'
       import { NativeClaudeRuntime } from './dist/src/native-runtime.mjs'
       import { CodexClaudeAppServer } from './dist/src/server.mjs'
       import { SessionStore } from './dist/src/store.mjs'
@@ -1386,7 +1387,22 @@ async function runWatchdogScript(windowMs: number, body: string): Promise<void> 
       process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS = '${windowMs}'
       process.env.CLAUDE_CODEX_GOAL_TOOLS = '0'
       const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
-      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+      // Fixture progress and watchdog deadlines share a clock the script advances.
+      // Polling for real I/O keeps its own deadline even when that clock is stopped.
+      const realNow = performance.now.bind(performance)
+      const realTimer = setTimeout
+      const poll = () => new Promise((resolve) => realTimer(resolve, 10))
+      let elapsed = 0
+      mock.timers.enable({ apis: ['setTimeout'] })
+      mock.method(performance, 'now', () => elapsed)
+      const advance = async (ms) => {
+        elapsed += ms
+        mock.timers.tick(ms)
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+      const createServer = (runtime) => new CodexClaudeAppServer(store, runtime, {
+        sleepMonitor: { suspendedMs: () => 0, sleptSince: () => 0 },
+      })
       const messages = []
       const receivedAt = new Map()
       const peer = {
@@ -1403,11 +1419,11 @@ async function runWatchdogScript(windowMs: number, body: string): Promise<void> 
           (message) => message.method === 'turn/completed' && message.params.turn.id === turnId,
         )
       const waitFor = async (probe, label, timeoutMs = 5000) => {
-        const deadline = performance.now() + timeoutMs
-        while (performance.now() < deadline) {
+        const deadline = realNow() + timeoutMs
+        while (realNow() < deadline) {
           const value = probe()
           if (value) return value
-          await sleep(10)
+          await poll()
         }
         throw new Error('timed out waiting for ' + label)
       }
@@ -1449,7 +1465,7 @@ test('subagent watchdog waits as long as a foreground agent keeps reporting prog
     `
       const interrupted = []
       let listener = null
-      const server = new CodexClaudeAppServer(store, {
+      const server = createServer({
         setBackgroundListener(next) {
           listener = next
         },
@@ -1463,11 +1479,11 @@ test('subagent watchdog waits as long as a foreground agent keeps reporting prog
           })
           // Either kind of report alone spans two windows.
           for (let beat = 0; beat < 6; beat += 1) {
-            await sleep(100)
+            await advance(100)
             await handlers.onEvent({ type: 'subagent_progress', toolUseId })
           }
           for (let beat = 0; beat < 6; beat += 1) {
-            await sleep(100)
+            await advance(100)
             await listener.onTaskEvent(context.threadId, {
               type: 'task_progress',
               taskId: 'task-1',
@@ -1506,7 +1522,7 @@ test('subagent watchdog does not take a jump of the wall clock for a quiet agent
       const wallClock = Date.now
       let jumpedMs = 0
       Date.now = () => wallClock() + jumpedMs
-      const server = new CodexClaudeAppServer(store, {
+      const server = createServer({
         async runTurn(context, handlers) {
           const toolUseId = 'busy-' + context.turnId
           await handlers.onEvent({
@@ -1518,7 +1534,7 @@ test('subagent watchdog does not take a jump of the wall clock for a quiet agent
           // The wall clock leaps an hour ahead after every report, as when a
           // laptop wakes from sleep; the agent itself never goes quiet.
           for (let beat = 0; beat < 6; beat += 1) {
-            await sleep(100)
+            await advance(100)
             await handlers.onEvent({ type: 'subagent_progress', toolUseId })
             jumpedMs += 3_600_000
           }
@@ -1543,16 +1559,15 @@ test('subagent watchdog does not take a jump of the wall clock for a quiet agent
 })
 
 test('workflow watchdog waits while overlapping workflow agents keep starting and finishing', async () => {
-  // A tick is a twelfth of the window, so a slow machine that stretches one
-  // still leaves the next start or finish well inside it; each agent runs
-  // fourteen ticks, longer than the window however slow the ticks are.
+  // Each agent runs fourteen ticks. Starts and finishes keep the workflow
+  // moving even though that is longer than its twelve-tick watchdog window.
   const windowMs = 1_200
   await runWatchdogScript(
     windowMs,
     `
       const interrupted = []
       const ranMs = []
-      const server = new CodexClaudeAppServer(store, {
+      const server = createServer({
         async runTurn(context, handlers) {
           const launch = 'workflow-' + context.turnId
           await handlers.onEvent({
@@ -1592,7 +1607,7 @@ test('workflow watchdog waits while overlapping workflow agents keep starting an
               })
               ranMs.push(performance.now() - startedAt[index])
             }
-            await sleep(100)
+            await advance(100)
           }
           await handlers.onEvent({ type: 'completed', success: true, result: 'review done' })
         },
@@ -1624,7 +1639,8 @@ test('subagent watchdog fails a turn whose agent goes quiet for a whole window',
       const abandoned = []
       let turnHandlers = null
       let lastProgressAt = 0
-      const server = new CodexClaudeAppServer(store, {
+      let quiet = false
+      const server = createServer({
         async runTurn(context, handlers) {
           turnHandlers = handlers
           const toolUseId = 'quiet-' + context.turnId
@@ -1635,10 +1651,11 @@ test('subagent watchdog fails a turn whose agent goes quiet for a whole window',
             input: { description: 'flaky check', prompt: 'goes quiet' },
           })
           for (let beat = 0; beat < 4; beat += 1) {
-            await sleep(100)
+            await advance(100)
             await handlers.onEvent({ type: 'subagent_progress', toolUseId })
             lastProgressAt = performance.now()
           }
+          quiet = true
           return new Promise(() => {})
         },
         async steer() {},
@@ -1654,12 +1671,16 @@ test('subagent watchdog fails a turn whose agent goes quiet for a whole window',
       })
       const startedAt = performance.now()
       const { threadId, turnId } = await startTurn(server, 'check, then hang')
+      await waitFor(() => quiet, 'last progress')
+      await advance(299)
+      assert.equal(completion(turnId), undefined)
+      await advance(1)
       const completed = await waitFor(() => completion(turnId), 'watchdog')
       const failedAt = receivedAt.get(completed)
       assert.equal(completed.params.turn.status, 'failed')
       assert.match(completed.params.turn.error.message, /terminal result within 1 second/)
-      assert.ok(failedAt - startedAt >= 650, 'each report starts the window over')
-      assert.ok(failedAt - lastProgressAt >= 250, 'the turn fails a window after the last report')
+      assert.equal(failedAt - startedAt, 700, 'each report starts the window over')
+      assert.equal(failedAt - lastProgressAt, 300, 'the turn fails a window after the last report')
       await waitFor(() => interrupted.length === 1, 'interrupt')
       assert.deepEqual(abandoned, [turnId])
       assert.equal(childStatus('goes quiet'), 'failed')
@@ -1684,7 +1705,7 @@ test('subagent watchdog leaves the background agents a stalled turn handed off r
       const interrupted = []
       const abandoned = []
       let listener = null
-      const server = new CodexClaudeAppServer(store, {
+      const server = createServer({
         setBackgroundListener(next) {
           listener = next
         },
@@ -1733,8 +1754,9 @@ test('subagent watchdog leaves the background agents a stalled turn handed off r
       })
       const { threadId, turnId } = await startTurn(server, 'survey in the background, then check')
       // The background agent reports all along; that is no sign of the stuck one.
-      const beats = setInterval(() => {
-        void listener.onTaskEvent(threadId, {
+      await waitFor(() => childStatus('never returns') === 'inProgress', 'stuck agent')
+      for (let beat = 0; beat < 3; beat++) {
+        await listener.onTaskEvent(threadId, {
           type: 'task_progress',
           taskId: 'bg-task',
           toolUseId: 'bg-use',
@@ -1743,19 +1765,16 @@ test('subagent watchdog leaves the background agents a stalled turn handed off r
           lastToolName: 'Grep',
           usage: null,
         })
-      }, 100)
-      try {
-        const completed = await waitFor(() => completion(turnId), 'watchdog')
-        assert.equal(completed.params.turn.status, 'failed')
-        assert.match(completed.params.turn.error.message, /terminal result within 1 second/)
-        await waitFor(() => abandoned.length === 1, 'abandon')
-        assert.deepEqual(abandoned, [turnId])
-        assert.deepEqual(interrupted, [], 'an interrupt would end the background agent too')
-        assert.equal(childStatus('never returns'), 'failed')
-        assert.equal(childStatus('survey the code'), 'inProgress')
-      } finally {
-        clearInterval(beats)
+        await advance(100)
       }
+      const completed = await waitFor(() => completion(turnId), 'watchdog')
+      assert.equal(completed.params.turn.status, 'failed')
+      assert.match(completed.params.turn.error.message, /terminal result within 1 second/)
+      await waitFor(() => abandoned.length === 1, 'abandon')
+      assert.deepEqual(abandoned, [turnId])
+      assert.deepEqual(interrupted, [], 'an interrupt would end the background agent too')
+      assert.equal(childStatus('never returns'), 'failed')
+      assert.equal(childStatus('survey the code'), 'inProgress')
       await listener.onTaskEvent(threadId, {
         type: 'task_notification',
         taskId: 'bg-task',
@@ -1778,7 +1797,7 @@ test('subagent watchdog does not take background agents finishing for progress o
       const interrupted = []
       const abandoned = []
       let listener = null
-      const server = new CodexClaudeAppServer(store, {
+      const server = createServer({
         setBackgroundListener(next) {
           listener = next
         },
@@ -1834,9 +1853,7 @@ test('subagent watchdog does not take background agents finishing for progress o
       await waitFor(() => childStatus('never returns') === 'inProgress', 'stuck agent')
       // The agents the turn handed off finish one by one, faster than the
       // window; none of that is a sign of life from the stuck one.
-      let finished = 0
-      while (!completion(turnId) && finished < 10) {
-        await sleep(100)
+      for (let finished = 0; finished < 3; finished++) {
         await listener.onTaskEvent(threadId, {
           type: 'task_notification',
           taskId: 'bg-task-' + finished,
@@ -1846,11 +1863,11 @@ test('subagent watchdog does not take background agents finishing for progress o
           result: 'Part ' + finished + ' surveyed.',
           usage: null,
         })
-        finished += 1
+        await advance(100)
       }
       const completed = await waitFor(() => completion(turnId), 'watchdog')
       assert.equal(completed.params.turn.status, 'failed')
-      assert.ok(finished < 10, 'the turn fails while the agents it handed off still finish')
+      assert.equal(childStatus('survey part 3'), 'inProgress', 'another agent is still finishing')
       await waitFor(() => abandoned.length === 1, 'abandon')
       assert.deepEqual(interrupted, [])
       assert.equal(childStatus('never returns'), 'failed')
@@ -1887,7 +1904,7 @@ test('subagent watchdog counts tool_progress heartbeats of a quiet agent as prog
           },
         }
         for (let beat = 0; beat < 24; beat += 1) {
-          await sleep(100)
+          await advance(100)
           yield beat < 12
             ? {
                 type: 'tool_progress',
@@ -1934,7 +1951,7 @@ test('subagent watchdog counts tool_progress heartbeats of a quiet agent as prog
           })
         },
       })
-      const server = new CodexClaudeAppServer(store, runtime)
+      const server = createServer(runtime)
       const { turnId } = await startTurn(server, 'build it')
       const completed = await waitFor(() => completion(turnId), 'turn completion')
       assert.equal(completed.params.turn.status, 'completed')
