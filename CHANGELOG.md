@@ -141,6 +141,10 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- `thread/list` now filters by `searchTerm` (thread name or preview) and
+  `excludedThreadIds`, and the exclusion applies before the page limit. A
+  malformed or oversized (more than 100) `excludedThreadIds` returns
+  `invalidRequest`, for `thread/search` too.
 - `fs/watch` follows Codex: it keeps the path the client sent instead of its
   realpath, watches a file (such as `.git/HEAD`) through its directory so the
   watch survives git's lock-file rename and reports the file's own path, accepts
