@@ -959,8 +959,9 @@ export interface ElicitationResponse {
 
 export interface UserInputAnswers {
   // Keyed by question id. Each answer is an array of selected option labels
-  // (size > 1 only when the original question was multi-select). When the
-  // user picks "Other", the free-text reply lives in `notes`.
+  // (size > 1 only when the original question was multi-select). A free-text
+  // reply arrives as an extra `user_note: <text>` entry in `answers`; `notes` is
+  // a legacy fallback.
   answers: Record<string, { answers: string[]; notes?: string | null }>
 }
 

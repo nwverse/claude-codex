@@ -13,7 +13,7 @@ import {
   setAppPluginConfigOverrides,
 } from '../src/app-plugin-mcp.mjs'
 import { appMarketplacePlugin } from '../src/claude-capabilities.mjs'
-import { toolCallMeta } from '../src/mcp.mjs'
+import { callMcpTool, toolCallMeta } from '../src/mcp.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
 const fixture = resolve('test/fixtures/mcp-stdio-server.mjs')
@@ -539,3 +539,22 @@ function alive(pid: number): boolean {
     return false
   }
 }
+
+test('direct MCP calls ignore a thread cwd that is not a folder', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-codex-mcp-file-cwd-'))
+  const file = join(dir, 'not-a-folder')
+  await writeFile(file, '')
+  const previous = process.env.CLAUDE_CODEX_MCP_SERVERS
+  process.env.CLAUDE_CODEX_MCP_SERVERS = JSON.stringify({
+    fixture: { type: 'stdio', command: process.execPath, args: [fixture] },
+  })
+  try {
+    const result = await callMcpTool('fixture', 'process', {}, { cwd: file, inherit: false })
+    const content = result.structuredContent as { cwd: string }
+    assert.equal(content.cwd, await realpath(process.cwd()))
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_MCP_SERVERS
+    else process.env.CLAUDE_CODEX_MCP_SERVERS = previous
+    await rm(dir, { recursive: true, force: true })
+  }
+})

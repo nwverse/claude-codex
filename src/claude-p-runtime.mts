@@ -91,10 +91,11 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
   async interrupt(threadId: string): Promise<void> {
     const child = this.active.get(threadId)
     if (!child) return
-    terminateProcessTree(child, 'SIGINT')
+    const treePids = terminateProcessTree(child, 'SIGINT')
     setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null)
-        terminateProcessTree(child, 'SIGTERM')
+      // The leader usually exits on SIGINT before this fires; the follow-up
+      // must still reach whatever is left of the tree (see #263).
+      terminateProcessTree(child, 'SIGTERM', treePids)
     }, 1500).unref()
   }
 
@@ -167,21 +168,26 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
       let killTimer: NodeJS.Timeout | null = null
       const timeout = setTimeout(() => {
         timedOut = true
-        terminateProcessTree(child, 'SIGTERM')
+        const treePids = terminateProcessTree(child, 'SIGTERM')
         killTimer = setTimeout(() => {
-          if (child.exitCode === null && child.signalCode === null)
-            terminateProcessTree(child, 'SIGKILL')
+          // Escalate whether or not the leader has exited by now: it
+          // normally exits on SIGTERM well within the grace period, but
+          // descendants that trapped SIGTERM are still alive (see #263).
+          terminateProcessTree(child, 'SIGKILL', treePids)
         }, 1500).unref()
       }, this.options.timeoutMs)
       child.once('error', (error) => {
         clearTimeout(timeout)
-        if (killTimer) clearTimeout(killTimer)
+        if (killTimer && !timedOut) clearTimeout(killTimer)
         this.active.delete(threadId)
         reject(error)
       })
       child.once('close', (code) => {
         clearTimeout(timeout)
-        if (killTimer) clearTimeout(killTimer)
+        // On the timeout path the escalation must survive `close`: the
+        // leader exiting (and its stdio closing) is what used to cancel
+        // the SIGKILL. On a normal exit there is no kill timer to keep.
+        if (killTimer && !timedOut) clearTimeout(killTimer)
         this.active.delete(threadId)
         if (timedOut) {
           reject(new Error(`claude-p timed out after ${this.options.timeoutMs}ms`))
@@ -240,10 +246,21 @@ function isClaudePTimeoutError(error: unknown): boolean {
   return error instanceof Error && /^claude-p timed out after \d+ms$/.test(error.message)
 }
 
-function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (child.exitCode !== null || child.signalCode !== null) return
-  const childPids = child.pid ? descendantPids(child.pid) : []
-  for (const pid of childPids.reverse()) {
+function terminateProcessTree(
+  child: ChildProcess,
+  signal: NodeJS.Signals,
+  knownDescendants: number[] = [],
+): number[] {
+  // Kill descendants deepest first, then the process group, then the leader.
+  // Callers pass the snapshot taken while the leader was alive; while the
+  // leader is still alive, union it with a fresh snapshot (it may have
+  // spawned more since). Once Node has reaped the leader, skip the fresh
+  // snapshot and the leader kill because its PID may be reused; the group
+  // kill stays because a PGID is not reused while members survive (see #263).
+  const leaderAlive = child.exitCode === null && child.signalCode === null
+  const fresh = leaderAlive && child.pid ? descendantPids(child.pid) : []
+  const childPids = [...new Set([...knownDescendants, ...fresh])]
+  for (const pid of [...childPids].reverse()) {
     killPid(pid, signal)
   }
   if (process.platform !== 'win32' && child.pid) {
@@ -251,7 +268,8 @@ function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void
       process.kill(-child.pid, signal)
     } catch {}
   }
-  killPid(child.pid, signal)
+  if (leaderAlive) killPid(child.pid, signal)
+  return childPids
 }
 
 function killPid(pid: number | undefined, signal: NodeJS.Signals): void {

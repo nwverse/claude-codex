@@ -518,6 +518,16 @@ function goalBudget(value: unknown): number | null {
   return value
 }
 
+// thread/list's excludedThreadIds: at most 100 ids. A longer or malformed
+// list is rejected, never truncated, so no excluded thread slips back in.
+function threadIdList(value: unknown): string[] {
+  if (value == null) return []
+  if (!Array.isArray(value) || !value.every((id) => typeof id === 'string'))
+    throw invalidRequest('excludedThreadIds must be an array of thread ids')
+  if (value.length > 100) throw invalidRequest('excludedThreadIds takes at most 100 thread ids')
+  return value
+}
+
 // command/exec answers a timed-out command with Codex's EXEC_TIMEOUT_EXIT_CODE,
 // and waits this long for its pipes after it exits (Codex's IO_DRAIN_TIMEOUT_MS).
 const COMMAND_EXEC_TIMEOUT_EXIT_CODE = 124
@@ -670,6 +680,11 @@ export class CodexClaudeAppServer {
   private subscribersByThread = new Map<string, Map<string, RpcPeer>>()
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
+  // Threads a thread/delete is removing. It waits for their turns to end
+  // first; a turn/start in that gap, on one of them or on a subagent thread
+  // below one, is refused rather than starting a turn on a thread that is
+  // about to go.
+  private deletingThreads = new Set<string>()
   private readonly startingTurnByThread = new Map<string, Promise<void>>()
   // Turns whose runtime run is scheduled or has not returned yet. A turn outside this
   // set has nothing left that would ever end it.
@@ -1907,7 +1922,12 @@ export class CodexClaudeAppServer {
 
   private threadList(params: Record<string, unknown>): unknown {
     const query = this.threadListQuery(params)
-    const threads = this.store.listThreads(query.options)
+    // thread/list's searchTerm filters by title (name or preview) only; thread/search reads messages too.
+    const titleSearch =
+      typeof params.searchTerm === 'string' && params.searchTerm.trim().length > 0
+        ? params.searchTerm
+        : undefined
+    const threads = this.store.listThreads({ ...query.options, titleSearch })
     const last = threads.at(-1)
     return {
       data: threads.map((thread) => this.toThread(thread, [])),
@@ -1955,6 +1975,7 @@ export class CodexClaudeAppServer {
         : typeof params.projectId === 'string'
           ? params.projectId
           : undefined
+    const excludedThreadIds = threadIdList(params.excludedThreadIds)
     // The store pages at most 200 threads.
     const limit = pageLimit(params.limit, 200) ?? 50
     return {
@@ -1974,6 +1995,7 @@ export class CodexClaudeAppServer {
         parentThreadId,
         ancestorThreadId,
         sourceKinds,
+        excludedThreadIds,
         sortKey,
         sortDirection,
       },
@@ -3288,6 +3310,16 @@ export class CodexClaudeAppServer {
       if (params.missingRolloutRecovery === true) return {}
       throw new Error(`no rollout found for thread id ${threadId}`)
     }
+    this.deletingThreads.add(threadId)
+    try {
+      await this.removeThread(peer, threadId)
+    } finally {
+      this.deletingThreads.delete(threadId)
+    }
+    return {}
+  }
+
+  private async removeThread(peer: RpcPeer, threadId: string): Promise<void> {
     if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
     // Background agents go with the thread that launched them (or that they
     // are, or that they hang off): their turns end before their threads do.
@@ -3316,7 +3348,6 @@ export class CodexClaudeAppServer {
       for (const target of targets.values())
         this.sendNotification(target, { method: 'thread/deleted', params: { threadId: id } })
     }
-    return {}
   }
 
   private threadShellCommand(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -3993,7 +4024,7 @@ export class CodexClaudeAppServer {
         onEvent: async (event) => {
           if (event.type === 'text_delta' && event.delta && active()) {
             collected += event.delta
-            this.store.updateItem(turnId, agentItemId, (item) =>
+            this.store.streamItem(turnId, agentItemId, (item) =>
               item.type === 'agentMessage' ? { ...item, text: item.text + event.delta } : item,
             )
             this.notify(peer, {
@@ -4043,8 +4074,7 @@ export class CodexClaudeAppServer {
 
   private async startClaimedTurn(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
-    const thread = this.store.getThread(threadId)
-    if (!thread) throw unknownThread(threadId)
+    let thread = this.startableThread(threadId)
     this.checkModelProfileBinding(thread)
     // Follow-up turns the adapter starts itself have no requesting peer.
     if (peer !== DETACHED_PEER) this.subscribe(threadId, peer)
@@ -4094,6 +4124,9 @@ export class CodexClaudeAppServer {
         workflowCommand?.type === 'list',
       )
       if (joined) return { turn: this.toLifecycleTurn(joined) }
+      // Other requests ran while the input waited: take the thread as they
+      // left it, so this turn's write keeps a rename and a delete holds.
+      thread = this.startableThread(threadId)
     }
     // A structured summary or title turn runs its model, mapped to the
     // summary model, for that turn alone; it never rebinds the thread's.
@@ -4253,6 +4286,19 @@ export class CodexClaudeAppServer {
       })
     })
     return { turn: publicTurn }
+  }
+
+  private startableThread(threadId: string): ThreadRecord {
+    const thread = this.store.getThread(threadId)
+    if (!thread || this.isBeingDeleted(threadId)) throw unknownThread(threadId)
+    return thread
+  }
+
+  // store.deleteThread takes a thread's subagent threads with it.
+  private isBeingDeleted(threadId: string): boolean {
+    for (const id of this.deletingThreads)
+      if (id === threadId || this.isSubagentDescendant(threadId, id)) return true
+    return false
   }
 
   // Steers input into the thread's running turn. Returns null when there is
@@ -5701,7 +5747,7 @@ export class CodexClaudeAppServer {
             completeReasoningItem()
             hasTextOutput = true
             const itemId = ensureAgentItem()
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type === 'agentMessage') return { ...item, text: item.text + event.delta }
               return item
             })
@@ -5715,7 +5761,7 @@ export class CodexClaudeAppServer {
             if (event.delta.length === 0) return
             completeAgentItem('commentary')
             const itemId = ensureReasoningItem()
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type !== 'reasoning') return item
               return reasoningVisible
                 ? { ...item, summary: [(item.summary[0] ?? '') + event.delta] }
@@ -5811,7 +5857,7 @@ export class CodexClaudeAppServer {
             // Output that comes after the result is not the item's any more.
             if (!itemId || !openToolItems.has(itemId)) return
             commandOutputSeen.add(itemId)
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
                 return {
                   ...item,
@@ -5839,7 +5885,7 @@ export class CodexClaudeAppServer {
               const started = itemStartedAtMs.get(itemId)
               return started == null ? null : Math.max(0, nowMillis() - started)
             })()
-            const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
+            const parsedExitCode = event.isError ? (parseExitCodeFromResult(event.content) ?? 1) : 0
             const output = exploreItemIds.has(itemId) ? capOutput(resultText) : resultText
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
@@ -6135,8 +6181,11 @@ export class CodexClaudeAppServer {
             )
             itemId = item.id
             itemIds.set(event.toolUseId, item.id)
+            itemStartedAtMs.set(item.id, nowMillis())
             openToolItems.add(item.id)
             if (isExploreTool(event.toolName)) exploreItemIds.add(item.id)
+            else if (item.type === 'commandExecution')
+              this.rememberCommandItem(event.toolUseId, thread.id, turn.id, item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -7139,7 +7188,7 @@ export class CodexClaudeAppServer {
     const at = this.commandItems.get(event.toolUseId)
     if (!at || at.threadId !== threadId || !event.delta) return
     let found = false
-    this.store.updateItem(at.turnId, at.itemId, (item) => {
+    this.store.streamItem(at.turnId, at.itemId, (item) => {
       if (item.type !== 'commandExecution') return item
       found = true
       return { ...item, aggregatedOutput: appendCommandOutput(item.aggregatedOutput, event.delta) }
@@ -8000,10 +8049,10 @@ export class CodexClaudeAppServer {
     signal?: AbortSignal,
   ): Promise<UserInputAnswers> {
     const requestId = newId()
-    // Always guarantee an "Other" affordance so the App's free-text fallback
-    // is available, even when the upstream caller (Claude tool input, mock
-    // runtime, etc.) didn't model it explicitly.
+    // Questions with isOther already get the App's own free-text choice; for
+    // callers that don't set it, fall back to a plain "Other" option.
     const normalized = questions.map((q) => {
+      if (q.isOther) return q
       const options = q.options ?? []
       const hasOther = options.some((o) => o.label === 'Other')
       return hasOther
@@ -10278,6 +10327,8 @@ export class CodexClaudeAppServer {
         threadId,
         error: error instanceof Error ? error.message : String(error),
       })
+      // What is stored describes the workspace the thread left.
+      if (options.replace && !this.stopped) this.store.setThreadGitInfo(threadId, null)
     }
   }
 
