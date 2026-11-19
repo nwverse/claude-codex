@@ -115,6 +115,9 @@ including repeated entries in one export, are reported in `existing` and keep
 their saved status, attempts, lease, prompt, settings, errors, and blocked reason.
 `enqueued` and `taskIds` describe only newly inserted tasks. Use explicit
 `enqueue --id` to intentionally replace a task instead.
+A `gh issue list` export and a GitHub REST export of the same ordinary issue
+(github.com, GHE.com or GitHub Enterprise Server) share one task ID, so a task
+saved under either ID is reported in `existing`.
 
 Before changing code for a GitHub-sourced task, inspect external text through
 the project trust-boundary workflow and keep the execution step explicit in the

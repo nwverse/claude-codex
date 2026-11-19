@@ -4,6 +4,7 @@ import type { WorkflowTask } from './workflow-state.mjs'
 export interface GitHubQueueParseResult {
   readonly tasks: readonly WorkflowTask[]
   readonly skipped: readonly GitHubQueueSkippedItem[]
+  readonly existing: readonly string[]
 }
 
 export interface GitHubQueueSkippedItem {
@@ -11,26 +12,44 @@ export interface GitHubQueueSkippedItem {
   readonly reason: string
 }
 
-export function parseGitHubQueueJson(text: string, now: Date): GitHubQueueParseResult {
+export function parseGitHubQueueJson(
+  text: string,
+  now: Date,
+  savedIds: Iterable<string> = [],
+): GitHubQueueParseResult {
   const parsed: unknown = JSON.parse(text)
   const entries = Array.isArray(parsed) ? parsed : [parsed]
   const tasks: WorkflowTask[] = []
   const skipped: GitHubQueueSkippedItem[] = []
+  const knownIds = new Set(savedIds)
+  const existing: string[] = []
 
   entries.forEach((entry, index) => {
-    const task = taskFromGitHubEntry(entry, now)
-    if (task.kind === 'task') {
-      tasks.push(task.task)
-    } else {
-      skipped.push({ index, reason: task.reason })
+    const item = taskFromGitHubEntry(entry, now)
+    if (item.kind === 'skip') {
+      skipped.push({ index, reason: item.reason })
+      return
     }
+    if (!item.issueIds) {
+      tasks.push(item.task)
+      return
+    }
+    const { web, api } = item.issueIds
+    // A worker may still be using the REST-derived ID from its original claim.
+    const saved = [item.task.id, web, api].find((id) => knownIds.has(id))
+    if (saved) {
+      existing.push(saved)
+      return
+    }
+    knownIds.add(web)
+    tasks.push({ ...item.task, id: web })
   })
 
-  return { tasks, skipped }
+  return { tasks, skipped, existing }
 }
 
 type GitHubEntryTaskResult =
-  | { readonly kind: 'task'; readonly task: WorkflowTask }
+  | { readonly kind: 'task'; readonly task: WorkflowTask; readonly issueIds: IssueIds | null }
   | { readonly kind: 'skip'; readonly reason: string }
 
 function taskFromGitHubEntry(entry: unknown, now: Date): GitHubEntryTaskResult {
@@ -48,8 +67,9 @@ function taskFromGitHubEntry(entry: unknown, now: Date): GitHubEntryTaskResult {
   const sourceUrl = url === null ? 'unknown' : compactText(url, 240)
   return {
     kind: 'task',
+    issueIds: kind === 'issue' && url ? ordinaryIssueIds(url, number) : null,
     task: {
-      id: `github-${kind}-${number}-${stableHash(`${kind}:${number}:${sourceUrl}`).slice(0, 12)}`,
+      id: taskId(kind, number, sourceUrl),
       status: 'queued',
       updatedAt: now.toISOString(),
       prompt: [
@@ -65,6 +85,45 @@ function taskFromGitHubEntry(entry: unknown, now: Date): GitHubEntryTaskResult {
       blockedReason: null,
       lastError: null,
     },
+  }
+}
+
+function taskId(kind: 'issue' | 'pull-request', number: number, sourceUrl: string): string {
+  const hash = stableHash(`${kind}:${number}:${compactText(sourceUrl, 240)}`)
+  return `github-${kind}-${number}-${hash.slice(0, 12)}`
+}
+
+interface IssueIds {
+  readonly web: string
+  readonly api: string
+}
+
+function ordinaryIssueIds(raw: string, number: number): IssueIds | null {
+  const url = URL.parse(raw)
+  if (
+    !url ||
+    !['https:', 'http:'].includes(url.protocol) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  )
+    return null
+  const match = /^\/(?:(repos|api\/v3\/repos)\/)?([^/]+\/[^/]+\/issues\/(\d+))$/.exec(url.pathname)
+  if (!match || match[3] !== String(number)) return null
+  const [, prefix, issuePath] = match
+  const cloud =
+    url.hostname === 'github.com' ||
+    url.hostname === 'api.github.com' ||
+    url.hostname.endsWith('.ghe.com')
+  const cloudApi = cloud && url.hostname.startsWith('api.')
+  if (cloudApi !== (prefix === 'repos') || (cloud && prefix === 'api/v3/repos')) return null
+  const webHost = cloudApi ? url.host.slice(4) : url.host
+  const webOrigin = `${url.protocol}//${webHost}`
+  const apiBase = cloud ? `${url.protocol}//api.${webHost}/repos` : `${webOrigin}/api/v3/repos`
+  return {
+    web: taskId('issue', number, `${webOrigin}/${issuePath}`),
+    api: taskId('issue', number, `${apiBase}/${issuePath}`),
   }
 }
 
