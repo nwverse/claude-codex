@@ -36,6 +36,16 @@ versioning or publishing metadata.
 - A refused listener or another bad listener option ends the adapter with
   exit code 1 and the message alone, without a stack trace.
 
+### Isolated launcher
+
+- New `claude-codex-isolated` bin
+  (`node dist/src/isolated-launch.mjs --state-dir PATH [--port PORT]`) runs a
+  foreground adapter on a loopback `ws://` port. It keeps its own Codex home,
+  adapter state, logs and capability token (token auth is on by default), so a
+  chosen native `codex --remote` CLI can use Claude while Orca and other
+  `codex app-server` clients keep their native route. The SSH shim is
+  unchanged.
+
 ### Failures you can see and act on
 
 - A turn that fails after the computer slept for a minute or more since
@@ -221,6 +231,12 @@ versioning or publishing metadata.
   Each turn records the process that wrote it, by pid and start time, and
   startup recovery fails only the turns of processes that are gone; turns
   written before this change are recovered as before.
+- Opening the state database no longer rewrites thread rows. The startup
+  repairs for pin state and legacy enum values rewrote every unsectioned
+  thread on each open and scanned the instruction text; they now check with
+  a read first and touch only rows that need fixing, so a clean store opens
+  without a write or the write lock (about 20 ms instead of 320-370 ms for
+  20,000 threads with large instructions).
 - `app-server --print-startup-config` (codex 0.164) prints its one JSON line
   (`appServerVersion` and `configRequirements`) and exits, and
   `app-server daemon version` reports the unix daemon listening on the control
