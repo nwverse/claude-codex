@@ -67,7 +67,7 @@ configuration as they are. Ordinary `codex app-server`, CLI commands and Orca
 chats keep their native route. It requires a native Codex CLI with `--remote`
 and `--remote-auth-token-env` support; an already installed global shim still
 intercepts app-server calls, so clients needing native Codex must resolve the
-real executable. See [Deployment](https://fuergaosi233.github.io/claude-codex/guide/deployment#alongside-orca-and-native-codex)
+real executable. See [Deployment](https://nwverse.github.io/claude-codex/guide/deployment#alongside-orca-and-native-codex)
 for lifecycle, crash recovery and environment details.
 
 ### Codex App over SSH
