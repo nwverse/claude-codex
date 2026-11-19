@@ -43,10 +43,11 @@ export function scheduleNextWorkflowTask(
   state: WorkflowState,
   options: WorkflowSchedulerOptions,
 ): WorkflowScheduleDecision {
-  const task = runnableTasks(state.tasks, options.now)[0]
-  if (!task) return { type: 'idle', reason: 'no-runnable-task', state }
+  const current = failExpiredFinalAttempts(state, options.now)
+  const task = runnableTasks(current.tasks, options.now)[0]
+  if (!task) return { type: 'idle', reason: 'no-runnable-task', state: current }
   const claimed = startWorkflowTask(task, options)
-  return { type: 'claimed', task: claimed, state: replaceTask(state, claimed) }
+  return { type: 'claimed', task: claimed, state: replaceTask(current, claimed) }
 }
 
 export function renewWorkflowLease(
@@ -146,6 +147,19 @@ function canTransition(from: WorkflowTaskStatus, to: WorkflowTaskStatus): boolea
     default:
       return assertNever(from)
   }
+}
+
+function failExpiredFinalAttempts(state: WorkflowState, now: Date): WorkflowState {
+  let tasks: WorkflowTask[] | undefined
+  for (const [index, task] of state.tasks.entries()) {
+    if (task.attempts < task.maxAttempts || !hasExpiredLease(task, now)) continue
+    tasks ??= [...state.tasks]
+    tasks[index] = {
+      ...transitionTask(task, 'failed', now),
+      lastError: 'Worker lease expired on the final attempt',
+    }
+  }
+  return tasks ? { ...state, tasks } : state
 }
 
 function runnableTasks(tasks: readonly WorkflowTask[], now: Date): readonly WorkflowTask[] {
