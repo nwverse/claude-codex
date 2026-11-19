@@ -228,6 +228,8 @@ versioning or publishing metadata.
   `excludedThreadIds`, and the exclusion applies before the page limit. A
   malformed or oversized (more than 100) `excludedThreadIds` returns
   `invalidRequest`, for `thread/search` too.
+- Sidebar search and title filtering use the same Unicode case matching as
+  in-chat search. Multiline queries can find adjacent message text parts. (#168)
 - A symlink under `.claude/rules` or `.claude/agents` that points back up the
   tree (such as `a -> .`) no longer stalls the adapter. Starting, resuming or
   forking a Claude thread in such a project used to block every other request

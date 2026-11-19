@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { currentProcessOwner, otherProcessRunning } from './process-owner.mjs'
+import { searchPattern } from './thread-history.mjs'
 import type {
   ClaudeCheckpoint,
   ClaudeResumePoint,
@@ -54,12 +55,20 @@ function openDatabase(path: string): DatabaseSync {
     DatabaseSync: new (filename: string, options?: { timeout?: number }) => DatabaseSync
   }
   const db = new sqlite.DatabaseSync(path, { timeout: busyTimeoutMs() })
-  // SQLite's LIKE ignores case for ASCII letters only, so thread search
-  // lowercases both sides with this. ς is σ at the end of a word, and the
-  // term and the text can disagree on where a word ends.
-  db.function('cc_fold', { deterministic: true }, (text: unknown) =>
-    text == null ? null : String(text).toLowerCase().replaceAll('ς', 'σ'),
-  )
+  // Reuse the literal Unicode matcher used for snippets and in-chat search.
+  // Queries have at most two needles: the displayed text and its JSON form.
+  const needles = new Map<string, RegExp | null>()
+  db.function('cc_contains', { deterministic: true }, (text: string | null, term: string) => {
+    if (text == null) return 0
+    if (!needles.has(term)) {
+      if (needles.size === 2) needles.clear()
+      needles.set(term, searchPattern(term))
+    }
+    const pattern = needles.get(term)
+    if (!pattern) return Number(text.includes(term))
+    pattern.lastIndex = 0
+    return Number(pattern.test(text))
+  })
   return db
 }
 
@@ -83,11 +92,6 @@ export function settledTurn(
 const PROJECT_SELECT = `SELECT p.*, (
   SELECT MAX(t.updated_at) FROM threads t WHERE t.project_id = p.id AND t.archived = 0
 ) AS recency_at FROM projects p`
-
-// A LIKE pattern matching the text anywhere, with `\` as the escape.
-function likePattern(text: string): string {
-  return `%${text.replace(/[\\%_]/g, '\\$&')}%`
-}
 
 function checkpointFrom(sessionId: unknown, messageUuid: unknown): ClaudeCheckpoint | null {
   return typeof sessionId === 'string' && typeof messageUuid === 'string'
@@ -617,22 +621,21 @@ export class SessionStore {
       }
     }
     if (options.searchTerm) {
-      const text = likePattern(options.searchTerm)
-      const json = likePattern(JSON.stringify(options.searchTerm).slice(1, -1))
+      // Visible message text joins adjacent text inputs with a newline; the
+      // encoded JSON need only contain one nonempty line to be a candidate.
+      const line = options.searchTerm.split('\n').find(Boolean) ?? options.searchTerm
+      const json = JSON.stringify(line).slice(1, -1)
       where.push(
-        `(cc_fold(t.name) LIKE cc_fold(?) ESCAPE '\\'
-           OR cc_fold(t.preview) LIKE cc_fold(?) ESCAPE '\\'
-           OR EXISTS (SELECT 1 FROM turns u
-             WHERE u.thread_id = t.id AND cc_fold(u.items_json) LIKE cc_fold(?) ESCAPE '\\')
+        `(cc_contains(t.name, ?) OR cc_contains(t.preview, ?)
+           OR EXISTS (SELECT 1 FROM turns u WHERE u.thread_id = t.id AND cc_contains(u.items_json, ?))
            OR EXISTS (SELECT 1 FROM thread_inherited_turns h
-             WHERE h.thread_id = t.id AND cc_fold(h.items_json) LIKE cc_fold(?) ESCAPE '\\'))`,
+             WHERE h.thread_id = t.id AND cc_contains(h.items_json, ?)))`,
       )
-      args.push(text, text, json, json)
+      args.push(options.searchTerm, options.searchTerm, json, json)
     }
     if (options.titleSearch) {
-      const text = likePattern(options.titleSearch)
-      where.push(`(t.name LIKE ? ESCAPE '\\' OR t.preview LIKE ? ESCAPE '\\')`)
-      args.push(text, text)
+      where.push('(cc_contains(t.name, ?) OR cc_contains(t.preview, ?))')
+      args.push(options.titleSearch, options.titleSearch)
     }
     if (options.excludedThreadIds && options.excludedThreadIds.length > 0) {
       where.push(`t.id NOT IN (${options.excludedThreadIds.map(() => '?').join(', ')})`)

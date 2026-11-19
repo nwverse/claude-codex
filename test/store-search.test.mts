@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { SessionStore } from '../src/store.mjs'
 import type { ThreadRecord, TurnRecord } from '../src/types.mjs'
+import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 async function withStore(run: (store: SessionStore) => void): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-store-search-'))
@@ -57,7 +58,7 @@ function addThread(store: SessionStore, fields: Partial<ThreadRecord> = {}): str
   return id
 }
 
-function addTurn(store: SessionStore, threadId: string, text: string): void {
+function addTurn(store: SessionStore, threadId: string, ...parts: string[]): void {
   const now = Math.floor(Date.now() / 1000)
   const turn: TurnRecord = {
     id: randomUUID(),
@@ -70,7 +71,7 @@ function addTurn(store: SessionStore, threadId: string, text: string): void {
       {
         type: 'userMessage',
         id: randomUUID(),
-        content: [{ type: 'text', text, text_elements: [] }],
+        content: parts.map((text) => ({ type: 'text', text, text_elements: [] })),
       },
     ],
     diff: '',
@@ -132,4 +133,40 @@ test('thread search still ignores ASCII case and reads %, _ and \\ literally', a
     assert.deepEqual(found(store, 'c:\\temp'), [backslash])
     assert.deepEqual(found(store, 'd:\\data\\notes'), [path])
   })
+})
+
+test('sidebar search, title filtering and occurrences share the literal Unicode matcher', async () => {
+  await withInProcessApp(
+    scriptedRuntime(async () => {}),
+    async (app) => {
+      const thread = await app.startThread({ cwd: app.home })
+      app.store.updateThreadName(thread, 'Übersicht ſ · Straße')
+      addTurn(app.store, thread, 'The long ſ and K and ΟΔΟΣ')
+      const term = 'S AND K AND οδος'
+      const sidebar = await app.request('thread/search', { searchTerm: term })
+      assert.deepEqual(
+        sidebar.data.map((entry: any) => entry.thread.id),
+        [thread],
+      )
+      assert.match(sidebar.data[0].snippet, /ſ and K/)
+      const occurrences = await app.request('thread/searchOccurrences', {
+        threadId: thread,
+        searchTerm: term,
+      })
+      assert.equal(occurrences.data.length, 1)
+      addTurn(app.store, thread, 'FIRST SECTION', 'SECOND SECTION')
+      const multiline = await app.request('thread/search', { searchTerm: 'section\nsecond' })
+      assert.deepEqual(
+        multiline.data.map((entry: any) => entry.thread.id),
+        [thread],
+      )
+      const listed = await app.request('thread/list', { searchTerm: 'übersicht s' })
+      assert.deepEqual(
+        listed.data.map((entry: any) => entry.id),
+        [thread],
+      )
+      const distinct = await app.request('thread/list', { searchTerm: 'STRASSE' })
+      assert.deepEqual(distinct.data, [])
+    },
+  )
 })
