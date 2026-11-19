@@ -4247,11 +4247,11 @@ test('a Claude Code that refused to start fails the turn with why, retryable onl
         reason,
       )
       // The CLI's own text, with the proxy's credentials, reaches no one.
-      assert.doesNotMatch(JSON.stringify(failed), /secret|proxy\.invalid/, reason)
+      assert.doesNotMatch(JSON.stringify(failed), /user:secret|proxy\.invalid/, reason)
     }
     proc.stdin.write(json({ id, method: 'thread/read', params: { threadId, includeTurns: true } }))
     const read = await reader.nextResponse(id)
-    assert.doesNotMatch(JSON.stringify(read.result), /secret|proxy\.invalid/)
+    assert.doesNotMatch(JSON.stringify(read.result), /user:secret|proxy\.invalid/)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -12389,6 +12389,27 @@ test('direct MCP stdio resource and tool calls work', async () => {
     assert.equal(resource.result.contents[0].text, 'resource-ok')
     // No hosted app scoped the read.
     assert.equal(resource.result.originCallId, null)
+    // Each direct connection initializes with id 1 and calls the tool with id 2.
+    for (const [index, args] of [
+      { id: 2 },
+      { id: 37 },
+      {},
+      { id: 2, method: 'unsupported' },
+    ].entries()) {
+      const requestId = 3 + index
+      proc.stdin.write(
+        json({
+          id: requestId,
+          method: 'mcpServer/tool/call',
+          params: { threadId: 't', server: 'fixture', tool: 'ping', arguments: args },
+        }),
+      )
+      const ping = await reader.nextResponse(requestId)
+      assert.equal(
+        ping.result.content[0].text,
+        args.method ? 'pong:{"code":-32601,"message":"Method not found: unsupported"}' : 'pong:{}',
+      )
+    }
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -12982,16 +13003,22 @@ test('direct MCP HTTP tool calls work', async () => {
         )
         return
       }
+      res.setHeader('content-type', 'text/event-stream')
+      // A colliding server request and a notification are not the tool reply.
+      res.write(`data: ${JSON.stringify({ jsonrpc: '2.0', id: message.id, method: 'ping' })}\n\n`)
+      res.write(`data: ${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/message' })}\n\n`)
       res.end(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: message.id,
-          result: {
-            content: [{ type: 'text', text: `http:${message.params.name}` }],
-            structuredContent: { http: true },
-            isError: false,
-          },
-        }),
+        'data: ' +
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: message.id,
+            result: {
+              content: [{ type: 'text', text: `http:${message.params.name}` }],
+              structuredContent: { http: true },
+              isError: false,
+            },
+          }) +
+          '\n\n',
       )
     })
   })

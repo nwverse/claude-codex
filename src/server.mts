@@ -5856,7 +5856,7 @@ export class CodexClaudeAppServer {
               const started = itemStartedAtMs.get(itemId)
               return started == null ? null : Math.max(0, nowMillis() - started)
             })()
-            const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
+            const parsedExitCode = event.isError ? (parseExitCodeFromResult(event.content) ?? 1) : 0
             const output = exploreItemIds.has(itemId) ? capOutput(resultText) : resultText
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
@@ -6152,8 +6152,11 @@ export class CodexClaudeAppServer {
             )
             itemId = item.id
             itemIds.set(event.toolUseId, item.id)
+            itemStartedAtMs.set(item.id, nowMillis())
             openToolItems.add(item.id)
             if (isExploreTool(event.toolName)) exploreItemIds.add(item.id)
+            else if (item.type === 'commandExecution')
+              this.rememberCommandItem(event.toolUseId, thread.id, turn.id, item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -10295,6 +10298,8 @@ export class CodexClaudeAppServer {
         threadId,
         error: error instanceof Error ? error.message : String(error),
       })
+      // What is stored describes the workspace the thread left.
+      if (options.replace && !this.stopped) this.store.setThreadGitInfo(threadId, null)
     }
   }
 

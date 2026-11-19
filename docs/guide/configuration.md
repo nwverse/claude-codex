@@ -150,16 +150,17 @@ The file holds either an object with a `models` array (and optionally
 | `displayName` / `description` | The picker's label and description. |
 | `isDefault` | Marks the default model, as the top-level `defaultModel` does. There is one default: without either, the first profile. |
 | `executable` | Path of the Claude Code to start. Without it the SDK's own Claude Code runs; `CLAUDE_CODEX_CLI` does not apply to profiles. |
-| `envFile` | A file of `KEY=value` lines (`export` and quotes allowed, `#` comments) applied to the process environment. |
+| `envFile` | A file of `KEY=value` lines applied to the process environment; `export` is allowed. A value in single or double quotes ends at the next matching quote, with no backslash escapes (put a value that contains `"` in single quotes), and only spaces or a `# comment` may follow it. A line starting with `#` is a comment, and outside quotes a `#` after a space or tab starts one, so `http://host/#frag` keeps its `#`. |
 | `env` | Variables set on the process after the env file. |
 | `inheritEnv` | Adapter variables the process inherits. By default `HOME`, `PATH`, `SHELL`, `USER`, `LOGNAME`, the locale, terminal, color and temp-folder variables, the `XDG_*` folders, `SSH_AUTH_SOCK` and `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM`; `["*"]` inherits all of them and cannot be combined with names. |
 
 `${VAR}` in `executable`, `envFile`, the env file and `env` reads the adapter's
 environment; a missing variable is an error. `executable` and `envFile` may
 also start with `~/`, and a relative path is taken from the profiles file's
-folder (the adapter's working folder for inline profiles). A key in `env` that looks like a secret (its name contains `TOKEN`,
-`KEY`, `SECRET`, `PASSWORD` or `AUTH`) must be a single `${VAR}` reference, so
-the file itself never holds a credential. A token budget such as
+folder (the adapter's working folder for inline profiles). A key in `env` that
+looks like a secret (its name contains `TOKEN`, `KEY`, `SECRET`, `PASSWORD` or
+`AUTH`, or is `ANTHROPIC_CUSTOM_HEADERS`) must be a single `${VAR}` reference,
+so the file itself never holds a credential. A token budget such as
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (`TOKENS` at the end of a word) is no secret.
 `${VAR}` in the env file also reads the file's earlier lines, and in `env`
 the whole env file.
@@ -202,8 +203,9 @@ over the profile's `id`, `sdkModel`, `executable` and `envFile` paths, sorted
 The value of a secret-looking key, and any secret-looking variable a value
 reads, counts as a placeholder: rotating a credential keeps the fingerprint, while
 changing the model, endpoint, executable, config folder or any other setting
-changes it. The fingerprint is kept with the thread in the adapter's state
-database.
+changes it. `ANTHROPIC_CUSTOM_HEADERS` counts as a secret as a whole, so
+changing any header in it, a routing header included, keeps the fingerprint.
+The fingerprint is kept with the thread in the adapter's state database.
 
 - Once a thread has a conversation (a turn ran, or it is a fork), its Claude
   session lives in that profile's process and config folder. If the profile's

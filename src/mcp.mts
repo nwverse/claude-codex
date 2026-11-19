@@ -554,6 +554,19 @@ async function connectStdio(
       } catch {
         continue
       }
+      if (typeof message.method === 'string') {
+        if (message.id === undefined || message.id === null) continue
+        const response =
+          message.method === 'ping'
+            ? { jsonrpc: '2.0', id: message.id, result: {} }
+            : {
+                jsonrpc: '2.0',
+                id: message.id,
+                error: { code: -32601, message: `Method not found: ${message.method}` },
+              }
+        child.stdin.write(`${JSON.stringify(response)}\n`)
+        continue
+      }
       const id = Number(message.id)
       const wait = pending.get(id)
       if (!wait) continue
@@ -684,6 +697,7 @@ function jsonRpcReply(reply: { text: string; stream: boolean }, id: number): unk
       .join('\n')
     if (!data) continue
     const message = asRecord(JSON.parse(data))
+    if (typeof message.method === 'string') continue
     if (String(message.id) === String(id)) return message
     if ('result' in message || 'error' in message) last = message
   }

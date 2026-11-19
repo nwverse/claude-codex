@@ -1456,3 +1456,137 @@ function saveEnv(keys: string[]): () => void {
     }
   }
 }
+
+test('profile env files strip comments while preserving quoted content and URL fragments', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-env-comments-'))
+  const envFile = join(root, 'provider.env')
+  const env = {
+    HOME: root,
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([{ id: 'main-model', envFile }]),
+  }
+  const expected = {
+    ANTHROPIC_BASE_URL: 'https://gw.example',
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '32000',
+    ANTHROPIC_MODEL: 'claude-x',
+    LINK: 'http://host/#frag',
+    EMPTY: '',
+    HASH: '#literal',
+    QUOTED: ' inside # value ',
+    ADJACENT: 'value',
+    NOREF: 'v',
+  }
+  try {
+    await writeFile(
+      envFile,
+      [
+        '# full-line comment',
+        'export ANTHROPIC_BASE_URL=https://gw.example # corp gateway',
+        'CLAUDE_CODE_MAX_OUTPUT_TOKENS="32000" # cap',
+        "ANTHROPIC_MODEL='claude-x' # model",
+        'LINK=http://host/#frag',
+        'EMPTY= \t# comment',
+        'HASH=#literal',
+        'QUOTED=" inside # value " # comment',
+        "ADJACENT='value'# comment",
+        'NOREF=v # ${MISSING_VAR}',
+        '',
+      ].join('\n'),
+      { mode: 0o600 },
+    )
+    const resolved = resolveClaudeModelProcess('main-model', env)
+    assert.ok(resolved)
+    for (const [key, value] of Object.entries(expected)) assert.equal(resolved.env[key], value, key)
+    const fingerprint = modelProfileFingerprint('main-model', env)
+    await writeFile(
+      envFile,
+      Object.entries(expected)
+        .map(([key, value]) => `${key}='${value}'`)
+        .join('\n'),
+      { mode: 0o600 },
+    )
+    assert.equal(modelProfileFingerprint('main-model', env), fingerprint)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('profile env files reject unterminated quotes and text after closing quotes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-env-invalid-'))
+  const envFile = join(root, 'provider.env')
+  const env = {
+    HOME: root,
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([{ id: 'main-model', envFile }]),
+  }
+  try {
+    for (const value of [
+      '"unterminated',
+      "'unterminated",
+      '"value"suffix',
+      "'value' trailing",
+      '"a\\"b"',
+    ]) {
+      await writeFile(envFile, `# first line\nLINK=${value}\n`, { mode: 0o600 })
+      assert.throws(() => resolveClaudeModelProcess('main-model', env), {
+        message: `invalid env assignment at ${envFile}:2`,
+      })
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('custom header credential rotation in env files keeps profile fingerprints and chats', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-header-rotation-'))
+  const envFile = join(root, 'provider.env')
+  const env = {
+    HOME: root,
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([{ id: 'main-model', envFile }]),
+  }
+  try {
+    await writeFile(envFile, 'ANTHROPIC_CUSTOM_HEADERS=x-api-key: old\n', { mode: 0o600 })
+    const pinned = modelProfileFingerprint('main-model', env)
+    assert.ok(pinned)
+    await writeFile(envFile, 'ANTHROPIC_CUSTOM_HEADERS=x-api-key: new\n')
+    assert.equal(modelProfileFingerprint('main-model', env), pinned)
+    assert.equal(
+      resolveClaudeModelProcess('main-model', env, pinned)?.env.ANTHROPIC_CUSTOM_HEADERS,
+      'x-api-key: new',
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('custom headers in profile env reject literal credentials', () => {
+  assert.throws(
+    () =>
+      loadClaudeModelProfiles({
+        CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([
+          {
+            id: 'main-model',
+            env: { ANTHROPIC_CUSTOM_HEADERS: 'x-api-key: literal' },
+          },
+        ]),
+      }),
+    /secret-like environment key must reference a parent environment variable: ANTHROPIC_CUSTOM_HEADERS/,
+  )
+})
+
+test('custom headers resolve parent references without pinning credential values', () => {
+  const env = {
+    HEADER_VAR: 'Authorization: Bearer old',
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([
+      {
+        id: 'main-model',
+        inheritEnv: ['*'],
+        env: { ANTHROPIC_CUSTOM_HEADERS: '${HEADER_VAR}' },
+      },
+    ]),
+  }
+  const pinned = modelProfileFingerprint('main-model', env)
+  assert.ok(pinned)
+  const rotated = { ...env, HEADER_VAR: 'Authorization: Bearer new' }
+  assert.equal(modelProfileFingerprint('main-model', rotated), pinned)
+  const resolved = resolveClaudeModelProcess('main-model', rotated, pinned)
+  assert.equal(resolved?.env.ANTHROPIC_CUSTOM_HEADERS, 'Authorization: Bearer new')
+})

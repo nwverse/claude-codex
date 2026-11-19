@@ -862,6 +862,14 @@ versioning or publishing metadata.
   chat"; a queued message or goal reports that and does not run. Profiles
   replace `CLAUDE_CODEX_MODELS` and `CLAUDE_CODEX_MODEL_ALIASES` and need
   the native runtime. Without a profiles file nothing changes.
+- `ANTHROPIC_CUSTOM_HEADERS` counts as a secret in model process profiles,
+  like a key whose name contains `TOKEN`, `KEY`, `SECRET`, `PASSWORD` or
+  `AUTH`. In a profile's `env` it must be a single `${VAR}` reference, and
+  its value is a placeholder in the profile fingerprint, so rotating a
+  gateway header credential keeps chats going. A profiles file with a
+  literal value there no longer loads (move the value to the 0600 env file
+  or a `${VAR}`). A chat that already had a conversation on a profile
+  setting it, before this change, needs a new chat once after updating.
 - Resuming a Claude session copies its transcript only into the config dir
   that turn's Claude Code runs from (a model profile's, else
   `CLAUDE_CONFIG_DIR` or `~/.claude`, or with `CLAUDE_CODEX_CLI` the

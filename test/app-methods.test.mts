@@ -1526,6 +1526,12 @@ test('threads carry the git info of their workspace without listing running git'
       const plain = await server.startThread()
       const resumed = await server.request('thread/resume', { threadId: plain, cwd: repo })
       assert.deepEqual(resumed.thread.gitInfo, later)
+      // A lookup that fails there drops the git info of the workspace it left.
+      const gone = await server.request('thread/resume', {
+        threadId: plain,
+        cwd: join(server.home, 'gone'),
+      })
+      assert.equal(gone.thread.gitInfo, null)
       const back = await server.request('thread/resume', { threadId: plain, cwd: server.home })
       assert.equal(back.thread.gitInfo, null)
     }, env)
