@@ -744,6 +744,8 @@ export type RuntimeEvent =
       toolUseId: string
       content: unknown
       isError?: boolean
+      // A background shell's exit notification supplies a summary and, when known, its code.
+      commandExitCode?: number | null
       // Claude Code's structured tool result (e.g. Agent `async_launched`,
       // SendMessage `resumedAgentId`) when the backend exposes it.
       structured?: Record<string, unknown> | null
@@ -1000,6 +1002,7 @@ export interface RuntimeHandlers {
   onEvent(event: RuntimeEvent): Promise<void> | void
   onPermissionRequest(
     event: Extract<RuntimeEvent, { type: 'permission_request' }>,
+    signal?: AbortSignal,
   ): Promise<PermissionDecision>
   // Routed when Claude invokes AskUserQuestion. The server bridges this to
   // Codex's native `item/tool/requestUserInput` reverse RPC so the App can
@@ -1009,6 +1012,7 @@ export interface RuntimeHandlers {
   // empty answer to the model.
   onUserInputRequest?(
     event: Extract<RuntimeEvent, { type: 'user_input_request' }>,
+    signal?: AbortSignal,
   ): Promise<UserInputAnswers>
   // Routed when an MCP server elicits input. The server bridges it to
   // Codex's `mcpServer/elicitation/request`; `signal` aborts when Claude

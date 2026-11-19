@@ -209,6 +209,7 @@ export class CommandOutputs {
     toolUseId: string,
     background: BackgroundSink | null,
     live: (taskId: string) => boolean,
+    keepOutput = false,
   ): void {
     // Results of other tools come here too; only a Bash call can leave a shell.
     const bash = this.calls.delete(toolUseId)
@@ -228,9 +229,9 @@ export class CommandOutputs {
       return
     }
     if (background && !stream.done && (stream.backgrounded || live(stream.taskId))) {
-      // The call's result replaced what its item showed. The shell's output
-      // follows it, from the start.
-      this.resume(stream, background(stream.taskId), true)
+      // A completed call replaced its output. A timed-out foreground call kept
+      // the same open item and only needs the bytes it has not shown yet.
+      this.resume(stream, background(stream.taskId), true, keepOutput)
       return
     }
     this.remove(stream)
@@ -284,12 +285,17 @@ export class CommandOutputs {
     return this.read !== null && this.intervalMs > 0 && !this.closed
   }
 
-  private resume(stream: CommandStream, sink: OutputSink, background: boolean): void {
+  private resume(
+    stream: CommandStream,
+    sink: OutputSink,
+    background: boolean,
+    keepOutput = false,
+  ): void {
     stream.generation += 1
     stream.sink = sink
     stream.background = background
     if (background) {
-      stream.consumed = 0
+      if (!keepOutput) stream.consumed = 0
       stream.lastChar = ''
       stream.separate = true
     }
