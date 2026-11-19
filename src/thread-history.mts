@@ -82,6 +82,14 @@ export function forkTurns(
   return null
 }
 
+// User-shell items are delivered live. The turn itself stays in history,
+// while these command executions are omitted from every paged replay.
+export function historyItems(turn: TurnRecord): ThreadItem[] {
+  return turn.items.filter(
+    (item) => item.type !== 'commandExecution' || item.source !== 'userShell',
+  )
+}
+
 export interface ThreadItemEntry {
   turnId: string
   item: ThreadItem
@@ -107,7 +115,7 @@ export function pageItems(
   if (params.turnId != null && scope.length === 0)
     throw invalidRequest(`turn not found: ${params.turnId}`)
   const entries = scope.flatMap((turn) =>
-    turn.items.map(
+    historyItems(turn).map(
       (item): ThreadItemEntry => ({
         turnId: turn.id,
         item,
@@ -173,7 +181,7 @@ export function pageTimeline(
       turnId: turn.id,
       startedAt: turn.startedAt,
     })
-    for (const item of turn.items)
+    for (const item of historyItems(turn))
       entries.push({ type: 'item', position: entries.length, turnId: turn.id, item })
     if (turn.status !== 'inProgress')
       entries.push({

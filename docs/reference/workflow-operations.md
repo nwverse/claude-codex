@@ -5,11 +5,19 @@ recurring Codex maintenance loops. The workflow is deliberately explicit: tasks
 are queued in a local state file, leased by a worker, verified, and then marked
 complete.
 
-The default state file is:
+The default state file is `workflow-state.json` in the adapter home
+(`CLAUDE_CODEX_HOME`, else `claude-codex-adapter` under `CODEX_HOME`, which
+defaults to `~/.codex`; see the
+[configuration reference](/guide/configuration#reference-table)):
 
 ```text
 ~/.codex/claude-codex-adapter/workflow-state.json
 ```
+
+Every command takes `--state PATH` to name another state file, `health` also
+takes `--run-log PATH` for the run registry, and each command prints the
+`statePath` it used. Check `statePath` when the daemon runs with a different
+`CODEX_HOME` or `CLAUDE_CODEX_HOME` than the shell you run the CLI from.
 
 ## Core loop
 
@@ -70,7 +78,7 @@ worker is rejected. An active lease should not be stolen.
 
 ## Run registry
 
-Run events are appended to:
+Run events are appended to `runs.jsonl` in the adapter home, by default:
 
 ```text
 ~/.codex/claude-codex-adapter/runs.jsonl
@@ -85,13 +93,20 @@ on it for raw prompt, response, credential, or user-secret recovery.
 
 ## Worktree isolation
 
-Set `CLAUDE_CODEX_WORKTREE_ROOT` to enable optional per-thread git worktrees.
-Each thread id is mapped to a root-confined, collision-resistant label. If the
-worktree already exists, it is reused. If setup fails, the adapter logs the
-failure and keeps the original cwd so the app-server session can continue.
+Per-thread git worktrees are off by default. Set `CLAUDE_CODEX_AUTO_WORKTREE=1`
+in the adapter's environment to turn them on; `CLAUDE_CODEX_WORKTREE_ROOT` only
+chooses where they go (default `worktrees` in the adapter home). Setting the
+root alone does not enable isolation. Each newly started or forked thread whose
+cwd is inside a git repository gets a worktree on a new `claude-codex/<label>`
+branch created from that repository's `HEAD`. Each thread id is mapped to a
+root-confined, collision-resistant label. If the worktree already exists, it is
+reused. If setup fails, the adapter logs the failure and keeps the original cwd
+so the app-server session can continue. See
+[Worktree isolation](/guide/configuration#worktree-isolation) in the
+configuration guide.
 
-This feature isolates concurrent coding agents without making worktree creation
-a hard dependency for normal Codex App operation.
+This feature isolates concurrent coding agents when it is enabled, without
+making worktree creation a hard dependency for normal Codex App operation.
 
 ## GitHub trust boundary
 

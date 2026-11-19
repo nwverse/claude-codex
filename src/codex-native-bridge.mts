@@ -153,10 +153,11 @@ export class CodexNativeBridge {
     const params = asRecord(rawParams)
     const threadId = stringField(params.threadId)
     if (!threadId) return NOT_ROUTED
+    const startsTurn = method === 'turn/start' || method === 'thread/shellCommand'
     if (
       this.changesInFlight.has(threadId) ||
       (this.startingTurns.has(threadId) &&
-        (method === 'turn/start' || method === 'thread/settings/update' || MIRRORED.has(method)))
+        (startsTurn || method === 'thread/settings/update' || MIRRORED.has(method)))
     )
       throw invalidRequest('another change is in progress on this thread; retry when it finishes')
     const model = requestedModel(params)
@@ -175,7 +176,7 @@ export class CodexNativeBridge {
       }
     }
     const thread = this.owned(threadId)
-    if (!thread || (!thread.codexSessionId && method !== 'turn/start')) return NOT_ROUTED
+    if (!thread || (!thread.codexSessionId && !startsTurn)) return NOT_ROUTED
     if (method === 'thread/fork') {
       // A description fork needs its native parent's conversation. The App's
       // default summary model can belong to a different provider.
@@ -190,7 +191,7 @@ export class CodexNativeBridge {
     this.host.subscribe(thread.id, peer)
     this.requestsInFlight += 1
     this.clearIdleTimer()
-    if (method === 'turn/start') this.startingTurns.set(threadId, new Set())
+    if (startsTurn) this.startingTurns.set(threadId, new Set())
     if (MIRRORED.has(method)) this.changesInFlight.add(threadId)
     try {
       if (!thread.codexSessionId) await this.createChildThread(thread)
@@ -236,7 +237,7 @@ export class CodexNativeBridge {
       return result
     } finally {
       if (MIRRORED.has(method)) this.changesInFlight.delete(threadId)
-      if (method === 'turn/start') this.startingTurns.delete(threadId)
+      if (startsTurn) this.startingTurns.delete(threadId)
       this.requestsInFlight -= 1
       this.host.checkIdle()
       this.scheduleIdleStop()

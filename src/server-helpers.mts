@@ -1,8 +1,6 @@
-import { execFile, spawn } from 'node:child_process'
-import { constants } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { spawn } from 'node:child_process'
+import { isAbsolute } from 'node:path'
 import { createInterface } from 'node:readline'
-import { promisify } from 'node:util'
 import type { ConfigEdit } from './app-settings.mjs'
 import type { AppSkill } from './claude-capabilities.mjs'
 import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
@@ -32,7 +30,13 @@ import {
   toolOutputInput,
 } from './util.mjs'
 
-const execFileAsync = promisify(execFile)
+export {
+  addedFileDiff,
+  gitDiff,
+  gitUntrackedDiff,
+  isGitWorkTree,
+  isNotAGitRepo,
+} from './turn-diff.mjs'
 
 export function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -1483,128 +1487,6 @@ export function simpleDiff(path: string, oldText: string, newText: string): stri
     '@@',
     ...splitDiffLines(oldText).map((line) => `-${line}`),
     ...splitDiffLines(newText).map((line) => `+${line}`),
-    '',
-  ].join('\n')
-}
-
-// `git diff` failing is expected outside a repo, so we still return '' to keep
-// turns working — but the reason is written to the debug log instead of being
-// dropped silently, and a genuine git error is flagged as such.
-export function isNotAGitRepo(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  return /not a git repository/i.test(message)
-}
-
-// Cheap upfront check — if cwd isn't in a git work-tree, skip the expensive
-// `git diff` spawn entirely. Without this guard a non-git workspace (App
-// Remote pointing at $HOME or any arbitrary dir) was spamming debug.jsonl
-// with multi-KB "not a git repository" failures on every turn cycle, since
-// gitDiff runs from runRuntimeTurn after each tool result.
-const gitRepoCache = new Map<string, boolean>()
-export async function isGitWorkTree(cwd: string): Promise<boolean> {
-  if (gitRepoCache.has(cwd)) return gitRepoCache.get(cwd) as boolean
-  let inside = false
-  try {
-    const { stdout } = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
-      cwd,
-      timeout: 3_000,
-      maxBuffer: 1024,
-    })
-    inside = stdout.trim() === 'true'
-  } catch {
-    inside = false
-  }
-  gitRepoCache.set(cwd, inside)
-  return inside
-}
-
-export async function gitDiff(cwd: string): Promise<string> {
-  if (!(await isGitWorkTree(cwd))) return ''
-  let trackedDiff = ''
-  try {
-    const { stdout } = await execFileAsync('git', ['diff', '--no-ext-diff', '--'], {
-      cwd,
-      timeout: 10_000,
-      maxBuffer: 5 * 1024 * 1024,
-    })
-    trackedDiff = stdout
-  } catch (error) {
-    debugLog('git.diff.failed', {
-      cwd,
-      reason: isNotAGitRepo(error) ? 'notAGitRepository' : 'error',
-      error: error instanceof Error ? error.message : String(error),
-    })
-    return ''
-  }
-  const untrackedDiff = await gitUntrackedDiff(cwd)
-  return [trackedDiff, untrackedDiff].filter(Boolean).join('\n')
-}
-
-export async function gitUntrackedDiff(cwd: string): Promise<string> {
-  try {
-    const { lstat, open, readlink } = await import('node:fs/promises')
-    const { stdout } = await execFileAsync(
-      'git',
-      ['ls-files', '--others', '--exclude-standard', '-z'],
-      {
-        cwd,
-        timeout: 10_000,
-        maxBuffer: 1024 * 1024,
-      },
-    )
-    const paths = stdout.split('\0').filter(Boolean).slice(0, 50)
-    const diffs: string[] = []
-    for (const path of paths) {
-      try {
-        const fullPath = join(cwd, path)
-        const stats = await lstat(fullPath)
-        if (stats.isSymbolicLink()) {
-          diffs.push(addedFileDiff(path, await readlink(fullPath), '120000'))
-        } else if (stats.isFile()) {
-          // Refuse a link swapped in after lstat, and never block on a FIFO.
-          const file = await open(
-            fullPath,
-            constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-          )
-          try {
-            if (!(await file.stat()).isFile()) continue
-            const bytes = await file.readFile()
-            if (bytes.includes(0)) continue
-            diffs.push(addedFileDiff(path, bytes.toString('utf8')))
-          } finally {
-            await file.close()
-          }
-        }
-      } catch (error) {
-        // A disappearing or unreadable path must not hide the other new files.
-        debugLog('git.untrackedDiff.fileFailed', { cwd, path, error: String(error) })
-      }
-    }
-    return diffs.join('\n')
-  } catch (error) {
-    debugLog('git.untrackedDiff.failed', {
-      cwd,
-      reason: isNotAGitRepo(error) ? 'notAGitRepository' : 'error',
-      error: error instanceof Error ? error.message : String(error),
-    })
-    return ''
-  }
-}
-
-export function addedFileDiff(path: string, text: string, mode = '100644'): string {
-  const lines = text.length === 0 ? [] : text.replace(/\n$/, '').split('\n')
-  // A link target never ends in a newline; git marks that so `git apply` keeps the link intact.
-  const noNewline =
-    mode === '120000' && text !== '' && !text.endsWith('\n') ? ['\\ No newline at end of file'] : []
-  return [
-    `diff --git a/${path} b/${path}`,
-    `new file mode ${mode}`,
-    'index 0000000..0000000',
-    '--- /dev/null',
-    `+++ b/${path}`,
-    `@@ -0,0 +1,${lines.length} @@`,
-    ...lines.map((line) => `+${line}`),
-    ...noNewline,
     '',
   ].join('\n')
 }

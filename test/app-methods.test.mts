@@ -1,12 +1,25 @@
 import assert from 'node:assert/strict'
 import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, join, resolve } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { isDeepStrictEqual } from 'node:util'
+import { CodexClaudeAppServer } from '../src/server.mjs'
+import { SessionStore } from '../src/store.mjs'
 import { searchPattern } from '../src/thread-history.mjs'
 import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
@@ -165,6 +178,295 @@ async function eventually(read: () => Promise<unknown>, expected: unknown): Prom
   }
   assert.deepEqual(actual, expected)
 }
+
+test("adapters sharing a home preserve each other's config edits", async () => {
+  await withServer(
+    async (a) => {
+      const b = new AppServer(a.home, { CLAUDE_CODEX_WEBSEARCH: undefined })
+      try {
+        const initialize = { clientInfo: { name: 'test', version: '1' }, capabilities: {} }
+        await a.request('initialize', initialize)
+        await b.request('initialize', initialize)
+        const file = join(a.home, 'claude-codex-adapter', 'config.json')
+        const saved = async () => JSON.parse(await readFile(file, 'utf8'))
+        const edit = (keyPath: string, value: unknown) => ({
+          keyPath,
+          value,
+          mergeStrategy: 'replace',
+        })
+        await a.request('config/batchWrite', {
+          edits: [
+            edit('approval_policy', 'never'),
+            edit('web_search', 'disabled'),
+            edit('model', 'opus'),
+          ],
+        })
+        await b.request('config/value/write', edit('model_reasoning_effort', 'high'))
+        assert.equal((await saved()).model, 'opus')
+        assert.equal((await saved()).model_reasoning_effort, 'high')
+        assert.deepEqual((await saved()).overrides, {
+          approval_policy: 'never',
+          web_search: 'disabled',
+        })
+        const read = (await a.request('config/read')).config
+        assert.equal(read.model_reasoning_effort, 'high')
+        assert.equal(read.approval_policy, 'never')
+        assert.equal(read.web_search, 'disabled')
+
+        const manifest = join(a.home, 'marketplace.json')
+        const root = join(a.home, 'plugins', 'visualize')
+        await writeFile(
+          manifest,
+          JSON.stringify({
+            name: 'test-market',
+            plugins: [{ name: 'visualize', source: './plugins/visualize' }],
+          }),
+        )
+        await b.request('plugin/install', { marketplacePath: manifest, pluginName: 'visualize' })
+        await a.request('config/value/write', edit('web_search', null))
+        const installed = await saved()
+        assert.deepEqual(installed.appPlugins, [{ name: 'visualize', root }])
+        assert.deepEqual(installed.installedAppPlugins, [{ id: 'visualize@test-market', root }])
+        assert.equal((await b.request('config/read')).config.web_search, 'live')
+        await a.request('config/value/write', edit('approval_policy', 'on-request'))
+        await b.request('plugin/uninstall', { pluginId: 'visualize@test-market' })
+        const removed = await saved()
+        assert.equal(removed.overrides.approval_policy, 'on-request')
+        assert.deepEqual(removed.appPlugins, [])
+        assert.deepEqual(removed.installedAppPlugins, [])
+        await a.request('config/value/write', edit('web_search', 'disabled'))
+        assert.deepEqual((await saved()).appPlugins, [])
+        assert.deepEqual((await saved()).installedAppPlugins, [])
+
+        await utimes(file, 1, 1)
+        const before = await readFile(file, 'utf8')
+        const stamp = await stat(file)
+        await b.request('config/batchWrite', {
+          edits: [edit('mcp_servers.node_repl', { command: 'node', args: ['repl.js'] })],
+        })
+        await b.request('config/value/write', edit('web_search', 'disabled'))
+        assert.equal(await readFile(file, 'utf8'), before)
+        assert.equal((await stat(file)).mtimeMs, stamp.mtimeMs)
+        assert.equal((await stat(file)).ino, stamp.ino)
+        await b.request('config/value/write', edit('model', 'haiku'))
+        const changed = await stat(file)
+        assert.notEqual(changed.ino, stamp.ino)
+        assert.equal(changed.mode & 0o777, 0o600)
+        assert.equal((await a.request('config/read')).config.model, 'haiku')
+
+        // A file another program broke is repaired by the next save, as a
+        // save overwrote it before.
+        for (const broken of ['{"model": "opus",', '[]', '"text"']) {
+          await writeFile(file, broken)
+          await a.request('config/value/write', edit('web_search', 'disabled'))
+          assert.equal((await saved()).overrides.web_search, 'disabled')
+          assert.equal((await a.request('config/read')).config.web_search, 'disabled')
+        }
+      } finally {
+        await b.close()
+      }
+    },
+    { CLAUDE_CODEX_WEBSEARCH: undefined },
+  )
+})
+
+const requiresFilePermissions = {
+  skip: process.platform === 'win32' || process.getuid?.() === 0,
+}
+
+test(
+  'an unreadable settings file blocks a new thread and preserves the last loaded model',
+  requiresFilePermissions,
+  async () => {
+    await withServer(async (server) => {
+      const file = join(server.home, 'claude-codex-adapter', 'config.json')
+      await server.request('config/batchWrite', {
+        edits: [
+          { keyPath: 'model', value: 'opus' },
+          { keyPath: 'web_search', value: 'disabled' },
+          { keyPath: 'approval_policy', value: 'never' },
+          { keyPath: 'sandbox_mode', value: 'danger-full-access' },
+        ],
+      })
+      const before = await readFile(file, 'utf8')
+      await chmod(file, 0)
+      try {
+        await assert.rejects(server.request('config/read'), /EACCES|EPERM/)
+        await assert.rejects(
+          server.request('config/value/write', { keyPath: 'model_reasoning_effort', value: 'low' }),
+          /EACCES|EPERM/,
+        )
+        const from = server.mark()
+        await assert.rejects(server.request('thread/start', { cwd: server.home }), /EACCES|EPERM/)
+        assert.deepEqual(server.notified('thread/started', from), [])
+        const { data } = await server.request('model/list')
+        assert.equal(data.find((model: { isDefault: boolean }) => model.isDefault).id, 'opus')
+      } finally {
+        await chmod(file, 0o600)
+      }
+      assert.equal(await readFile(file, 'utf8'), before)
+      assert.equal((await server.request('config/read')).config.web_search, 'disabled')
+    })
+  },
+)
+
+test(
+  'a failed save keeps the previous model active for the next thread',
+  requiresFilePermissions,
+  async () => {
+    await withServer(async (server) => {
+      const directory = join(server.home, 'claude-codex-adapter')
+      const file = join(directory, 'config.json')
+      await server.request('config/value/write', { keyPath: 'model', value: 'sonnet' })
+      const before = await readFile(file, 'utf8')
+      await chmod(file, 0o400)
+      try {
+        await assert.rejects(
+          server.request('config/value/write', { keyPath: 'model', value: 'opus' }),
+          /EACCES|EPERM/,
+        )
+      } finally {
+        await chmod(file, 0o600)
+      }
+      await chmod(directory, 0o500)
+      try {
+        await assert.rejects(
+          server.request('config/value/write', { keyPath: 'model', value: 'opus' }),
+          /EACCES|EPERM|readonly/,
+        )
+      } finally {
+        await chmod(directory, 0o700)
+      }
+      assert.equal((await server.request('thread/start', { cwd: server.home })).model, 'sonnet')
+      assert.equal(await readFile(file, 'utf8'), before)
+    })
+  },
+)
+
+test('a new thread reads the permission defaults another adapter just tightened', async () => {
+  await withServer(async (a) => {
+    await a.request('config/batchWrite', {
+      edits: [
+        { keyPath: 'approval_policy', value: 'never' },
+        { keyPath: 'sandbox_mode', value: 'danger-full-access' },
+      ],
+    })
+    const b = new AppServer(a.home)
+    try {
+      const before = await b.request('thread/start', { cwd: a.home })
+      assert.equal(before.approvalPolicy, 'never')
+      assert.equal(before.sandbox.type, 'dangerFullAccess')
+      await a.request('config/batchWrite', {
+        edits: [
+          { keyPath: 'approval_policy', value: 'on-request' },
+          { keyPath: 'sandbox_mode', value: 'read-only' },
+        ],
+      })
+      const after = await b.request('thread/start', { cwd: a.home })
+      assert.equal(after.approvalPolicy, 'on-request')
+      assert.equal(after.sandbox.type, 'readOnly')
+      const original = await b.request('thread/resume', { threadId: before.thread.id })
+      assert.equal(original.approvalPolicy, 'never')
+      assert.equal(original.sandbox.type, 'dangerFullAccess')
+    } finally {
+      await b.close()
+    }
+  })
+})
+
+test('a new thread waits for a malformed settings file to be repaired', async () => {
+  await withServer(async (server) => {
+    await server.request('config/batchWrite', {
+      edits: [
+        { keyPath: 'approval_policy', value: 'never' },
+        { keyPath: 'sandbox_mode', value: 'danger-full-access' },
+      ],
+    })
+    const file = join(server.home, 'claude-codex-adapter', 'config.json')
+    for (const content of ['{"model":', '[]']) {
+      await writeFile(file, content)
+      await assert.rejects(
+        server.request('thread/start', { cwd: server.home }),
+        /valid JSON object/,
+      )
+      assert.equal(await readFile(file, 'utf8'), content)
+    }
+    await server.request('config/value/write', { keyPath: 'sandbox_mode', value: 'read-only' })
+    const repaired = await server.request('thread/start', { cwd: server.home })
+    assert.equal(repaired.approvalPolicy, 'on-request')
+    assert.equal(repaired.sandbox.type, 'readOnly')
+  })
+})
+
+test('opening clean settings takes no database writer lock', async (t) => {
+  await withInProcessApp(
+    scriptedRuntime(async () => {}),
+    async ({ home, request }) => {
+      await request('config/value/write', { keyPath: 'model', value: 'opus' })
+      const secondStore = new SessionStore(join(home, 'state.sqlite'))
+      const transaction = t.mock.method(secondStore, 'transaction')
+      const second = new CodexClaudeAppServer(
+        secondStore,
+        scriptedRuntime(async () => {}),
+      )
+      try {
+        assert.equal(transaction.mock.callCount(), 0)
+      } finally {
+        await second.stop()
+      }
+    },
+  )
+})
+
+test('another model catalog and simultaneous writers preserve unrelated settings', async () => {
+  await withServer(
+    async (a) => {
+      await a.request('config/value/write', { keyPath: 'model', value: 'custom-x' })
+      const file = join(a.home, 'claude-codex-adapter', 'config.json')
+      const initial = JSON.parse(await readFile(file, 'utf8'))
+      initial.futureSetting = { version: 2 }
+      await writeFile(file, JSON.stringify(initial))
+      const b = new AppServer(a.home, { CLAUDE_CODEX_MODELS: 'sonnet' })
+      try {
+        assert.equal((await b.request('config/read')).config.model, 'sonnet')
+        assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), initial)
+        await b.request('config/value/write', { keyPath: 'model_reasoning_effort', value: 'high' })
+        const keys = Array.from({ length: 24 }, (_, i) => `desktop.flag-${i}`)
+        await Promise.all(
+          keys.map((keyPath, i) =>
+            (i % 2 ? a : b).request('config/value/write', { keyPath, value: i }),
+          ),
+        )
+        const saved = JSON.parse(await readFile(file, 'utf8'))
+        assert.equal(saved.model, 'custom-x')
+        assert.equal(saved.model_reasoning_effort, 'high')
+        assert.deepEqual(saved.futureSetting, initial.futureSetting)
+        for (const [i, key] of keys.entries()) assert.equal(saved.overrides[key], i, key)
+        assert.equal((await a.request('config/read')).config.model, 'custom-x')
+      } finally {
+        await b.close()
+      }
+    },
+    { CLAUDE_CODEX_MODELS: 'sonnet,custom-x' },
+  )
+})
+
+test('an atomic settings save preserves a symlink to the config file', {
+  skip: process.platform === 'win32',
+}, async () => {
+  await withServer(async (server) => {
+    await server.request('initialize', {
+      clientInfo: { name: 'test', version: '1' },
+      capabilities: {},
+    })
+    const file = join(server.home, 'claude-codex-adapter', 'config.json')
+    const target = join(server.home, 'shared-settings.json')
+    await symlink('../shared-settings.json', file)
+    await server.request('config/value/write', { keyPath: 'model', value: 'opus' })
+    assert.equal((await lstat(file)).isSymbolicLink(), true)
+    assert.equal(JSON.parse(await readFile(target, 'utf8')).model, 'opus')
+  })
+})
 
 test('thread history pages turns, items and the timeline', async () => {
   await withServer(async (server) => {

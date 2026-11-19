@@ -1058,7 +1058,9 @@ export class SessionStore {
     for (const [position, projectId] of projectIds.entries()) update.run(position, projectId)
   }
 
-  private transaction<T>(body: () => T): T {
+  // All app-servers sharing a home use this database. Its writer lock also
+  // serializes their config.json read-modify-rename operations.
+  transaction<T>(body: () => T): T {
     this.db.exec('BEGIN IMMEDIATE')
     try {
       const result = body()

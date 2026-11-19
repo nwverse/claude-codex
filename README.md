@@ -1,5 +1,7 @@
 # Claude Codex Adapter
 
+[简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/nwverse/claude-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/nwverse/claude-codex/actions/workflows/ci.yml)
 [![Docs](https://github.com/nwverse/claude-codex/actions/workflows/deploy-docs.yml/badge.svg)](https://nwverse.github.io/claude-codex/)
 [![Node](https://img.shields.io/badge/node-%3E%3D24-brightgreen)](https://nodejs.org)
@@ -20,7 +22,25 @@ real Codex runtime, so agent turns run on Claude Code.
 answers with an <a href="#inline-visualizations">inline visualization</a> that the
 App renders inside the reply. The request was in Chinese, so are the labels.</sub></p>
 
+<details>
+<summary>Show the animated recreation</summary>
+
+![A pointer highlights June and May in the signup charts](docs/public/images/inline-visualization.webp)
+
+In this recreation, the June tooltip shows 204 signups (+27.5%) and the May
+tooltip shows 160 (−6.4%). It uses the same synthetic data as the screenshot.
+
+</details>
+
 📖 **Documentation: <https://nwverse.github.io/claude-codex/>**
+
+## Community video tour
+
+Boulea7's tour shows a Claude chat, leader tools, and an inline chart. Leader
+tools require `CLAUDE_CODEX_LEADER_TOOLS=1`. Chart rendering requires a Codex
+App version with visualization support. This is an independent community demo.
+
+[Watch the English tour (MP4)](https://github.com/Boulea7/claude-codex/releases/download/promo-v1/claude-codex-en.mp4) · [English subtitles (SRT)](https://github.com/Boulea7/claude-codex/releases/download/promo-v1/claude-codex-en.srt)
 
 ## Quick start
 
@@ -455,6 +475,9 @@ auto-allows permission requests through the existing Codex bridge. This avoids R
 dangerous permission bypass outside a recognized container sandbox while preserving a zero-prompt
 Full Access turn. Operators can still opt into native SDK bypass explicitly with
 `CLAUDE_CODEX_PERMISSION_MODE=bypassPermissions` in an appropriately isolated environment.
+The variable applies to every Claude thread and overrides the App's Plan mode, approval policy
+and sandbox; see the
+[configuration reference](https://nwverse.github.io/claude-codex/guide/configuration#reference-table).
 
 ## Current release boundaries
 
@@ -520,8 +543,9 @@ for the full toolchain and conventions.
 
 The adapter includes a small workflow control plane for long-running Codex
 maintenance loops. It is intentionally file-backed and explicit: the scheduler
-tracks tasks in `~/.codex/claude-codex-adapter/workflow-state.json`, and a task
-only runs after it has been queued and leased.
+tracks tasks in `workflow-state.json` in the adapter home (`CLAUDE_CODEX_HOME`,
+else `claude-codex-adapter` under `CODEX_HOME`, `~/.codex` by default), and a
+task only runs after it has been queued and leased.
 
 ```bash
 npm run workflow -- status
@@ -537,17 +561,21 @@ has no stale leases, no failed tasks, and either no running task or one running
 task with an active lease. If a lease is still active, continue that task or
 renew the heartbeat only when more time is needed. Do not enqueue duplicates.
 
-Run events are appended to
-`~/.codex/claude-codex-adapter/runs.jsonl` by default. The registry redacts
-prompt-like fields, model responses, and secret-like values before writing. Set
+Run events are appended to `runs.jsonl` in the adapter home by default. The
+registry redacts prompt-like fields, model responses, and secret-like values
+before writing. Set
 `CLAUDE_CODEX_RUN_LOG=0` to disable it, or set `CLAUDE_CODEX_RUN_LOG=/path/log`
 to choose a different JSONL file.
 
-Optional per-thread worktree isolation is controlled with
-`CLAUDE_CODEX_WORKTREE_ROOT`. Thread ids are mapped to root-confined,
-collision-resistant labels, and an existing worktree is reused when present.
-If worktree setup fails, the adapter logs the failure and keeps the original
-cwd so the app-server session can continue.
+Optional per-thread worktree isolation is off by default: set
+`CLAUDE_CODEX_AUTO_WORKTREE=1` to enable it, and optionally
+`CLAUDE_CODEX_WORKTREE_ROOT` to choose the folder (default
+`<adapter home>/worktrees`). Each new or forked thread in a git repository then
+gets a worktree on its own `claude-codex/<label>` branch. Thread ids are mapped
+to root-confined, collision-resistant labels, and an existing worktree is reused
+when present. If worktree setup fails, the adapter logs the failure and keeps
+the original cwd so the app-server session can continue. See
+[Worktree isolation](https://nwverse.github.io/claude-codex/guide/configuration#worktree-isolation).
 
 GitHub issue or PR automation must go through the trust-boundary queue. Export
 only trusted metadata to local JSON, then ingest it:

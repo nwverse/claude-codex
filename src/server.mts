@@ -1,9 +1,19 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  accessSync,
+  constants,
+  existsSync,
+  lstatSync,
+  readFileSync,
+  readlinkSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { promisify } from 'node:util'
+import { isDeepStrictEqual, promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
 import { type InstalledAppPlugin, stopAppPluginServers } from './app-plugin-mcp.mjs'
 import {
@@ -36,7 +46,7 @@ import {
   reportedClaudeModel,
 } from './claude-models.mjs'
 import { configRequirements } from './cli-probes.mjs'
-import { codexAutoCompactLimit } from './codex-config.mjs'
+import { asTable, codexAutoCompactLimit } from './codex-config.mjs'
 import {
   CodexNativeBridge,
   isNativeConversationMethod,
@@ -80,6 +90,7 @@ import {
   asInvalidRequest,
   hostMethod,
   INVALID_REQUEST,
+  invalidParams,
   invalidRequest,
   invalidRequestIfThrows,
   methodNotFound,
@@ -123,6 +134,7 @@ import {
   sessionApproval,
   sessionSuggestionsEnabled,
 } from './permission-suggestions.mjs'
+import { signalProcessGroup, stopProcessGroup } from './process-group.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -233,6 +245,7 @@ import {
 import {
   findOccurrences,
   forkTurns,
+  historyItems,
   offsetCursor,
   pageItems,
   pageLimit,
@@ -303,6 +316,7 @@ import type {
   UserInputQuestion,
   WireMessage,
 } from './types.mjs'
+import { startUserShell, type UserShellRun } from './user-shell.mjs'
 import {
   adapterHome,
   CLAUDE_CODE_AGENT_EFFORT_VERSION,
@@ -537,33 +551,6 @@ function threadIdList(value: unknown): string[] {
 // and waits this long for its pipes after it exits (Codex's IO_DRAIN_TIMEOUT_MS).
 const COMMAND_EXEC_TIMEOUT_EXIT_CODE = 124
 const COMMAND_EXEC_IO_DRAIN_MS = 2_000
-// How long a stopped command has to exit on SIGTERM before it gets SIGKILL.
-const COMMAND_EXEC_KILL_GRACE_MS = 1_000
-
-// Signals a child's process group when it leads one (spawned detached),
-// else the child alone.
-function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (child.pid && process.platform !== 'win32') {
-    try {
-      process.kill(-child.pid, signal)
-      return
-    } catch {
-      // Not a group leader, or the group is gone: fall back to the child.
-    }
-  }
-  try {
-    child.kill(signal)
-  } catch {
-    // Already gone.
-  }
-}
-
-// SIGTERM to the group, then SIGKILL to whatever ignores it.
-function stopProcessGroup(child: ChildProcess): void {
-  signalProcessGroup(child, 'SIGTERM')
-  const kill = setTimeout(() => signalProcessGroup(child, 'SIGKILL'), COMMAND_EXEC_KILL_GRACE_MS)
-  kill.unref()
-}
 
 // The pty bridge's own stop takes up to about 1.2 s: SIGTERM to its shell's
 // group, SIGKILL after 0.2 s, then at most 1 s draining the last output.
@@ -759,6 +746,7 @@ export class CodexClaudeAppServer {
   // Approvals the user gave "for this session", by thread: a command, a
   // non-edit tool call, or an MCP tool (see approvalSessionKey).
   private sessionApprovals = new Map<string, Set<string>>()
+  private userShells = new Map<string, { standalone: boolean; runs: Map<string, UserShellRun> }>()
   private commandProcesses = new Map<string, ChildProcess>()
   private processHandles = new Map<string, ChildProcess>()
   // The connection that started each command/exec and process/spawn process:
@@ -869,7 +857,16 @@ export class CodexClaudeAppServer {
       toolItem: (event, cwd, options) => this.toolUseToItem(event, cwd, options),
       reasoningVisible: () => reasoningSummariesVisible(this.configOverrides),
     })
-    this.loadPersistedConfig()
+    // Startup also drops legacy overrides, including private desktop MCP
+    // settings. Keep the server available if the settings file is unreadable.
+    try {
+      this.loadPersistedConfig('startup')
+    } catch (error) {
+      debugLog('config.load.failed', {
+        path: this.configPath,
+        code: (error as NodeJS.ErrnoException).code,
+      })
+    }
     // A CLI reported a different set of commands: the App refetches
     // skills/list, which serves them as skills.
     // App rule: skills-popup
@@ -945,6 +942,7 @@ export class CodexClaudeAppServer {
     this.idleSleep.stop()
     this.leaderThreads.stop()
     try {
+      for (const turnId of this.userShells.keys()) this.stopUserShells(turnId, 'server stopped')
       // Child turns are created directly from Task/Workflow events and are not
       // registered in activeTurnByThread. Finalize them before aborting the
       // runtime or closing SQLite, otherwise stdio EOF can leave child turns
@@ -1315,9 +1313,9 @@ export class CodexClaudeAppServer {
       case 'plugin/share/delete':
         return {}
       case 'plugin/uninstall':
-        return this.pluginUninstall(asRecord(params))
+        return this.store.transaction(() => this.pluginUninstall(asRecord(params)))
       case 'plugin/install':
-        return this.pluginInstall(asRecord(params))
+        return this.store.transaction(() => this.pluginInstall(asRecord(params)))
       case 'skills/config/write':
         // App rule: settings-write-errors
         if (asRecord(params).enabled === false) {
@@ -1466,7 +1464,7 @@ export class CodexClaudeAppServer {
         return this.serverDiagnostics()
       case 'config/value/write':
       case 'config/batchWrite':
-        return this.configWriteResponse(asRecord(params))
+        return this.store.transaction(() => this.configWriteResponse(asRecord(params)))
       case 'getConversationSummary':
         return this.getConversationSummary(asRecord(params))
       case 'gitDiffToRemote':
@@ -1500,6 +1498,9 @@ export class CodexClaudeAppServer {
   }
 
   private threadStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    // Another adapter can tighten the defaults between starts. Read them
+    // before creating a worktree or thread, even if this peer skips config/read.
+    this.loadPersistedConfig('thread')
     // Specs Codex would reject fail the request, as they do there. With the
     // switch off they are ignored.
     // App rule: dynamic-tools
@@ -1571,14 +1572,19 @@ export class CodexClaudeAppServer {
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
+      // A start that names no policy, or only a profile the adapter cannot
+      // resolve, gets what config/read reports, as Codex does: never Full
+      // Access by default.
       approvalPolicy:
         permissionProfile?.approvalPolicy ??
         normalizeApprovalPolicy(params.approvalPolicy) ??
-        'never',
+        normalizeApprovalPolicy(this.configOverrides.approval_policy) ??
+        'on-request',
       sandboxMode:
         permissionProfile?.sandboxMode ??
         normalizeSandboxMode(params.sandbox) ??
-        'danger-full-access',
+        normalizeSandboxMode(this.configOverrides.sandbox_mode) ??
+        'workspace-write',
       permissionProfileId: permissionProfile?.id ?? null,
       // Helper threads never ask the user anything.
       // App rule: auto-review
@@ -1650,9 +1656,9 @@ export class CodexClaudeAppServer {
       cwd: options.cwd,
       model: options.model,
       effort: leader.reasoningEffort,
-      // A leader without a policy asks before tools run. thread/start reads
-      // a missing one as never and full access, so pass the asking pair that
-      // runs the same: a started chat gets no more than its leader.
+      // A leader without a policy asks before tools run. Pass the leader's
+      // own policy, or the asking pair that runs the same, rather than the
+      // configured defaults: a started chat gets no more than its leader.
       approvalPolicy: leader.approvalPolicy ?? 'on-request',
       sandbox: leader.sandboxMode ?? 'workspace-write',
       permissions: leader.permissionProfileId,
@@ -2444,7 +2450,7 @@ export class CodexClaudeAppServer {
     // A fork's inherited turns keep their ids, so the thread names which copy.
     const turn = threadId ? this.store.historyTurn(threadId, turnId) : this.store.getTurn(turnId)
     return {
-      data: turn?.items ?? [],
+      data: turn ? historyItems(turn) : [],
       nextCursor: null,
       backwardsCursor: null,
     }
@@ -3456,49 +3462,143 @@ export class CodexClaudeAppServer {
         continue
       await this.stopBackgroundSubagent(entry)
     }
+    // Archiving or deleting a parent takes its child threads with it. A child
+    // can have opened a user shell of its own since the subagent task ended.
+    for (const id of this.store.subagentTreeIds(threadId)) {
+      const turnId = this.activeTurnByThread.get(id)
+      if (!turnId) continue
+      if (this.userShells.get(turnId)?.standalone) this.settleInterruptedTurn(peer, id, turnId)
+      else this.stopUserShells(turnId, 'command aborted by user')
+    }
   }
 
-  private threadShellCommand(peer: RpcPeer, params: Record<string, unknown>): unknown {
+  private async threadShellCommand(
+    peer: RpcPeer,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
-    const thread = this.store.getThread(threadId)
     const command = stringOr(params.command, '')
-    if (!command) return {}
-    const shell = process.env.SHELL || '/bin/sh'
-    const cwd = thread?.cwd ?? process.cwd()
-    const processId = newId()
-    debugLog('thread.shellCommand.start', { threadId, processId, cwd, command })
-    const child = spawn(shell, ['-lc', command], { cwd, env: process.env, stdio: 'pipe' })
-    this.commandProcesses.set(processId, child)
-    child.stdout?.on('data', (chunk) =>
+    const timeoutMs = params.timeoutMs ?? 3_600_000
+    if (typeof timeoutMs === 'number' && timeoutMs < 0) {
+      throw invalidParams(`thread/shellCommand timeoutMs must be non-negative, got ${timeoutMs}`)
+    }
+    if (typeof timeoutMs !== 'number' || !Number.isSafeInteger(timeoutMs)) {
+      throw invalidParams('thread/shellCommand timeoutMs must be a non-negative safe integer')
+    }
+    if (!command.trim()) throw invalidParams('command must not be empty')
+    if (command.includes('\0')) throw invalidParams('command must not contain NUL')
+    // A racing turn/start may still be claiming this thread across an await.
+    while (this.startingTurnByThread.has(threadId)) await this.startingTurnByThread.get(threadId)
+    if (this.stopped) throw invalidRequest('server stopped')
+    const thread = this.startableThread(threadId)
+    if (thread.archived) throw invalidRequest('cannot run a shell command in an archived thread')
+    this.subscribe(threadId, peer)
+    const activeTurnId = this.activeTurnByThread.get(threadId)
+    const turnId = activeTurnId ?? newId()
+    const group = this.userShells.get(turnId) ?? {
+      standalone: !activeTurnId,
+      runs: new Map<string, UserShellRun>(),
+    }
+    const item: Extract<ThreadItem, { type: 'commandExecution' }> = {
+      type: 'commandExecution',
+      id: newId(),
+      command,
+      cwd: thread.cwd,
+      processId: null,
+      source: 'userShell',
+      status: 'inProgress',
+      commandActions: [{ type: 'unknown', command }],
+      aggregatedOutput: null,
+      exitCode: null,
+      durationMs: null,
+    }
+    if (!activeTurnId) {
+      const turn: TurnRecord = {
+        id: turnId,
+        threadId,
+        status: 'inProgress',
+        startedAt: nowSeconds(),
+        completedAt: null,
+        durationMs: null,
+        items: [item],
+        diff: '',
+        error: null,
+      }
+      this.store.upsertTurn(turn)
+      this.activeTurnByThread.set(threadId, turnId)
+      this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
       this.notify(peer, {
-        method: 'command/exec/outputDelta',
-        params: {
-          processId,
-          stream: 'stdout',
-          deltaBase64: Buffer.from(chunk).toString('base64'),
-          capReached: false,
-        },
-      }),
-    )
-    child.stderr?.on('data', (chunk) =>
-      this.notify(peer, {
-        method: 'command/exec/outputDelta',
-        params: {
-          processId,
-          stream: 'stderr',
-          deltaBase64: Buffer.from(chunk).toString('base64'),
-          capReached: false,
-        },
-      }),
-    )
-    child.once('error', (error) =>
-      debugLog('thread.shellCommand.error', { threadId, processId, error: error.message }),
-    )
-    child.once('close', (code, signal) => {
-      debugLog('thread.shellCommand.close', { threadId, processId, code, signal })
-      this.commandProcesses.delete(processId)
+        method: 'turn/started',
+        params: { threadId, turn: this.toLifecycleTurn(turn) },
+      })
+    } else {
+      this.store.appendItem(turnId, item)
+    }
+    this.notify(peer, {
+      method: 'item/started',
+      params: { threadId, turnId, item, startedAtMs: nowMillis() },
     })
+    debugLog('thread.shellCommand.start', { threadId, turnId, itemId: item.id, cwd: thread.cwd })
+    const run = startUserShell(
+      thread.cwd,
+      command,
+      timeoutMs,
+      (delta) => {
+        if (!this.stopped)
+          this.notify(peer, {
+            method: 'item/commandExecution/outputDelta',
+            params: { threadId, turnId, itemId: item.id, delta },
+          })
+      },
+      (result) => {
+        group.runs.delete(item.id)
+        if (!group.runs.size) this.userShells.delete(turnId)
+        const current = this.store.getTurn(turnId)
+        if (current?.status !== 'inProgress') return
+        const { exitCode, aggregatedOutput, durationMs } = result
+        const completedItem: ThreadItem = {
+          ...item,
+          status: exitCode === 0 ? 'completed' : 'failed',
+          exitCode,
+          aggregatedOutput,
+          durationMs,
+        }
+        this.store.updateItem(turnId, item.id, () => completedItem)
+        debugLog('thread.shellCommand.close', {
+          threadId,
+          turnId,
+          itemId: item.id,
+          exitCode,
+          signal: result.signal,
+          timedOut: result.timedOut,
+          durationMs,
+        })
+        if (this.stopped) return
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId, turnId, item: completedItem, completedAtMs: nowMillis() },
+        })
+        if (group.standalone && !group.runs.size && !result.aborted) {
+          const completed = this.endTurn(current, 'completed', null)
+          if (completed) {
+            this.clearActiveTurn(threadId, turnId)
+            this.setThreadStatus(peer, threadId, { type: 'idle' })
+            this.notify(peer, {
+              method: 'turn/completed',
+              params: { threadId, turn: this.toLifecycleTurn(completed) },
+            })
+          }
+        }
+      },
+    )
+    group.runs.set(item.id, run)
+    this.userShells.set(turnId, group)
     return {}
+  }
+
+  // A turn closes its live shell items before it announces its terminal state.
+  private stopUserShells(turnId: string, message: string): void {
+    for (const run of this.userShells.get(turnId)?.runs.values() ?? []) run.stop(message)
   }
 
   // Codex's "clean background terminals" ends the shells a thread left
@@ -4185,6 +4285,10 @@ export class CodexClaudeAppServer {
   private async startClaimedTurn(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     let thread = this.startableThread(threadId)
+    const activeTurnId = this.activeTurnByThread.get(threadId)
+    if (activeTurnId && this.userShells.get(activeTurnId)?.standalone) {
+      throw invalidRequest('cannot start a turn while a user shell command is running')
+    }
     this.checkModelProfileBinding(thread)
     // Follow-up turns the adapter starts itself have no requesting peer.
     if (peer !== DETACHED_PEER) this.subscribe(threadId, peer)
@@ -6552,7 +6656,16 @@ export class CodexClaudeAppServer {
     const currentTurn = this.store.getTurn(turn.id)
     if (currentTurn && currentTurn.status !== 'inProgress') return
 
-    const finalDiff = await gitDiff(thread.cwd)
+    let finalDiff = await gitDiff(thread.cwd)
+    // A joined shell can outlast the model and make further file changes.
+    // Finish its item and refresh the diff before closing the turn.
+    let shells = this.userShells.get(turn.id)
+    while (shells) {
+      await Promise.all(Array.from(shells.runs.values(), (run) => run.done))
+      if (this.stopped || this.store.getTurn(turn.id)?.status !== 'inProgress') return
+      finalDiff = await gitDiff(thread.cwd)
+      shells = this.userShells.get(turn.id)
+    }
     if (this.stopped || this.store.getTurn(turn.id)?.status !== 'inProgress') return
     if (finalDiff) {
       this.store.updateTurnDiff(turn.id, finalDiff)
@@ -8320,6 +8433,15 @@ export class CodexClaudeAppServer {
     // Subagent threads are stored too, so this check covers them.
     if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     this.subscribe(threadId, peer)
+    const shellTurnId = this.activeTurnByThread.get(threadId)
+    if (
+      shellTurnId &&
+      this.userShells.get(shellTurnId)?.standalone &&
+      (!requestedTurnId || shellTurnId === requestedTurnId)
+    ) {
+      this.settleInterruptedTurn(peer, threadId, shellTurnId)
+      return {}
+    }
     // A background child has no runtime turn of its own; stop its task.
     const background = this.backgroundSubagents.get(threadId)
     if (background?.running) {
@@ -8351,7 +8473,9 @@ export class CodexClaudeAppServer {
   private settleInterruptedTurn(peer: RpcPeer, threadId: string, turnId: string): void {
     if (turnId) {
       const turn = this.store.getTurn(turnId)
+      if (turn && turn.threadId !== threadId) return
       if (turn?.status === 'inProgress') {
+        this.stopUserShells(turnId, 'command aborted by user')
         // Claude may still be streaming a message (a turn held open for its
         // workflow always is); the App needs it completed before the turn.
         this.closeStreamingItemsByTurn.get(turnId)?.()
@@ -8403,6 +8527,8 @@ export class CodexClaudeAppServer {
     // refusal is Codex's invalid-request error with the turn kind in
     // `data`, which App builds that queue a message sent during a compaction
     // match on.
+    if (this.userShells.get(activeTurnId)?.standalone)
+      throw invalidRequest('cannot steer a user shell command')
     const turnKind = this.unsteerableTurns.get(activeTurnId)
     if (turnKind) {
       const message = `cannot steer a ${turnKind} turn`
@@ -8499,6 +8625,7 @@ export class CodexClaudeAppServer {
   }
 
   private configRead(params: Record<string, unknown>): unknown {
+    this.loadPersistedConfig()
     // Base config = our typed defaults; overrides (whatever the App's
     // settings sheet has written previously via config/value/write) are
     // layered on top so the user sees their last-saved values instead of
@@ -9560,6 +9687,8 @@ export class CodexClaudeAppServer {
   // or, when one fails, none: the App shows the error and its settings stay
   // as they were. See app-settings.mts for what each setting does.
   private configWriteResponse(params: Record<string, unknown>): unknown {
+    const saved = this.loadPersistedConfig()
+    const edits: Record<string, unknown> = {}
     const overrides = structuredClone(this.configOverrides)
     let model = this.configModel
     let effort = this.configReasoningEffort
@@ -9567,8 +9696,10 @@ export class CodexClaudeAppServer {
       const { keyPath, value } = edit
       if (keyPath === 'model' && typeof value === 'string' && value.length > 0) {
         model = normalizeSelectableModelId(value, model)
+        edits.model = model
       } else if (keyPath === 'model_reasoning_effort' && typeof value === 'string') {
         effort = normalizeCodexReasoningEffort(value) ?? effort
+        edits.model_reasoning_effort = effort
       } else if (keyPath === 'mcp_servers' || keyPath.startsWith('mcp_servers.')) {
         editMcpServers(overrides, edit)
       } else {
@@ -9584,10 +9715,11 @@ export class CodexClaudeAppServer {
         }
       }
     }
+    if (!isDeepStrictEqual(overrides, this.configOverrides)) edits.overrides = overrides
+    this.persistConfig(saved, edits)
     this.configOverrides = overrides
     this.configModel = model
     this.configReasoningEffort = effort
-    this.persistConfig()
     const filePath = stringOr(params.filePath, `${codexHome()}/config.toml`)
     return {
       status: 'ok',
@@ -9648,31 +9780,39 @@ export class CodexClaudeAppServer {
   // started before the App gets to it list the same skills.
   // App rule: inline-visualizations
   private pluginInstall(params: Record<string, unknown>): unknown {
+    const saved = this.loadPersistedConfig()
     const plugin = claudeRunnableAppPlugin(params.marketplacePath, params.pluginName)
     const known = this.appPlugins.find((candidate) => candidate.name === plugin?.name)
-    let changed = false
+    const edits: Record<string, unknown> = {}
+    let appPlugins = this.appPlugins
+    let installedAppPlugins = this.installedAppPlugins
     if (plugin && known?.root !== plugin.root) {
-      this.appPlugins = [...this.appPlugins.filter((candidate) => candidate !== known), plugin]
-      changed = true
+      appPlugins = [...appPlugins.filter((candidate) => candidate !== known), plugin]
+      edits.appPlugins = appPlugins
     }
     // App rule: code-review-plugin-server
     const installed = appMarketplacePlugin(params.marketplacePath, params.pluginName)
     if (installed?.marketplace) {
       const id = `${installed.name}@${installed.marketplace}`
-      const was = this.installedAppPlugins.find((candidate) => candidate.id === id)
+      const was = installedAppPlugins.find((candidate) => candidate.id === id)
       if (was?.root !== installed.root) {
-        this.installedAppPlugins = [
-          ...this.installedAppPlugins.filter((candidate) => candidate !== was),
+        installedAppPlugins = [
+          ...installedAppPlugins.filter((candidate) => candidate !== was),
           { id, root: installed.root },
         ]
-        changed = true
+        edits.installedAppPlugins = installedAppPlugins
       }
     }
-    if (changed) this.persistConfig()
+    if (appPlugins !== this.appPlugins || installedAppPlugins !== this.installedAppPlugins) {
+      this.persistConfig(saved, edits)
+      this.appPlugins = appPlugins
+      this.installedAppPlugins = installedAppPlugins
+    }
     return { authPolicy: 'ON_USE', appsNeedingAuth: [] }
   }
 
   private pluginUninstall(params: Record<string, unknown>): unknown {
+    const saved = this.loadPersistedConfig()
     // Plugin ids read `<name>@<marketplace>`.
     const id = stringOr(params.pluginId, '')
     const name = id.split('@')[0]
@@ -9682,9 +9822,9 @@ export class CodexClaudeAppServer {
       kept.length !== this.appPlugins.length ||
       installed.length !== this.installedAppPlugins.length
     ) {
+      this.persistConfig(saved, { appPlugins: kept, installedAppPlugins: installed })
       this.appPlugins = kept
       this.installedAppPlugins = installed
-      this.persistConfig()
     }
     return {}
   }
@@ -9963,7 +10103,8 @@ export class CodexClaudeAppServer {
       runtimeWorkspaceRoots: [thread.cwd],
       instructionSources:
         thread.runtimeBackend === 'codex' ? [] : projectInstructions(thread.cwd).sources,
-      approvalPolicy: thread.approvalPolicy ?? 'never',
+      // A thread stored without a policy asks before tools run.
+      approvalPolicy: thread.approvalPolicy ?? 'on-request',
       // App rule: auto-review
       approvalsReviewer: thread.approvalsReviewer ?? 'user',
       sandbox: sandboxEnvelope(thread.sandboxMode, thread.cwd),
@@ -10066,7 +10207,7 @@ export class CodexClaudeAppServer {
     return {
       id: turn.id,
       rootTurnId: turn.rootTurnId ?? turn.id,
-      items: turn.items,
+      items: historyItems(turn),
       itemsView: 'full',
       status: turn.status,
       error: turn.error,
@@ -10679,6 +10820,7 @@ export class CodexClaudeAppServer {
   // and the terminal record built in memory when the store refused the write;
   // that write is then retried in the background.
   private endTurn(turn: TurnRecord, status: TurnStatus, error: unknown | null): TurnRecord | null {
+    this.stopUserShells(turn.id, 'command stopped because its turn ended')
     try {
       const current = this.store.getTurn(turn.id)
       if (current && current.status !== 'inProgress') return null
@@ -10772,68 +10914,107 @@ export class CodexClaudeAppServer {
     for (const id of this.store.descendantThreadIds(rootThreadId)) this.subscribe(id, peer)
   }
 
-  private loadPersistedConfig(): void {
-    try {
-      const parsed = JSON.parse(readFileSync(this.configPath, 'utf8')) as Record<string, unknown>
-      let shouldRepair = false
-      if (typeof parsed.model === 'string' && parsed.model.length > 0) {
-        const normalized = normalizeSelectableModelId(parsed.model, this.configModel)
-        shouldRepair = normalized !== parsed.model
-        this.configModel = normalized
-      }
-      if (typeof parsed.model_reasoning_effort === 'string') {
-        this.configReasoningEffort =
-          normalizeCodexReasoningEffort(parsed.model_reasoning_effort) ?? this.configReasoningEffort
-      }
-      // Restore the overrides bag — any key persisted previously that isn't
-      // the strongly-typed model / effort lives here so it survives restarts.
-      if (
-        parsed.overrides &&
-        typeof parsed.overrides === 'object' &&
-        !Array.isArray(parsed.overrides)
-      ) {
-        this.configOverrides = parsed.overrides as Record<string, unknown>
-        if (pruneLegacySettings(this.configOverrides)) shouldRepair = true
-      }
-      if (Array.isArray(parsed.appPlugins)) {
-        this.appPlugins = parsed.appPlugins.flatMap((entry) => {
+  private loadPersistedConfig(
+    purpose: 'read' | 'startup' | 'thread' = 'read',
+  ): Record<string, unknown> | null {
+    // Read first. A transient I/O error must leave the last good in-memory
+    // settings intact, and prevent a writer from replacing the unread file.
+    const saved = this.savedConfig(purpose === 'thread')
+    const parsed = saved ?? {}
+    const fallback = defaultSelectableModelId()
+    this.configModel =
+      typeof parsed.model === 'string'
+        ? normalizeSelectableModelId(parsed.model, fallback)
+        : fallback
+    this.configReasoningEffort =
+      normalizeCodexReasoningEffort(stringOr(parsed.model_reasoning_effort, '')) ??
+      normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ??
+      'medium'
+    this.configOverrides = { ...asTable(parsed.overrides) }
+    const pruned = pruneLegacySettings(this.configOverrides)
+    this.appPlugins = Array.isArray(parsed.appPlugins)
+      ? parsed.appPlugins.flatMap((entry) => {
           const plugin = asRecord(entry)
           return typeof plugin.name === 'string' && typeof plugin.root === 'string'
             ? [{ name: plugin.name, root: plugin.root }]
             : []
         })
-      }
-      if (Array.isArray(parsed.installedAppPlugins)) {
-        this.installedAppPlugins = parsed.installedAppPlugins.flatMap((entry) => {
+      : []
+    this.installedAppPlugins = Array.isArray(parsed.installedAppPlugins)
+      ? parsed.installedAppPlugins.flatMap((entry) => {
           const plugin = asRecord(entry)
           return typeof plugin.id === 'string' && typeof plugin.root === 'string'
             ? [{ id: plugin.id, root: plugin.root }]
             : []
         })
-      }
-      if (shouldRepair) this.persistConfig()
-    } catch {}
+      : []
+    // A model missing from this adapter's picker can be valid for a different
+    // adapter. Keep its on-disk selection until an explicit model edit.
+    if (purpose === 'startup' && pruned) {
+      // A clean startup only reads. Recheck inside the writer lock before
+      // migrating, in case another process saved since the initial read.
+      this.store.transaction(() => {
+        const current = this.loadPersistedConfig()
+        if (asTable(current?.overrides))
+          this.persistConfig(current, { overrides: this.configOverrides })
+      })
+    }
+    return saved
   }
 
-  private persistConfig(): void {
+  private savedConfig(forThreadStart: boolean): Record<string, unknown> | null {
     try {
-      ensureParent(this.configPath)
-      writeFileSync(
-        this.configPath,
-        JSON.stringify(
-          {
-            model: this.configModel,
-            model_reasoning_effort: this.configReasoningEffort,
-            overrides: this.configOverrides,
-            appPlugins: this.appPlugins,
-            installedAppPlugins: this.installedAppPlugins,
-          },
-          null,
-          2,
-        ) + '\n',
-        { mode: 0o600 },
-      )
-    } catch {}
+      const parsed = asTable(JSON.parse(readFileSync(this.configPath, 'utf8')))
+      if (parsed || !forThreadStart) return parsed
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      if (!(error instanceof SyntaxError)) throw error
+      if (!forThreadStart) return null
+    }
+    // A settings edit can repair malformed JSON. Starting a new thread
+    // without its saved permission defaults must wait for that repair.
+    throw new Error(
+      `Cannot start a thread because ${this.configPath} must contain a valid JSON object.`,
+    )
+  }
+
+  private persistConfig(
+    saved: Record<string, unknown> | null,
+    edits: Record<string, unknown>,
+  ): void {
+    // Initialize missing or malformed files in the established format. On a
+    // valid file, preserve every key outside this request's edits.
+    const config = {
+      ...(saved ?? {
+        model: this.configModel,
+        model_reasoning_effort: this.configReasoningEffort,
+        overrides: this.configOverrides,
+        appPlugins: this.appPlugins,
+        installedAppPlugins: this.installedAppPlugins,
+      }),
+      ...edits,
+    }
+    if (isDeepStrictEqual(config, saved)) return
+    // Rename next to the target so a linked config stays linked, including
+    // when a user creates the link before the first save.
+    let target = this.configPath
+    const links = new Set<string>()
+    while (lstatSync(target, { throwIfNoEntry: false })?.isSymbolicLink()) {
+      if (links.has(target)) throw new Error(`symbolic link loop at ${target}`)
+      links.add(target)
+      target = resolve(dirname(target), readlinkSync(target))
+    }
+    // Renaming can replace a read-only file in a writable directory. Honor
+    // the file permissions that a direct config write would enforce.
+    if (existsSync(target)) accessSync(target, constants.W_OK)
+    const temp = `${target}.${newId()}.tmp`
+    try {
+      ensureParent(target)
+      writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: 'wx' })
+      renameSync(temp, target)
+    } finally {
+      rmSync(temp, { force: true })
+    }
   }
 }
 
