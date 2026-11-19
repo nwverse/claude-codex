@@ -1274,11 +1274,6 @@ function unwrapSubagentHandback(text: string): string {
     .replace(/\s+$/, '')
 }
 
-// Best-effort parse of a Claude Bash tool_result for the real shell exit
-// code. Claude's tool result content is usually plain stdout/stderr, but in
-// some failure modes (and via custom wrappers / Codex CLI shims) the SDK
-// suffixes a `Exit code: N` / `exit status N` marker. Returning null lets
-// the caller fall back to 0/1 from event.isError.
 // Map Claude's TodoWrite input to Codex v2 TurnPlanStep[]. Claude todos carry
 // { content, status, activeForm } with status pending|in_progress|completed;
 // the wire TurnPlanStepStatus is camelCase pending|inProgress|completed.
@@ -1305,6 +1300,11 @@ export function todoWriteToPlanSteps(
   })
 }
 
+// Best-effort parse of a failed Claude Bash tool_result for the real shell
+// exit code. Claude Code starts a failed result with `Exit code N` (no colon)
+// followed by the command output; wrappers and the codex proxy may instead end
+// it with `Exit code: N` / `exit status: N`. Callers parse only error results
+// and fall back to 1 when this returns null.
 export function parseExitCodeFromResult(content: unknown): number | null {
   const text =
     typeof content === 'string'
@@ -1315,7 +1315,9 @@ export function parseExitCodeFromResult(content: unknown): number | null {
             .join('')
         : ''
   if (!text) return null
-  const match = text.match(/(?:Exit code|exit status|exit code):\s*(-?\d+)/i)
+  const match =
+    text.match(/^(?:Exit code|exit status):?[ \t]*(-?\d+)[ \t]*(?:\r?\n|$)/i) ??
+    text.match(/(?:^|\n)(?:Exit code|exit status):?[ \t]*(-?\d+)\s*$/i)
   if (!match) return null
   const code = Number(match[1])
   return Number.isFinite(code) ? code : null
@@ -1492,19 +1494,20 @@ export function fileChangeFromTool(
   ]
 }
 
+function splitDiffLines(text: string): string[] {
+  if (!text) return []
+  const lines = text.split('\n')
+  if (lines[lines.length - 1] === '') lines.pop()
+  return lines
+}
+
 export function simpleDiff(path: string, oldText: string, newText: string): string {
   return [
     `--- a/${path}`,
     `+++ b/${path}`,
     '@@',
-    ...oldText
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => `-${line}`),
-    ...newText
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => `+${line}`),
+    ...splitDiffLines(oldText).map((line) => `-${line}`),
+    ...splitDiffLines(newText).map((line) => `+${line}`),
     '',
   ].join('\n')
 }

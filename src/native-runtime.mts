@@ -909,6 +909,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       opts.model = context.model
     }
     if (context.effort) opts.effort = context.effort
+    if (context.enableFileCheckpointing) opts.enableFileCheckpointing = true
     const profileRoot = modelProcess
       ? defaultWorkflowTranscriptRoots(modelProcess.env, context.cwd)[0]
       : undefined
@@ -4561,6 +4562,7 @@ export function sessionSignature(context: RuntimeTurnContext): string {
     context.modelProfileFingerprint ?? null,
     context.thinkingDisplay ?? null,
     context.autoCompactWindow ?? null,
+    context.enableFileCheckpointing === true,
   ])
 }
 

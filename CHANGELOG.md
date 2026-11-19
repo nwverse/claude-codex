@@ -134,6 +134,11 @@ versioning or publishing metadata.
   the App and the debug log used to carry the JSON parser's excerpt of it,
   which could include a credential; JSON wrapped in quotes was echoed whole
   as a file that was not found.
+- `claude-codex-mode logs agent-http|agentapi` and `tail agent-http|agentapi`
+  show the pooled bridge log written to most recently. They used to show the
+  oldest one, so the log a failed bridge start pointed you to was usually
+  another bridge's.
+  They also find pooled logs when `CLAUDE_CODEX_STATE_DIR` contains a space.
 - A workflow agent that fails (one that stalled on every attempt, or hit an
   API error) ends its thread's turn as failed, with the reason the workflow
   reported, and counts as a failed subagent of its parent. It used to show as
