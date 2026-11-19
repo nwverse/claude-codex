@@ -132,6 +132,12 @@ versioning or publishing metadata.
   not found, a name, roots or metadata it refuses), whose text the App
   matches; a bad project cursor or an empty `idempotencyKey` is an invalid
   request.
+- `thread/turns/list`, `thread/turns/items/list`, `thread/items/list`,
+  `thread/timeline/list`, `thread/name/set`, `thread/archive`,
+  `thread/goal/get` and `turn/interrupt` refuse an unknown thread with
+  `unknown thread: <id>` (`-32600`) too. They used to answer an empty page,
+  `{goal: null}` or `{}`; a rename or archive still sent its notification,
+  and an interrupt left the caller subscribed to a thread that did not exist.
 - Model process profiles that fail to load fail with one line of at most 300
   characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
   what is wrong. The message used to carry the JSON parser's excerpt of the
@@ -160,9 +166,32 @@ versioning or publishing metadata.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.
+- `claude-codex-mode` force-kills (SIGKILL) a pooled bridge or an app-server
+  that is still running 3 seconds after SIGTERM. It used to send SIGTERM a
+  second time, then drop the bridge's pidfile anyway, which left a bridge
+  holding its port that `status`, `stop-bridges` and `prune-bridges` could no
+  longer see, and `set` reported the app-server stopped while it still ran.
+- An unexpected error the adapter does not catch now ends it with exit code 1
+  and the stack on stderr, logged once in `debug.jsonl`, so whatever started
+  it can start it again. The adapter used to log and re-throw the same error
+  forever, so it kept running in whatever state the error left it in, busy
+  writing thousands of `adapter.uncaughtException` lines a second to
+  `debug.jsonl`. Errors from a peer that went away (`EPIPE`, `ECONNRESET`,
+  `EBADF`) are still logged and ignored.
 
 ### App-server and protocol compatibility
 
+- Untracked symlinks show in the turn diff as `new file mode 120000` entries
+  whose content is the link target, as `git diff` shows them. The adapter no
+  longer reads through a link, so a file outside the workspace no longer leaks
+  into the diff and a link to a device such as `/dev/zero` no longer hangs it;
+  a dangling or directory link, an embedded repository or an unreadable file
+  no longer empties the untracked part of the diff.
+- With the `codex` shim on `PATH`, `codex app-server generate-ts` and
+  `generate-json-schema` (and so `npm run generate:schema`) go to the real
+  Codex CLI (`CODEX_REAL`). They used to start an adapter app-server on stdio
+  that never wrote the bindings; without a real codex the shim now exits 127
+  and says to set `CODEX_REAL`.
 - `thread/list` now filters by `searchTerm` (thread name or preview) and
   `excludedThreadIds`, and the exclusion applies before the page limit. A
   malformed or oversized (more than 100) `excludedThreadIds` returns
@@ -665,6 +694,17 @@ versioning or publishing metadata.
   included, and "Allow for this session" covers only that call.
 - When Claude Code withdraws a pending approval or question mid-turn, its card
   closes, the call is declined, and a late Cancel no longer interrupts the turn.
+- A thread whose approval policy is `never` keeps a read-only sandbox
+  read-only: Read, Grep, Glob, LS and WebSearch run, and any other call is
+  refused without a card, with Claude told the sandbox is read-only. Before,
+  `never` approved every tool whatever the sandbox, so Bash and file edits ran
+  in a read-only thread. The `claude-p` backend no longer adds
+  `--dangerously-skip-permissions` there, so only the read tools it
+  pre-approves run. The summary `/compact` writes in place of compacting
+  Claude's session (on a Codex model, or when that compaction fails) now
+  declines any tool beyond its reads instead of approving it. `never` with
+  any other sandbox still runs every tool unasked: the adapter has no OS
+  sandbox to confine workspace-write.
 
 ### Trustworthy history and settings
 
@@ -794,6 +834,12 @@ versioning or publishing metadata.
 
 ### Provider and multi-agent boundaries
 
+- Follow-up turns of a Codex (`gpt-*`) chat on the `codex-proxy` route run
+  in the thread's folder with its sandbox mode and extra writable roots
+  (`CLAUDE_CODEX_ADD_DIRS`) again. `codex exec resume` was run without `-C`,
+  `-s` and `--add-dir`, so from the second turn on Codex worked in the
+  adapter's own folder, dropped the extra roots and, in `read-only` and
+  `workspace-write` chats, used the sandbox of the user's Codex config.
 - `/workflows` runs turn workflows on with the CLI's `CLAUDE_CODE_WORKFLOWS`
   switch instead of `--settings`, which pinned launchers reject, and respect a
   user's `enableWorkflows: false`.
@@ -1017,9 +1063,11 @@ versioning or publishing metadata.
 
 ### Validation and release gates
 
-- Default CI runs Biome checks, TypeScript typechecking, the Node test suite,
-  Rust workspace tests, and the pinned Rust protocol fixture drift gate.
-- Documentation changes should run `npm run docs:build`.
+- Default CI runs Biome checks, TypeScript typechecking, the VitePress docs
+  build, the Node test suite, Rust workspace tests, and the pinned Rust protocol
+  fixture drift gate.
+- The docs build no longer ignores dead links, so a link to a page that does not
+  exist fails CI.
 - Credentialed smoke and acceptance checks remain opt-in and must use
   credentials already owned by the local user or organization on the host.
 - `npm run check:app-upgrade -- --app <bundle>` checks a new Codex App build
@@ -1029,6 +1077,18 @@ versioning or publishing metadata.
   behaviors the adapter relies on are App rules in `src/app-compat.mts`, tagged
   in the code and kept in sync by `test/app-compat.test.mts`; an App build not
   yet checked gets a config warning. See `docs/reference/app-compat.md`.
+- `npm run doctor` checks the runtime the shim will run: it reads the
+  `runtime.env` that `claude-codex-mode set` writes, accepts `codex-proxy`
+  (and checks for the real `codex` CLI), and reports an unknown runtime type
+  as a failed check instead of crashing. It finds the adapter, shim and
+  `node_modules` from its own checkout whatever the working directory, checks
+  that the built adapter answers a startup probe, and names spawn errors such
+  as `ENOENT` instead of `exited null`. It reads quoted values, trailing
+  comments and a leading `~` in `runtime.env` as the shell does, fails the
+  runtime type check when a line it cannot evaluate sets the runtime, lists
+  the other lines it skipped, and says whether the type came from the file,
+  the environment or the default. It looks for the real `codex` as the shim
+  does for the native route and as the adapter does for `codex-proxy`.
 
 ### Still experimental or not yet included
 

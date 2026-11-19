@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { MockRuntime } from '../src/mock-runtime.mjs'
+import type { PermissionDecision, RuntimeTurnContext } from '../src/types.mjs'
 import { type InProcessApp, scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 // The App draws a stored contextCompaction, or one item/completed closed, as
@@ -220,5 +221,59 @@ test('a /compact that compacted the session stands when its run goes wrong after
     assert.deepEqual(storedTypes(app, compactTurn), ['contextCompaction'])
     assert.deepEqual(app.notified('thread/compacted'), [{ threadId, turnId: compactTurn }])
     assert.deepEqual(app.notified('error'), [])
+  })
+})
+
+test('the summary written in place of a compaction reads only, and any other tool is declined', async () => {
+  const contexts: RuntimeTurnContext[] = []
+  const decisions: PermissionDecision[] = []
+  const runtime = scriptedRuntime(async (context, handlers) => {
+    if (context.purpose === 'compact') {
+      contexts.push(context)
+      decisions.push(
+        await handlers.onPermissionRequest({
+          type: 'permission_request',
+          requestId: 'perm-1',
+          toolUseId: 'tool-1',
+          toolName: 'Bash',
+          input: { command: 'rm -rf build' },
+        }),
+      )
+      await handlers.onEvent({ type: 'text_delta', delta: 'SUMMARY: work so far.' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'summary' })
+      return
+    }
+    await handlers.onEvent({ type: 'text_delta', delta: 'done' })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread({
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+    })
+    const first = await app.startTurn(threadId, 'hello')
+    await app.turnCompleted(first)
+    await app.request('thread/compact/start', { threadId })
+    const compactTurn = await app.waitFor(
+      () => app.notified('turn/started').find((params) => params.turn.id !== first)?.turn.id,
+    )
+    assert.equal((await app.turnCompleted(compactTurn)).status, 'completed')
+
+    // A policy that would approve anything is not the summary's, whatever the
+    // thread runs on: it reads, and asks for nothing else.
+    const [context] = contexts
+    assert.equal(context?.approvalPolicy, 'on-request')
+    assert.equal(context?.sandboxMode, 'read-only')
+    assert.deepEqual(context?.allowedTools, ['Read', 'Glob', 'Grep'])
+    // The call is refused without a card, and Claude goes on with the summary.
+    assert.deepEqual(decisions, [{ decision: 'decline' }])
+    assert.deepEqual(
+      app.messages.filter((message) => /requestApproval$/.test(message.method ?? '')),
+      [],
+    )
+    const summary = app.store
+      .getTurn(compactTurn)
+      ?.items.find((item) => item.type === 'agentMessage')
+    assert.deepEqual(summary?.type === 'agentMessage' && summary.text, 'SUMMARY: work so far.')
   })
 })
