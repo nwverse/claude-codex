@@ -1,19 +1,23 @@
 import assert from 'node:assert/strict'
-import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { once } from 'node:events'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { CodexClaudeAppServer } from '../src/server.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type { ClaudeRuntime, RpcPeer, RuntimeTurnContext, WireMessage } from '../src/types.mjs'
 
+import {
+  manualBackgroundReports,
+  releaseBackgroundReport,
+  spawnMockAdapter,
+} from './support/adapter-harness.mjs'
+
 // The leader tools end to end: a mock app-server over stdio, with the mock
 // runtime calling the tools for each `leader <tool> <json>` line of a prompt.
-
-const adapter = resolve('dist/src/adapter.mjs')
 
 class AppServer {
   readonly home: string
@@ -30,19 +34,11 @@ class AppServer {
 
   constructor(home: string, env: Record<string, string> = {}) {
     this.home = home
-    const inherited = { ...process.env }
-    delete inherited.CLAUDE_CODEX_HOME
-    delete inherited.CLAUDE_CODEX_LEADER_TOOLS
-    delete inherited.CLAUDE_CODEX_LEADER_MAX_RUNNING
-    this.proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...inherited,
-        CODEX_HOME: home,
-        CLAUDE_CODEX_MOCK: '1',
-        NODE_NO_WARNINGS: '1',
-        ...env,
-      },
+    this.proc = spawnMockAdapter(home, {
+      CLAUDE_CODEX_HOME: undefined,
+      CLAUDE_CODEX_LEADER_TOOLS: undefined,
+      CLAUDE_CODEX_LEADER_MAX_RUNNING: undefined,
+      ...env,
     })
     this.proc.stderr.resume()
     this.proc.stdout.setEncoding('utf8')
@@ -57,6 +53,10 @@ class AppServer {
 
   answer(id: number, result: unknown): void {
     this.proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`)
+  }
+
+  releaseReport(threadId: string): void {
+    releaseBackgroundReport(this.proc, threadId)
   }
 
   mark(): number {
@@ -452,11 +452,11 @@ test('thread_prompt steers a working chat or starts a turn, and can wait for it'
 })
 
 test('a leader sees no quiet-turn heartbeat, only that background work still runs', async () => {
-  await withServer(LEADER_ENV, async (server) => {
+  await withServer({ ...LEADER_ENV, ...manualBackgroundReports }, async (server) => {
     const leader = await server.startThread()
     const from = server.mark()
     const started = await server.tool(leader, 'thread_start', {
-      prompt: 'background subagent check delay=1500',
+      prompt: 'background subagent check',
     })
     const childId = started.threadId
     // The App gets the heartbeat that keeps its unread dot off.
@@ -477,6 +477,7 @@ test('a leader sees no quiet-turn heartbeat, only that background work still run
     assert.deepEqual(agentTexts, ['agent launched in background'])
 
     // The agent reports back in a turn of its own, which carries no heartbeat.
+    server.releaseReport(childId)
     await server.waitFor(
       'turn/completed',
       (params) => params.threadId === childId && params.turn.id !== started.turnId,

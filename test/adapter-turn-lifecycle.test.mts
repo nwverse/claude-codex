@@ -11,9 +11,11 @@ import {
   codex930Initialize,
   JsonLineReader,
   json,
+  manualBackgroundReports,
   nextNotification,
   readQuiet,
   readUntil,
+  releaseBackgroundReport,
   spawnMockAdapter,
   startMockThread,
   stopProcess,
@@ -845,7 +847,7 @@ test('stale interrupt for a completed turn leaves the active turn running', asyn
 
 test('stale interrupt for a background child turn that reported leaves its resumed turn running', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawnMockAdapter(home)
+  const proc = spawnMockAdapter(home, manualBackgroundReports)
   const reader = new JsonLineReader(proc)
   const turnCompleted = (threadId: string) => (message: any) =>
     message.method === 'turn/completed' && message.params.threadId === threadId
@@ -860,13 +862,13 @@ test('stale interrupt for a background child turn that reported leaves its resum
       json({
         id: 2,
         method: 'turn/start',
-        params: { threadId, input: textInput('background subagent check delay=300') },
+        params: { threadId, input: textInput('background subagent check') },
       }),
     )
     await reader.nextResponse(2)
-    const reported: any[] = []
-    for (let turns = 0; turns < 2; turns += 1)
-      reported.push(...(await readUntil(reader, turnCompleted(threadId))))
+    const reported = await readUntil(reader, turnCompleted(threadId))
+    releaseBackgroundReport(proc, threadId)
+    reported.push(...(await readUntil(reader, turnCompleted(threadId))))
     const childStarted = reported.find(
       (m) => m.method === 'turn/started' && m.params.threadId !== threadId,
     )
@@ -879,7 +881,7 @@ test('stale interrupt for a background child turn that reported leaves its resum
       json({
         id: 3,
         method: 'turn/start',
-        params: { threadId, input: textInput('background message check delay=30000') },
+        params: { threadId, input: textInput('background message check') },
       }),
     )
     await reader.nextResponse(3)

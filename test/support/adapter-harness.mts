@@ -100,12 +100,21 @@ export const completedItems = (seen: any[]): any[] =>
     .filter((message) => message.method === 'item/completed')
     .map((message) => message.params.item)
 
+export const manualBackgroundReports = { CLAUDE_CODEX_MOCK_BACKGROUND_REPORTS: 'manual' }
+
+export function releaseBackgroundReport(proc: ChildProcess, threadId: string): void {
+  proc.send(`releaseBackgroundReport:${threadId}`)
+}
+
 export function spawnMockAdapter(
   home: string,
   env: NodeJS.ProcessEnv = {},
 ): ChildProcessWithoutNullStreams {
   return spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
+    stdio:
+      env.CLAUDE_CODEX_MOCK_BACKGROUND_REPORTS === 'manual'
+        ? ['pipe', 'pipe', 'pipe', 'ipc']
+        : ['pipe', 'pipe', 'pipe'],
     env: {
       ...process.env,
       CODEX_HOME: home,
@@ -113,7 +122,7 @@ export function spawnMockAdapter(
       NODE_NO_WARNINGS: '1',
       ...env,
     },
-  })
+  }) as ChildProcessWithoutNullStreams
 }
 
 export async function awaitMessage(

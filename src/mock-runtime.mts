@@ -29,7 +29,7 @@ export class MockRuntime implements ClaudeRuntime {
   private runningTurns = new Map<string, string>()
   private turnSettings = new Map<string, RuntimeTurnSettings>()
   private listener: RuntimeBackgroundListener | null = null
-  private backgroundTasks = new Map<string, { threadId: string; timer: NodeJS.Timeout }>()
+  private backgroundTasks = new Map<string, { threadId: string; cancel: () => void }>()
   // What Claude says, unprompted, once a background agent reports back.
   private continuations = new Map<string, string>()
   private steered = new Map<string, string[]>()
@@ -1443,7 +1443,7 @@ export class MockRuntime implements ClaudeRuntime {
         input: { task_id: MOCK_BACKGROUND_AGENT_ID },
       })
       const task = this.backgroundTasks.get(MOCK_BACKGROUND_AGENT_ID)
-      if (task) clearTimeout(task.timer)
+      task?.cancel()
       this.backgroundTasks.delete(MOCK_BACKGROUND_AGENT_ID)
       await handlers.onEvent({
         type: 'tool_result',
@@ -1890,7 +1890,7 @@ export class MockRuntime implements ClaudeRuntime {
   }
 
   async stop(): Promise<void> {
-    for (const { timer } of this.backgroundTasks.values()) clearTimeout(timer)
+    for (const task of this.backgroundTasks.values()) task.cancel()
     this.backgroundTasks.clear()
     this.shells.clear()
     this.workflows.clear()
@@ -1914,7 +1914,7 @@ export class MockRuntime implements ClaudeRuntime {
     }
     const task = this.backgroundTasks.get(taskId)
     if (!task || task.threadId !== threadId) return false
-    clearTimeout(task.timer)
+    task.cancel()
     this.backgroundTasks.delete(taskId)
     // Claude reports the stop asynchronously, and passively: no wakeup.
     setImmediate(() => {
@@ -1975,7 +1975,7 @@ export class MockRuntime implements ClaudeRuntime {
     report: string,
     delayMs: number,
   ): void {
-    const timer = setTimeout(async () => {
+    const deliver = async () => {
       this.backgroundTasks.delete(taskId)
       const listener = this.listener
       if (!listener) return
@@ -1999,8 +1999,22 @@ export class MockRuntime implements ClaudeRuntime {
       })
       this.continuations.set(threadId, `Background agent reported: ${report}`)
       listener.onAutonomousTurn(threadId)
-    }, delayMs)
-    this.backgroundTasks.set(taskId, { threadId, timer })
+    }
+    // A stdio fixture can hold the report until it has observed the launching
+    // turn, or cancel the task while it is still live. The IPC channel is
+    // separate from the App's protocol on stdin/stdout.
+    if (process.send && process.env.CLAUDE_CODEX_MOCK_BACKGROUND_REPORTS === 'manual') {
+      const release = (message: unknown) => {
+        if (message !== `releaseBackgroundReport:${threadId}`) return
+        process.off('message', release)
+        void deliver()
+      }
+      process.on('message', release)
+      this.backgroundTasks.set(taskId, { threadId, cancel: () => process.off('message', release) })
+    } else {
+      const timer = setTimeout(deliver, delayMs)
+      this.backgroundTasks.set(taskId, { threadId, cancel: () => clearTimeout(timer) })
+    }
   }
 }
 

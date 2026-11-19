@@ -14,7 +14,9 @@ import {
   completedAgentMessages,
   JsonLineReader,
   json,
+  manualBackgroundReports,
   readUntil,
+  releaseBackgroundReport,
   spawnMockAdapter,
   startMockThread,
   textInput,
@@ -860,10 +862,7 @@ test('server stop keeps a background report from opening a parent turn after it'
 
 test('background Agent outlives the parent turn, wakes the parent, and resumes on SendMessage', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
-  })
+  const proc = spawnMockAdapter(home, manualBackgroundReports)
   const reader = new JsonLineReader(proc)
   const parentTurnCompleted = (threadId: string) => (message: any) =>
     message.method === 'turn/completed' && message.params.threadId === threadId
@@ -878,7 +877,7 @@ test('background Agent outlives the parent turn, wakes the parent, and resumes o
         method: 'turn/start',
         params: {
           threadId,
-          input: [{ type: 'text', text: 'background subagent check delay=600', text_elements: [] }],
+          input: [{ type: 'text', text: 'background subagent check', text_elements: [] }],
         },
       }),
     )
@@ -904,6 +903,7 @@ test('background Agent outlives the parent turn, wakes the parent, and resumes o
     assert.deepEqual(activityKinds(launch, threadId), ['started'])
 
     // The report completes the child, then Claude answers in a turn of its own.
+    releaseBackgroundReport(proc, threadId)
     const report = await readUntil(reader, parentTurnCompleted(threadId))
     const childDone = report.findIndex(parentTurnCompleted(childThreadId))
     assert.ok(childDone >= 0)
@@ -969,7 +969,7 @@ test('background Agent outlives the parent turn, wakes the parent, and resumes o
         method: 'turn/start',
         params: {
           threadId,
-          input: [{ type: 'text', text: 'background message check delay=600', text_elements: [] }],
+          input: [{ type: 'text', text: 'background message check', text_elements: [] }],
         },
       }),
     )
@@ -1002,6 +1002,7 @@ test('background Agent outlives the parent turn, wakes the parent, and resumes o
     )
     assert.deepEqual(activityKinds(sent, threadId), ['interacted'])
 
+    releaseBackgroundReport(proc, threadId)
     const followUp = await readUntil(reader, parentTurnCompleted(threadId))
     const resumedDone = followUp.find(parentTurnCompleted(childThreadId))
     assert.equal(resumedDone?.params.turn.id, resumed.params.turn.id)
@@ -1172,7 +1173,10 @@ function heartbeatDeltas(messages: any[]): any[] {
 
 test('a turn that leaves a background agent running ends quiet, and the report does not', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawnMockAdapter(home, { CLAUDE_CODEX_QUIET_BACKGROUND_TURNS: '' })
+  const proc = spawnMockAdapter(home, {
+    ...manualBackgroundReports,
+    CLAUDE_CODEX_QUIET_BACKGROUND_TURNS: '',
+  })
   const reader = new JsonLineReader(proc)
   const turnCompleted = (threadId: string) => (message: any) =>
     message.method === 'turn/completed' && message.params.threadId === threadId
@@ -1184,7 +1188,7 @@ test('a turn that leaves a background agent running ends quiet, and the report d
       json({
         id: 2,
         method: 'turn/start',
-        params: { threadId, input: textInput('background subagent check delay=600') },
+        params: { threadId, input: textInput('background subagent check') },
       }),
     )
     await reader.nextResponse(2)
@@ -1200,6 +1204,7 @@ test('a turn that leaves a background agent running ends quiet, and the report d
 
     // Nothing runs once the agent reported, so its turn lights the dot; the
     // child's own message never carries the block either.
+    releaseBackgroundReport(proc, threadId)
     const report = await readUntil(reader, turnCompleted(threadId))
     const reported = completedAgentMessages(report, threadId)
     assert.ok(reported.some((item) => /Background agent reported/.test(item.text)))
@@ -1350,7 +1355,7 @@ test('CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0 lets every turn light the dot', asyn
 
 test('SendMessage to a finished foreground agent reopens it like a background one', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawnMockAdapter(home)
+  const proc = spawnMockAdapter(home, manualBackgroundReports)
   const reader = new JsonLineReader(proc)
   const turnCompleted = (threadId: string) => (message: any) =>
     message.method === 'turn/completed' && message.params.threadId === threadId
@@ -1380,7 +1385,7 @@ test('SendMessage to a finished foreground agent reopens it like a background on
         method: 'turn/start',
         params: {
           threadId,
-          input: [{ type: 'text', text: 'foreground message check delay=300', text_elements: [] }],
+          input: [{ type: 'text', text: 'foreground message check', text_elements: [] }],
         },
       }),
     )
@@ -1402,6 +1407,7 @@ test('SendMessage to a finished foreground agent reopens it like a background on
     assert.deepEqual(activityKinds(sent, threadId), ['interacted'])
 
     // The report settles the reopened turn and wakes the parent.
+    releaseBackgroundReport(proc, threadId)
     const report = await readUntil(reader, turnCompleted(threadId))
     const reopenedDone = report.find(turnCompleted(childThreadId))
     assert.equal(reopenedDone?.params.turn.id, reopened.params.turn.id)
@@ -1649,7 +1655,7 @@ test('agents a turn leaves running end with it, a nested one inside its host fir
 
 test('an agent SendMessage resumes keeps its child thread, and the agents it launches hang off it', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawnMockAdapter(home)
+  const proc = spawnMockAdapter(home, manualBackgroundReports)
   const reader = new JsonLineReader(proc)
   const turnCompleted = (threadId: string) => (message: any) =>
     message.method === 'turn/completed' && message.params.threadId === threadId
@@ -1676,7 +1682,7 @@ test('an agent SendMessage resumes keeps its child thread, and the agents it lau
       json({
         id: 3,
         method: 'turn/start',
-        params: { threadId, input: textInput('foreground message nested check delay=300') },
+        params: { threadId, input: textInput('foreground message nested check') },
       }),
     )
     await reader.nextResponse(3)
@@ -1706,6 +1712,7 @@ test('an agent SendMessage resumes keeps its child thread, and the agents it lau
     )
 
     // The report settles the reopened turn: one child thread throughout.
+    releaseBackgroundReport(proc, threadId)
     const report = await readUntil(reader, turnCompleted(threadId))
     assert.equal(report.find(turnCompleted(childThreadId))?.params.turn.id, reopened.params.turn.id)
     proc.stdin.write(json({ id: 4, method: 'thread/read', params: { threadId: childThreadId } }))
@@ -1727,7 +1734,7 @@ test('an agent SendMessage resumes keeps its child thread, and the agents it lau
 
 test('TaskStop on a background agent is a closeAgent that ends the child as interrupted', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawnMockAdapter(home)
+  const proc = spawnMockAdapter(home, manualBackgroundReports)
   const reader = new JsonLineReader(proc)
   const turnCompleted = (threadId: string) => (message: any) =>
     message.method === 'turn/completed' && message.params.threadId === threadId
@@ -1744,7 +1751,7 @@ test('TaskStop on a background agent is a closeAgent that ends the child as inte
           params: { threadId, input: [{ type: 'text', text, text_elements: [] }] },
         }),
       )
-    startTurn(2, 'background subagent check delay=5000')
+    startTurn(2, 'background subagent check')
     await reader.nextResponse(2)
     const launch = await readUntil(reader, turnCompleted(threadId))
     const childThreadId = String(
@@ -1816,10 +1823,7 @@ test('a tool Claude runs beside an Agent call keeps its own card', async () => {
 
 test('an agent backgrounded mid-wait closes the wait without marking the child done', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
-  })
+  const proc = spawnMockAdapter(home, manualBackgroundReports)
   const reader = new JsonLineReader(proc)
   const turnCompleted = (threadId: string) => (message: any) =>
     message.method === 'turn/completed' && message.params.threadId === threadId
@@ -1834,7 +1838,7 @@ test('an agent backgrounded mid-wait closes the wait without marking the child d
         method: 'turn/start',
         params: {
           threadId,
-          input: [{ type: 'text', text: 'auto background check delay=600', text_elements: [] }],
+          input: [{ type: 'text', text: 'auto background check', text_elements: [] }],
         },
       }),
     )
@@ -1856,6 +1860,7 @@ test('an agent backgrounded mid-wait closes the wait without marking the child d
     assert.equal(waitEnd.agentsStates[childThreadId].status, 'running')
     assert.equal(launch.some(turnCompleted(childThreadId)), false)
 
+    releaseBackgroundReport(proc, threadId)
     const report = await readUntil(reader, turnCompleted(threadId))
     assert.equal(report.find(turnCompleted(childThreadId))?.params.turn.status, 'completed')
 
@@ -1874,10 +1879,7 @@ test('an agent backgrounded mid-wait closes the wait without marking the child d
 
 test('stopping a background child interrupts it without waking the parent', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
-  })
+  const proc = spawnMockAdapter(home, manualBackgroundReports)
   const reader = new JsonLineReader(proc)
   try {
     proc.stdin.write(json(codex930Initialize(0)))
@@ -1890,9 +1892,7 @@ test('stopping a background child interrupts it without waking the parent', asyn
         method: 'turn/start',
         params: {
           threadId,
-          input: [
-            { type: 'text', text: 'background subagent check delay=30000', text_elements: [] },
-          ],
+          input: [{ type: 'text', text: 'background subagent check', text_elements: [] }],
         },
       }),
     )
@@ -1947,10 +1947,7 @@ test('stopping a background child interrupts it without waking the parent', asyn
 
 test('deleting a thread stops its running background child and ends the child turn first', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
-  })
+  const proc = spawnMockAdapter(home, manualBackgroundReports)
   const reader = new JsonLineReader(proc)
   try {
     proc.stdin.write(json(codex930Initialize(0)))
@@ -1963,9 +1960,7 @@ test('deleting a thread stops its running background child and ends the child tu
         method: 'turn/start',
         params: {
           threadId,
-          input: [
-            { type: 'text', text: 'background subagent check delay=30000', text_elements: [] },
-          ],
+          input: [{ type: 'text', text: 'background subagent check', text_elements: [] }],
         },
       }),
     )
