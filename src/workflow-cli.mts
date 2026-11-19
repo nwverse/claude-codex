@@ -110,17 +110,27 @@ export async function runWorkflowCli(
         now,
         state.tasks.map((task) => task.id),
       )
-      const nextState = result.tasks.reduce((current, task) => upsertTask(current, task), state)
+      const knownTaskIds = new Set(state.tasks.map((task) => task.id))
+      const existing: string[] = [...result.existing]
+      const newTasks = result.tasks.filter((task) => {
+        if (knownTaskIds.has(task.id)) {
+          existing.push(task.id)
+          return false
+        }
+        knownTaskIds.add(task.id)
+        return true
+      })
+      const nextState = { ...state, tasks: [...state.tasks, ...newTasks] }
       // A duplicate-only import leaves the saved state file untouched.
-      if (result.tasks.length > 0 || result.existing.length === 0) await store.write(nextState)
+      if (newTasks.length > 0 || existing.length === 0) await store.write(nextState)
       writeJson(io.stdout, {
         status: 'ingested',
         statePath: store.path,
         source,
-        enqueued: result.tasks.length,
-        existing: result.existing,
+        enqueued: newTasks.length,
+        existing,
         skipped: result.skipped,
-        taskIds: result.tasks.map((task) => task.id),
+        taskIds: newTasks.map((task) => task.id),
       })
       return 0
     }
