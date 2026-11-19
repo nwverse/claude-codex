@@ -4024,7 +4024,7 @@ export class CodexClaudeAppServer {
         onEvent: async (event) => {
           if (event.type === 'text_delta' && event.delta && active()) {
             collected += event.delta
-            this.store.updateItem(turnId, agentItemId, (item) =>
+            this.store.streamItem(turnId, agentItemId, (item) =>
               item.type === 'agentMessage' ? { ...item, text: item.text + event.delta } : item,
             )
             this.notify(peer, {
@@ -5747,7 +5747,7 @@ export class CodexClaudeAppServer {
             completeReasoningItem()
             hasTextOutput = true
             const itemId = ensureAgentItem()
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type === 'agentMessage') return { ...item, text: item.text + event.delta }
               return item
             })
@@ -5761,7 +5761,7 @@ export class CodexClaudeAppServer {
             if (event.delta.length === 0) return
             completeAgentItem('commentary')
             const itemId = ensureReasoningItem()
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type !== 'reasoning') return item
               return reasoningVisible
                 ? { ...item, summary: [(item.summary[0] ?? '') + event.delta] }
@@ -5857,7 +5857,7 @@ export class CodexClaudeAppServer {
             // Output that comes after the result is not the item's any more.
             if (!itemId || !openToolItems.has(itemId)) return
             commandOutputSeen.add(itemId)
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
                 return {
                   ...item,
@@ -5885,7 +5885,7 @@ export class CodexClaudeAppServer {
               const started = itemStartedAtMs.get(itemId)
               return started == null ? null : Math.max(0, nowMillis() - started)
             })()
-            const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
+            const parsedExitCode = event.isError ? (parseExitCodeFromResult(event.content) ?? 1) : 0
             const output = exploreItemIds.has(itemId) ? capOutput(resultText) : resultText
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
@@ -6181,8 +6181,11 @@ export class CodexClaudeAppServer {
             )
             itemId = item.id
             itemIds.set(event.toolUseId, item.id)
+            itemStartedAtMs.set(item.id, nowMillis())
             openToolItems.add(item.id)
             if (isExploreTool(event.toolName)) exploreItemIds.add(item.id)
+            else if (item.type === 'commandExecution')
+              this.rememberCommandItem(event.toolUseId, thread.id, turn.id, item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -7185,7 +7188,7 @@ export class CodexClaudeAppServer {
     const at = this.commandItems.get(event.toolUseId)
     if (!at || at.threadId !== threadId || !event.delta) return
     let found = false
-    this.store.updateItem(at.turnId, at.itemId, (item) => {
+    this.store.streamItem(at.turnId, at.itemId, (item) => {
       if (item.type !== 'commandExecution') return item
       found = true
       return { ...item, aggregatedOutput: appendCommandOutput(item.aggregatedOutput, event.delta) }
@@ -8046,10 +8049,10 @@ export class CodexClaudeAppServer {
     signal?: AbortSignal,
   ): Promise<UserInputAnswers> {
     const requestId = newId()
-    // Always guarantee an "Other" affordance so the App's free-text fallback
-    // is available, even when the upstream caller (Claude tool input, mock
-    // runtime, etc.) didn't model it explicitly.
+    // Questions with isOther already get the App's own free-text choice; for
+    // callers that don't set it, fall back to a plain "Other" option.
     const normalized = questions.map((q) => {
+      if (q.isOther) return q
       const options = q.options ?? []
       const hasOther = options.some((o) => o.label === 'Other')
       return hasOther
@@ -10324,6 +10327,8 @@ export class CodexClaudeAppServer {
         threadId,
         error: error instanceof Error ? error.message : String(error),
       })
+      // What is stored describes the workspace the thread left.
+      if (options.replace && !this.stopped) this.store.setThreadGitInfo(threadId, null)
     }
   }
 
