@@ -58,13 +58,15 @@ npm run workflow -- block --task task-id --reason "Needs a missing credential"
 | --- | --- |
 | `counts` | Number of queued, running, blocked, done, and failed tasks. |
 | `runningTaskIds` | Tasks currently holding leases. |
-| `staleLeaseTaskIds` | Running tasks whose lease expired and can be reclaimed. |
+| `staleLeaseTaskIds` | Running tasks whose lease expired; `schedule` reclaims them, or fails them on their final attempt. |
 | `nextLeaseExpiresAt` | The next active lease expiry time, or `null`. |
 | `runRegistryLagMs` | Time since the run registry was last updated, when available. |
 
 A safe heartbeat has no stale leases, no failed tasks, and no duplicate queued
-work. A stale lease can be reclaimed by `schedule`; an active lease should not
-be stolen.
+work. `schedule` reclaims a stale lease. If that lease was the task's final
+attempt (`attempts >= maxAttempts`), `schedule` marks the task `failed` with a
+lease-expiry `lastError` instead, and a late `complete` or `fail` from that
+worker is rejected. An active lease should not be stolen.
 
 ## Run registry
 
