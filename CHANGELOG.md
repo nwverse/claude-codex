@@ -190,6 +190,12 @@ versioning or publishing metadata.
   `excludedThreadIds`, and the exclusion applies before the page limit. A
   malformed or oversized (more than 100) `excludedThreadIds` returns
   `invalidRequest`, for `thread/search` too.
+- A symlink under `.claude/rules` or `.claude/agents` that points back up the
+  tree (such as `a -> .`) no longer stalls the adapter. Starting, resuming or
+  forking a Claude thread in such a project used to block every other request
+  for seconds and then fail with `Maximum call stack size exceeded`. Each
+  folder is now read once, by its real path, and its rules and agents load as
+  usual.
 - `fs/watch` follows Codex: it keeps the path the client sent instead of its
   realpath, watches a file (such as `.git/HEAD`) through its directory so the
   watch survives git's lock-file rename and reports the file's own path, accepts
