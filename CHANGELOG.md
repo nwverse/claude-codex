@@ -589,6 +589,8 @@ versioning or publishing metadata.
   A thread that names no reviewer runs as before, except that a call Claude
   Code says only the user may answer now asks in every mode, Full access
   included, and "Allow for this session" covers only that call.
+- When Claude Code withdraws a pending approval or question mid-turn, its card
+  closes, the call is declined, and a late Cancel no longer interrupts the turn.
 
 ### Trustworthy history and settings
 
