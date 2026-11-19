@@ -34,27 +34,31 @@ def reap_status(pid, wait=True):
             return None
         time.sleep(0.01)
 
-def cleanup_child(pid):
+def signal_child_group(pid, sig):
     try:
-        os.killpg(pid, signal.SIGTERM)
-    except Exception:
+        os.killpg(pid, sig)
+    except OSError:
+        # A child that has not finished setsid() does not yet lead a group.
         if reap_status(pid, wait=False) is None:
             try:
-                os.kill(pid, signal.SIGTERM)
-            except Exception:
+                os.kill(pid, sig)
+            except OSError:
                 pass
+
+def cleanup_child(pid):
+    signal_child_group(pid, signal.SIGTERM)
     for _ in range(10):
         code = reap_status(pid, wait=False)
         if code is not None:
-            return code
+            # The leader can exit before another member of its group.
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                return code
+            except PermissionError:
+                pass
         time.sleep(0.02)
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except Exception:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except Exception:
-            pass
+    signal_child_group(pid, signal.SIGKILL)
     return reap_status(pid)
 
 def main():
@@ -84,6 +88,8 @@ def main():
     os.close(ready_r)
     os.close(ready_w)
 
+    closing = threading.Event()
+
     def pty_reader():
         try:
             while True:
@@ -100,7 +106,9 @@ def main():
             os.close(master)
         except Exception:
             pass
-        os._exit(code)
+        # During an explicit shutdown the main thread still owns group cleanup.
+        if not closing.is_set():
+            os._exit(code)
 
     t = threading.Thread(target=pty_reader, daemon=True)
     t.start()
@@ -129,6 +137,7 @@ def main():
         pass
 
     finally:
+        closing.set()
         code = cleanup_child(pid)
         # Drain remaining output, but never hang on a slave held outside the process group.
         t.join(timeout=1.0)
