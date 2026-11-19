@@ -9,6 +9,7 @@ import {
 } from './app-plugin-mcp.mjs'
 import type { InheritedMcpServer } from './codex-config.mjs'
 import { inheritedMcpServers, type McpToolRules, mcpToolRules } from './inherited-config.mjs'
+import { jsonSyntaxReason } from './json-syntax.mjs'
 import { ownVariable, remoteCredential } from './mcp-credentials.mjs'
 import type { RuntimeMcpServerStatus } from './types.mjs'
 
@@ -762,13 +763,31 @@ export function expandServerConfig(
   return out
 }
 
+// The value's failures reach the App and the debug log, so they quote none of
+// the JSON, which may hold a credential.
 function parseMcpValue(raw: string): unknown {
   const trimmed = raw.trim()
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    return JSON.parse(trimmed)
+    return parseMcpJson(trimmed, 'CLAUDE_CODEX_MCP_SERVERS')
   }
-  if (!existsSync(trimmed)) throw new Error(`MCP config file not found: ${trimmed}`)
-  return JSON.parse(readFileSync(trimmed, 'utf8'))
+  if (!existsSync(trimmed)) {
+    // JSON in quotes or otherwise mangled is no file path.
+    if (/[{}"]/.test(trimmed)) {
+      throw new Error(
+        'CLAUDE_CODEX_MCP_SERVERS is neither JSON (starting with { or [) nor a file path',
+      )
+    }
+    throw new Error(`MCP config file not found: ${trimmed}`)
+  }
+  return parseMcpJson(readFileSync(trimmed, 'utf8'), trimmed)
+}
+
+function parseMcpJson(text: string, source: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch (error) {
+    throw new Error(`invalid MCP config JSON in ${source}: ${jsonSyntaxReason(error)}`)
+  }
 }
 
 // The servers by name; a file may wrap them in "mcpServers" as Claude Code's
