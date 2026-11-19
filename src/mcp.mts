@@ -636,8 +636,8 @@ async function connectHttp(config: Record<string, unknown>): Promise<McpConnecti
     const id = nextId++
     const reply = await postJsonRpc(url, headers, { jsonrpc: '2.0', id, method, params }, signal)
     if (method === 'initialize' && reply.sessionId) headers['mcp-session-id'] = reply.sessionId
-    if (reply.message == null) throw new Error('HTTP MCP server sent no reply')
     const record = asRecord(reply.message)
+    if (!isReplyTo(record, id)) throw new Error(`HTTP MCP server sent no reply for request ${id}`)
     if (record.error) throw new Error(JSON.stringify(record.error))
     return record.result
   }
@@ -729,15 +729,20 @@ async function eventReply(
   lines: AsyncIterable<string> | Iterable<string>,
   id: number,
 ): Promise<unknown> {
-  let last: Record<string, unknown> | null = null
   for await (const data of eventData(lines)) {
     if (!data.trim()) continue
     const message = asRecord(JSON.parse(data))
-    if (typeof message.method === 'string' || !('result' in message || 'error' in message)) continue
-    if (String(message.id) === String(id)) return message
-    last = message
+    if (isReplyTo(message, id)) return message
   }
-  return last
+  return null
+}
+
+function isReplyTo(message: Record<string, unknown>, id: number): boolean {
+  return (
+    typeof message.method !== 'string' &&
+    (message.id === id || message.id === String(id)) &&
+    ('result' in message || 'error' in message)
+  )
 }
 
 // What a stdio server wrote to stderr, to go with an error.

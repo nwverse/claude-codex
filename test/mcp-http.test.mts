@@ -102,6 +102,46 @@ test('an HTTP MCP reply is read from an event stream the server ends', async () 
   })
 })
 
+for (const format of ['application/json', 'text/event-stream']) {
+  test(`an HTTP MCP ${format} reply must match the request ID`, async () => {
+    let match = false
+    const server = http.createServer(async (req, res) => {
+      let data = ''
+      for await (const chunk of req) data += chunk
+      const message = JSON.parse(data)
+      if (message.id === undefined) {
+        res.writeHead(202).end()
+        return
+      }
+      const initialize = message.method === 'initialize'
+      const id = initialize || match ? message.id : message.id + 1
+      const result = initialize ? { capabilities: {} } : { contents: [{ text: 'value' }] }
+      const reply = JSON.stringify({ jsonrpc: '2.0', id, result })
+      res.setHeader('content-type', format)
+      res.end(format === 'application/json' ? reply : `data: ${reply}\n\n`)
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    assert.ok(address && typeof address === 'object')
+    const saved = process.env.CLAUDE_CODEX_MCP_SERVERS
+    process.env.CLAUDE_CODEX_MCP_SERVERS = JSON.stringify({
+      echo: { type: 'http', url: `http://127.0.0.1:${address.port}/mcp` },
+    })
+    try {
+      await assert.rejects(readMcpResource('echo', 'memo://note'), /no reply for request 2/)
+      match = true
+      assert.deepEqual(await readMcpResource('echo', 'memo://note'), {
+        contents: [{ text: 'value' }],
+      })
+    } finally {
+      restoreEnv('CLAUDE_CODEX_MCP_SERVERS', saved)
+      server.closeAllConnections()
+      server.close()
+    }
+  })
+}
+
 function restoreEnv(name: string, value: string | undefined): void {
   if (value === undefined) delete process.env[name]
   else process.env[name] = value
