@@ -7,7 +7,7 @@ import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
-import { startWebSocketTransport } from '../src/transports.mjs'
+import { parseProxySockArg, startWebSocketTransport } from '../src/transports.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
 
@@ -113,6 +113,37 @@ test('a unix listener refuses a path that holds a regular file or a directory', 
     assert.equal(await readFile(join(folder, 'inside.txt'), 'utf8'), 'keep\n')
   } finally {
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a socket at the exact platform byte limit accepts a connection on its full path', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const root = await mkdtemp('/tmp/ccx-limit-')
+  const limit = process.platform === 'darwin' ? 104 : 108
+  const remaining = limit - Buffer.byteLength(root + '/')
+  const path = join(root, '界'.repeat(Math.floor(remaining / 3)) + 'x'.repeat(remaining % 3))
+  try {
+    assert.equal(Buffer.byteLength(path), limit)
+    const transport = await startWebSocketTransport(
+      `unix://${path}`,
+      () => {},
+      () => {},
+    )
+    try {
+      assert.ok(existsSync(path))
+      const socket = net.createConnection(parseProxySockArg(['--sock', path]))
+      try {
+        await once(socket, 'connect')
+      } finally {
+        socket.destroy()
+      }
+      assert.throws(() => parseProxySockArg(['--sock', path + 'x']), /Unix socket path exceeds/)
+    } finally {
+      await transport.close()
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
   }
 })
 
