@@ -8781,8 +8781,7 @@ export class CodexClaudeAppServer {
         runtimeBackend = codexModel ? 'codex' : 'claude'
       } else if (
         runtimeBackend === 'codex' &&
-        this.codexBridge &&
-        (thread.nativeCodexProvider || !thread.codexSessionId) &&
+        (thread.nativeCodexProvider || (this.codexBridge && !thread.codexSessionId)) &&
         (isAgModel(model) !== isAgModel(thread.model) ||
           (thread.nativeCodexProvider && !isCodexOpenAiModel(model))) &&
         this.threadHasConversation(thread)

@@ -305,6 +305,11 @@ test('a native chat resumes on its original provider and adapter id after a rest
         (row: any) => row.id === threadId,
       ),
     )
+    const move = await disabled.request('thread/metadata/update', {
+      threadId,
+      model: 'gpt-6.1-sol',
+    })
+    assert.equal(move.error?.code, -32600)
     assert.deepEqual(disabled.childLog(), [])
   } finally {
     await disabled.stop()
