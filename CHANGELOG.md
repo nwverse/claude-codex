@@ -132,6 +132,12 @@ versioning or publishing metadata.
   not found, a name, roots or metadata it refuses), whose text the App
   matches; a bad project cursor or an empty `idempotencyKey` is an invalid
   request.
+- `thread/turns/list`, `thread/turns/items/list`, `thread/items/list`,
+  `thread/timeline/list`, `thread/name/set`, `thread/archive`,
+  `thread/goal/get` and `turn/interrupt` refuse an unknown thread with
+  `unknown thread: <id>` (`-32600`) too. They used to answer an empty page,
+  `{goal: null}` or `{}`; a rename or archive still sent its notification,
+  and an interrupt left the caller subscribed to a thread that did not exist.
 - Model process profiles that fail to load fail with one line of at most 300
   characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
   what is wrong. The message used to carry the JSON parser's excerpt of the
@@ -295,6 +301,12 @@ versioning or publishing metadata.
   are read in UTC and the C locale, so two adapters with a different `TZ`
   (an App launch and a shell) no longer drop a live sibling's record or miss
   a killed adapter's Claude CLI.
+- On a busy machine, a `claude-p` turn that times out or is interrupted stops
+  the processes it started in their own process group too. Listing the
+  process tree (`ps`) gave up after 1 s, which a loaded Mac with a thousand
+  or more processes often needs, and the stop then reached only the
+  `claude-p` process; the list now runs without blocking the adapter and
+  gets 10 s.
 - A second adapter started on the same state dir (a startup probe, another
   window) no longer fails the turns a running adapter is still working on.
   Each turn records the process that wrote it, by pid and start time, and
@@ -688,6 +700,17 @@ versioning or publishing metadata.
   included, and "Allow for this session" covers only that call.
 - When Claude Code withdraws a pending approval or question mid-turn, its card
   closes, the call is declined, and a late Cancel no longer interrupts the turn.
+- A thread whose approval policy is `never` keeps a read-only sandbox
+  read-only: Read, Grep, Glob, LS and WebSearch run, and any other call is
+  refused without a card, with Claude told the sandbox is read-only. Before,
+  `never` approved every tool whatever the sandbox, so Bash and file edits ran
+  in a read-only thread. The `claude-p` backend no longer adds
+  `--dangerously-skip-permissions` there, so only the read tools it
+  pre-approves run. The summary `/compact` writes in place of compacting
+  Claude's session (on a Codex model, or when that compaction fails) now
+  declines any tool beyond its reads instead of approving it. `never` with
+  any other sandbox still runs every tool unasked: the adapter has no OS
+  sandbox to confine workspace-write.
 
 ### Trustworthy history and settings
 
@@ -1008,6 +1031,12 @@ versioning or publishing metadata.
   parent's turn with "FOREIGN KEY constraint failed" when the agent ends, or
   stops the adapter's shutdown halfway; the agent's end leaves nothing in
   the deleted thread.
+- A client that resumes a thread now follows all of its subagents and their
+  subagents. It used to follow only the first 50 children of each thread,
+  so a workflow with more agents left the rest without live updates there.
+  Finding a thread's subagents and the newest-first thread list use indexes
+  instead of reading every thread: with 20,000 threads a list page takes
+  about 1 ms instead of 25 ms.
 
 ### Rust-first protocol groundwork
 
@@ -1060,6 +1089,18 @@ versioning or publishing metadata.
   behaviors the adapter relies on are App rules in `src/app-compat.mts`, tagged
   in the code and kept in sync by `test/app-compat.test.mts`; an App build not
   yet checked gets a config warning. See `docs/reference/app-compat.md`.
+- `npm run doctor` checks the runtime the shim will run: it reads the
+  `runtime.env` that `claude-codex-mode set` writes, accepts `codex-proxy`
+  (and checks for the real `codex` CLI), and reports an unknown runtime type
+  as a failed check instead of crashing. It finds the adapter, shim and
+  `node_modules` from its own checkout whatever the working directory, checks
+  that the built adapter answers a startup probe, and names spawn errors such
+  as `ENOENT` instead of `exited null`. It reads quoted values, trailing
+  comments and a leading `~` in `runtime.env` as the shell does, fails the
+  runtime type check when a line it cannot evaluate sets the runtime, lists
+  the other lines it skipped, and says whether the type came from the file,
+  the environment or the default. It looks for the real `codex` as the shim
+  does for the native route and as the adapter does for `codex-proxy`.
 
 ### Still experimental or not yet included
 
