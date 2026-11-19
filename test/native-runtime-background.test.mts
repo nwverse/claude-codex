@@ -1297,6 +1297,46 @@ test('native model switch mid-turn sends the permission mode again for the new m
   }
 })
 
+test('a monitor expiring between turns wakes Claude without synthesizing a user interrupt', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+  const turn = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  try {
+    query.push(...launchBackgroundAgent('other-work'))
+    await turn
+    query.push(
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: 'monitor',
+        status: 'stopped',
+        summary: 'Monitor expired',
+      },
+      init,
+    )
+    await waitFor(() => listener.autonomous.length || query.interrupts, 'monitor expiry')
+    assert.equal(query.interrupts, 0, 'the client never requested a stop')
+    assert.deepEqual(listener.autonomous, ['thread'])
+    const events: RuntimeEvent[] = []
+    const reply = runtime.runTurn(
+      { ...context, turnId: 'monitor-reply', prompt: '', continuation: true },
+      handlers(events),
+    )
+    query.push(assistant('report', [text('Monitor expired.')]), {
+      type: 'result',
+      subtype: 'success',
+      result: 'Monitor expired.',
+      origin: { kind: 'task-notification' },
+    })
+    await reply
+    assert.deepEqual(textDeltas(events), ['Monitor expired.'])
+  } finally {
+    await runtime.stop()
+  }
+})
+
 test('native drops the turn Claude starts only to acknowledge a task the user stopped', async () => {
   await withSettleMs(30, async () => {
     const { runtime, queries } = fakeRuntime()

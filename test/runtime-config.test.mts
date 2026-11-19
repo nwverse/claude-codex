@@ -22,6 +22,7 @@ import { dirname, join } from 'node:path'
 import test from 'node:test'
 import * as z from 'zod'
 import { ClaudePTranscriptRuntime } from '../src/claude-p-runtime.mjs'
+import { ForegroundShells } from '../src/foreground-shells.mjs'
 import {
   HttpAgentRuntime,
   hasAgentapiTrustPrompt,
@@ -1139,6 +1140,7 @@ test('native SDK parent result does not cap workflow runtime at three seconds', 
   let resolved = false
   const pending = {
     context: nativeTurnContext({ turnId: 'parent-result-workflow-turn' }),
+    foregroundShells: new ForegroundShells(),
     input: new TurnInput(),
     activeSubagents: new Set<string>(),
     failedSubagentCalls: new Set<string>(),
