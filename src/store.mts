@@ -415,9 +415,15 @@ export class SessionStore {
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
-    const rows = this.db.prepare(`PRAGMA table_info(${table})`).all()
-    if (rows.some((row: any) => String(row.name) === column)) return
-    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+    const probe = this.db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?')
+    if (probe.get(table, column)) return
+    // Another adapter can add the column after the first probe. Recheck
+    // under the writer lock; an already migrated store takes no write lock.
+    this.transaction(() => {
+      if (!probe.get(table, column)) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+      }
+    })
   }
 
   upsertThread(thread: ThreadRecord): void {
