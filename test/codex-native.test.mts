@@ -554,3 +554,17 @@ test('a native user shell can begin the conversation with the configured adapter
     await app.stop()
   }
 })
+
+test('adapter shutdown waits for a native child that ignores SIGTERM', async () => {
+  const app = startAdapter({ env: { FAKE_IGNORE_TERM: '1' } })
+  let pid: number
+  try {
+    const threadId = await startChat(app)
+    await runTurn(app, threadId, 'decline')
+    pid = app.childLog().find((entry) => entry.event === 'spawn').pid
+    assert.ok(Number.isInteger(pid))
+  } finally {
+    await app.stop()
+  }
+  assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
+})

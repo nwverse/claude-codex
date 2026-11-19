@@ -112,6 +112,7 @@ export class CodexNativeBridge {
   // Completed turns reported before turn/start answers, while the App waits for its id.
   private readonly startingTurns = new Map<string, Set<string>>()
   private requestsInFlight = 0
+  private stopped = false
   private readonly activeTurns = new Map<string, ActiveTurn>()
   private readonly pendingRequests = new Map<string, { threadId: string; turnId: string | null }>()
   private readonly changesInFlight = new Set<string>()
@@ -125,12 +126,14 @@ export class CodexNativeBridge {
     return this.requestsInFlight > 0 || this.activeTurns.size > 0 || this.pendingRequests.size > 0
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
+    this.stopped = true
     this.clearIdleTimer()
-    for (const child of this.children.values()) child.stop()
+    const children = [...this.children.values()].map((child) => child.close())
     this.children.clear()
     for (const id of this.pendingRequests.keys()) this.finishRequest(id)
     this.activeTurns.clear()
+    await Promise.all(children)
   }
 
   // The thread's record when the native harness runs it.
@@ -249,12 +252,13 @@ export class CodexNativeBridge {
   // starts them again and reloads its thread.
   private scheduleIdleStop(): void {
     this.clearIdleTimer()
+    if (this.stopped) return
     const ms = Number(process.env.CLAUDE_CODEX_NATIVE_IDLE_MS ?? 600_000)
     if (!(ms > 0)) return
     this.idleTimer = setTimeout(() => {
       this.idleTimer = null
       if (this.busy()) return this.scheduleIdleStop()
-      for (const child of this.children.values()) child.stop()
+      for (const child of this.children.values()) void child.stop()
       debugLog('codexBridge.idleStop', {})
     }, ms)
     this.idleTimer.unref()
@@ -445,6 +449,7 @@ export class CodexNativeBridge {
   }
 
   private child(provider: string): CodexAppServerChild {
+    if (this.stopped) throw new RpcError('the native Codex bridge is shutting down')
     let child = this.children.get(provider)
     if (!child) {
       child = new CodexAppServerChild(

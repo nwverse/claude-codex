@@ -1,6 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { delimiter, dirname } from 'node:path'
 import { RpcError, SERVER_ERROR } from './host-methods.mjs'
+import { signalProcessGroup } from './process-group.mjs'
 import { debugLog, resolveCodexBinary } from './util.mjs'
 
 // One real `codex app-server --listen stdio://` for one Codex model provider.
@@ -39,6 +40,8 @@ export class CodexAppServerChild {
   private readonly options: CodexChildOptions
   private proc: ChildProcessWithoutNullStreams | null = null
   private starting: Promise<void> | null = null
+  private stopping: Promise<void> | null = null
+  private closed = false
   private pending = new Map<number, PendingChildRequest>()
   private nextId = 1
   private buffer = ''
@@ -72,20 +75,36 @@ export class CodexAppServerChild {
     proc.stdin.write(`${JSON.stringify(message)}\n`)
   }
 
-  stop(): void {
-    const proc = this.proc
-    if (!proc) return
-    this.proc = null
-    this.failPending(`codex app-server (${this.provider}) stopped`)
-    proc.stdin.end()
-    proc.kill('SIGTERM')
-    const timer = setTimeout(() => proc.kill('SIGKILL'), 5_000)
-    timer.unref()
-    proc.once('exit', () => clearTimeout(timer))
+  close(): Promise<void> {
+    this.closed = true
+    return this.stop()
   }
 
-  private ensureStarted(): Promise<void> {
-    if (this.proc && !this.starting) return Promise.resolve()
+  stop(): Promise<void> {
+    const proc = this.proc
+    if (!proc) return this.stopping ?? Promise.resolve()
+    this.proc = null
+    this.failPending(`codex app-server (${this.provider}) stopped`)
+    this.stopping = new Promise<void>((resolve) => {
+      const force = setTimeout(() => signalProcessGroup(proc, 'SIGKILL'), 1000)
+      proc.once('close', () => {
+        clearTimeout(force)
+        // An MCP helper may have closed its stdio and outlived the leader.
+        if (process.platform !== 'win32') signalProcessGroup(proc, 'SIGKILL')
+        resolve()
+      })
+      proc.stdin.end()
+      signalProcessGroup(proc, 'SIGTERM')
+    }).finally(() => {
+      this.stopping = null
+    })
+    return this.stopping
+  }
+
+  private async ensureStarted(): Promise<void> {
+    if (this.stopping) await this.stopping
+    if (this.closed) throw new RpcError(`codex app-server (${this.provider}) is shutting down`)
+    if (this.proc && !this.starting) return
     if (!this.starting) {
       this.starting = this.start().finally(() => {
         this.starting = null
@@ -105,7 +124,11 @@ export class CodexAppServerChild {
       '--listen',
       'stdio://',
     ]
-    const proc = spawn(binary, args, { env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] })
+    const proc = spawn(binary, args, {
+      env: childEnv(),
+      detached: process.platform !== 'win32',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
     this.generation += 1
     const generation = this.generation
     this.proc = proc
@@ -127,7 +150,7 @@ export class CodexAppServerChild {
         capabilities: { experimentalApi: true },
       })
     } catch (error) {
-      if (this.proc === proc) this.stop()
+      if (this.proc === proc) await this.stop()
       throw error
     }
     proc.stdin.write(`${JSON.stringify({ method: 'initialized' })}\n`)

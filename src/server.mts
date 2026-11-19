@@ -931,7 +931,7 @@ export class CodexClaudeAppServer {
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
-    this.codexBridge?.stop()
+    const nativeStopped = this.codexBridge?.stop()
     // command/exec runs in its own process group, out of reach of a signal to
     // the adapter's group (launchd job stop, Ctrl-C), and a terminal has no
     // timeout: end what is still running.
@@ -961,7 +961,11 @@ export class CodexClaudeAppServer {
       try {
         await this.runtime.stop()
       } finally {
-        this.store.close()
+        try {
+          await nativeStopped
+        } finally {
+          this.store.close()
+        }
       }
     }
   }
