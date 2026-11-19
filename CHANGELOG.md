@@ -1107,9 +1107,9 @@ versioning or publishing metadata.
   exist fails CI.
 - `npm test` passes in a developer's or Claude Code's shell as it does on CI:
   `CLAUDE_CODE_WORKFLOWS=1`, `umask 077` and a global
-  `commit.gpgsign = true` no longer fail tests, the mock adapters the
-  end-to-end tests start no longer get the shell's `ANTHROPIC_*`,
-  `CLAUDE_CONFIG_DIR` or adapter home, and no suite writes to the real
+  `commit.gpgsign = true` no longer fail tests, the ~105 mock adapters
+  `test/adapter.test.mts` starts no longer get the shell's `ANTHROPIC_*`,
+  `CLAUDE*` or `CODEX_*` variables, and no suite writes to the real
   `~/.codex` debug log. Daemon and fixture tests allow for a busy machine,
   `npm run build` clears `dist/test` so a deleted suite stops running, and a
   hung test fails after 2 minutes instead of holding `npm test` (CI jobs stop
