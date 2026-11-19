@@ -299,6 +299,9 @@ export class SessionStore {
     this.ensureColumn('threads', 'codex_session_id', 'TEXT')
     this.ensureColumn('threads', 'claude_session_cwd', 'TEXT')
     this.ensureColumn('threads', 'native_codex_provider', 'TEXT')
+    // Native turn rows live in Codex's rollout rather than the turns table.
+    this.ensureColumn('threads', 'native_active_owner_pid', 'INTEGER')
+    this.ensureColumn('threads', 'native_active_owner_started', 'TEXT')
     // Claude transcript checkpoints for thread/rollback, thread/revert and
     // thread/fork: see setTurnCheckpoint and rewindClaudeSession.
     this.ensureColumn('threads', 'claude_resume_at', 'TEXT')
@@ -1292,6 +1295,38 @@ export class SessionStore {
       .run(preview, threadId)
   }
 
+  startNativeTurnActivity(threadId: string): void {
+    const owner = currentProcessOwner()
+    // An earlier status event may already carry waitingOnApproval or other flags.
+    this.db
+      .prepare(`
+      UPDATE threads SET native_active_owner_pid = ?, native_active_owner_started = ?,
+        status_json = CASE WHEN json_extract(status_json, '$.type') = 'active'
+                           THEN status_json ELSE ? END, updated_at = ?
+      WHERE id = ?`)
+      .run(
+        owner.pid,
+        owner.started,
+        JSON.stringify({ type: 'active', activeFlags: [] }),
+        nowSeconds(),
+        threadId,
+      )
+  }
+
+  updateNativeThreadStatus(threadId: string, status: ThreadStatus): void {
+    const owner = currentProcessOwner()
+    const release =
+      status.type === 'active'
+        ? ''
+        : ', native_active_owner_pid = NULL, native_active_owner_started = NULL'
+    this.db
+      .prepare(`
+      UPDATE threads SET status_json = ?, updated_at = ?${release}
+      WHERE id = ? AND (native_active_owner_pid IS NULL OR
+        (native_active_owner_pid = ? AND native_active_owner_started IS ?))`)
+      .run(JSON.stringify(status), nowSeconds(), threadId, owner.pid, owner.started)
+  }
+
   updateThreadStatus(threadId: string, status: ThreadStatus): boolean {
     // Another adapter may have claimed the next turn since the previous one
     // finished. Its new active state takes precedence over the late idle update.
@@ -2080,27 +2115,42 @@ export class SessionStore {
     for (const threadId of seenThreads) {
       reconcileThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId, 'inProgress')
     }
-    const terminalRows = this.db
-      .prepare(
-        'SELECT id, thread_id, status, items_json, owner_pid, owner_started FROM turns WHERE status <> ?',
-      )
-      .all('inProgress') as Array<{
-      id: string
-      thread_id: string
-      status: TurnStatus
-      items_json: string
-      owner_pid: number | null
-      owner_started: string | null
-    }>
-    const updateItems = this.db.prepare('UPDATE turns SET items_json = ? WHERE id = ?')
+    // Stream finished turns. Keeping their entire transcripts in an array
+    // makes startup memory scale with the total size of every chat. Finish
+    // the read cursor before issuing writes to the table it is traversing.
+    const terminalRows = this.db.prepare(
+      "SELECT id, items_json FROM turns WHERE status <> 'inProgress' ORDER BY rowid",
+    )
+    const repairs: string[] = []
+    for (const row of terminalRows.iterate() as Iterable<{ id: string; items_json: string }>) {
+      if (this.terminalizeStaleItems(row.items_json, message, isDead) !== row.items_json)
+        repairs.push(row.id)
+    }
+
+    const readItems = this.db.prepare(`SELECT thread_id, items_json, owner_pid, owner_started
+      FROM turns WHERE id = ? AND status <> 'inProgress'`)
+    const updateItems = this.db.prepare(`UPDATE turns SET items_json = ?
+      WHERE id = ? AND status <> 'inProgress' AND items_json = ?
+        AND owner_pid IS ? AND owner_started IS ?`)
     const repairThreadIds = new Set<string>()
-    for (const row of terminalRows) {
-      // A background agent outlives the parent turn that spawned it, so its
-      // markers can sit in a turn that ended long before the restart.
+    for (const id of repairs) {
+      // A live adapter may have finished an agent, appended a report or
+      // deleted the turn since the scan. Heal only the snapshot just read.
+      const row = readItems.get(id) as
+        | Pick<StaleTurnRow, 'thread_id' | 'items_json' | 'owner_pid' | 'owner_started'>
+        | undefined
+      if (!row || ownerRunning(row)) continue
       const itemsJson = this.terminalizeStaleItems(row.items_json, message, isDead)
-      if (itemsJson === row.items_json || ownerRunning(row)) continue
-      updateItems.run(itemsJson, row.id)
-      repairThreadIds.add(String(row.thread_id))
+      if (itemsJson === row.items_json) continue
+      const updated = updateItems.run(
+        itemsJson,
+        id,
+        row.items_json,
+        row.owner_pid,
+        row.owner_started,
+      )
+      if (Number(updated.changes) === 0) continue
+      repairThreadIds.add(row.thread_id)
       recoveredCount += 1
     }
     for (const threadId of repairThreadIds) {
@@ -2114,6 +2164,7 @@ export class SessionStore {
     const reconcileTerminalActiveThreads = this.db.prepare(
       `UPDATE threads SET status_json = ?, updated_at = ?
        WHERE json_extract(status_json, '$.type') = 'active'
+         AND native_active_owner_pid IS NULL
          AND NOT EXISTS (SELECT 1 FROM turns WHERE thread_id = threads.id AND status = ?)`,
     )
     const reconciled = reconcileTerminalActiveThreads.run(
@@ -2122,6 +2173,33 @@ export class SessionStore {
       'inProgress',
     ) as { changes?: number }
     recoveredCount += Number(reconciled.changes ?? 0)
+    // The native child owns the rollout; an empty SQLite turn list says
+    // nothing about its liveness. Only clear a marker left by a dead adapter.
+    const native = this.db
+      .prepare(`SELECT id, native_active_owner_pid AS owner_pid,
+      native_active_owner_started AS owner_started FROM threads
+      WHERE native_active_owner_pid IS NOT NULL`)
+      .all() as Array<{
+      id: string
+      owner_pid: number
+      owner_started: string | null
+    }>
+    const clearNative = this.db.prepare(`UPDATE threads SET status_json = ?,
+      updated_at = ?, native_active_owner_pid = NULL, native_active_owner_started = NULL
+      WHERE id = ? AND native_active_owner_pid = ? AND native_active_owner_started IS ?`)
+    const self = currentProcessOwner()
+    for (const row of native) {
+      if ((row.owner_pid === self.pid && row.owner_started === self.started) || ownerRunning(row))
+        continue
+      const cleared = clearNative.run(
+        JSON.stringify({ type: 'idle' }),
+        completedAt,
+        row.id,
+        row.owner_pid,
+        row.owner_started,
+      )
+      recoveredCount += Number(cleared.changes)
+    }
     return recoveredCount
   }
 
@@ -2170,6 +2248,7 @@ export class SessionStore {
     }
     if (!Array.isArray(parsed)) return '[]'
 
+    let changed = false
     const items = parsed.map((raw) => {
       if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return raw
       const item = raw as Record<string, unknown>
@@ -2178,8 +2257,10 @@ export class SessionStore {
         (item.kind === 'started' || item.kind === 'interacted') &&
         isDead(String(item.agentThreadId))
       ) {
+        changed = true
         return { ...item, kind: 'interrupted' }
       }
+      if (item.status === 'inProgress') changed = true
       if (item.type === 'collabAgentToolCall') {
         const agentsStates = item.agentsStates
         const nextStates =
@@ -2195,6 +2276,7 @@ export class SessionStore {
                       !isDead(threadId)
                     )
                       return [threadId, state]
+                    changed = true
                     return [
                       threadId,
                       { ...state, status: 'errored', message: state.message ?? message },
@@ -2212,7 +2294,7 @@ export class SessionStore {
       if (item.status === 'inProgress') return { ...item, status: 'failed' }
       return item
     })
-    return JSON.stringify(items)
+    return changed ? JSON.stringify(items) : itemsJson
   }
 
   updateTurnDiff(turnId: string, diff: string): TurnRecord | null {

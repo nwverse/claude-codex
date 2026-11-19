@@ -132,8 +132,10 @@ export class CodexNativeBridge {
     const children = [...this.children.values()].map((child) => child.close())
     this.children.clear()
     for (const id of this.pendingRequests.keys()) this.finishRequest(id)
-    this.activeTurns.clear()
     await Promise.all(children)
+    for (const id of this.activeTurns.keys())
+      this.host.store.updateNativeThreadStatus(id, { type: 'idle' })
+    this.activeTurns.clear()
   }
 
   // The thread's record when the native harness runs it.
@@ -316,7 +318,7 @@ export class CodexNativeBridge {
       const turnId = stringField(asRecord(asRecord(result).turn).id)
       const status = asRecord(asRecord(result).turn).status
       if (turnId && status === 'inProgress' && !this.startingTurns.get(thread.id)?.has(turnId))
-        this.activeTurns.set(thread.id, { turnId, provider })
+        this.recordActiveTurn(thread.id, turnId, provider)
     }
     return this.outboundResult(result, provider)
   }
@@ -539,6 +541,12 @@ export class CodexNativeBridge {
     } else this.host.notifyAll(notification)
   }
 
+  private recordActiveTurn(threadId: string, turnId: string, provider: string): void {
+    if (this.activeTurns.get(threadId)?.turnId === turnId) return
+    this.activeTurns.set(threadId, { turnId, provider })
+    this.host.store.startNativeTurnActivity(threadId)
+  }
+
   // The sidebar record follows the conversation.
   private track(threadId: string, method: string, params: Record<string, unknown>): void {
     const thread = this.host.store.getThread(threadId)
@@ -546,30 +554,25 @@ export class CodexNativeBridge {
     switch (method) {
       case 'turn/started': {
         const turnId = stringField(asRecord(params.turn).id)
-        if (turnId)
-          this.activeTurns.set(threadId, {
-            turnId,
-            provider: thread.nativeCodexProvider as string,
-          })
-        thread.updatedAt = Math.floor(Date.now() / 1000)
-        this.host.store.upsertThread(thread)
+        if (turnId) this.recordActiveTurn(threadId, turnId, thread.nativeCodexProvider as string)
         return
       }
       case 'turn/completed': {
         const turnId = stringField(asRecord(params.turn).id)
         if (turnId) this.startingTurns.get(threadId)?.add(turnId)
-        if (this.activeTurns.get(threadId)?.turnId === turnId) this.activeTurns.delete(threadId)
+        const active = this.activeTurns.get(threadId)
+        if (!active || active.turnId === turnId) {
+          this.activeTurns.delete(threadId)
+          this.host.store.updateNativeThreadStatus(threadId, { type: 'idle' })
+        }
         if (turnId) this.finishThreadRequests(threadId, turnId)
-        thread.updatedAt = Math.floor(Date.now() / 1000)
-        thread.status = { type: 'idle' }
-        this.host.store.upsertThread(thread)
         this.host.checkIdle()
         return
       }
       case 'thread/status/changed': {
         const status = asRecord(params.status)
         if (typeof status.type === 'string')
-          this.host.store.updateThreadStatus(threadId, status as ThreadRecord['status'])
+          this.host.store.updateNativeThreadStatus(threadId, status as ThreadRecord['status'])
         return
       }
       case 'thread/name/updated': {
@@ -667,7 +670,7 @@ export class CodexNativeBridge {
         method: 'thread/status/changed',
         params: { threadId, status: { type: 'idle' } },
       })
-      this.host.store.updateThreadStatus(threadId, { type: 'idle' })
+      this.host.store.updateNativeThreadStatus(threadId, { type: 'idle' })
     }
     for (const id of this.pendingRequests.keys()) {
       if (id.startsWith(`cx:${provider}:${generation}:`)) this.finishRequest(id)

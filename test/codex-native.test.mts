@@ -258,6 +258,54 @@ async function startChat(app: ReturnType<typeof startAdapter>, model = 'codex-ag
   return answer.result.thread.id as string
 }
 
+test('opening a second adapter keeps live native sidebar activity and recovers a crashed owner', async () => {
+  const first = startAdapter()
+  const observers: Array<ReturnType<typeof startAdapter>> = []
+  const openObserver = async () => {
+    const observer = startAdapter({ home: first.home })
+    observers.push(observer)
+    await initialize(observer)
+    return observer
+  }
+  try {
+    const threadId = await startChat(first)
+    const status = async (app: typeof first) => {
+      const list = await app.request('thread/list', {})
+      return list.result.data.find((thread: any) => thread.id === threadId)?.status
+    }
+    const startHeld = async () => {
+      const started = await first.request('turn/start', {
+        threadId,
+        input: [{ type: 'text', text: 'held' }],
+      })
+      assert.equal(started.error, undefined)
+      return await first.reader.until((message) => message.method?.endsWith('requestApproval'))
+    }
+    const approval = await startHeld()
+    const active = { type: 'active', activeFlags: ['waitingOnApproval'] }
+    assert.deepEqual(await status(first), active)
+    const second = await openObserver()
+    assert.deepEqual(await status(second), active)
+    assert.deepEqual(await status(first), active)
+    first.proc.stdin.write(
+      `${JSON.stringify({ id: approval.id, result: { decision: 'decline' } })}\n`,
+    )
+    await first.reader.until((message) => message.method === 'turn/completed')
+    assert.deepEqual(await status(second), { type: 'idle' })
+    await startHeld()
+    assert.deepEqual(await status(second), active)
+    const exited = once(first.proc, 'exit')
+    first.proc.kill('SIGKILL')
+    await exited
+    const third = await openObserver()
+    assert.deepEqual(await status(third), { type: 'idle' })
+    assert.deepEqual(await status(second), { type: 'idle' })
+  } finally {
+    await first.stop()
+    await Promise.all(observers.map((app) => app.stop()))
+  }
+})
+
 test('a native chat resumes on its original provider and adapter id after a restart', async () => {
   const first = startAdapter({ env: { CLAUDE_CODEX_CODEX_AG_PROVIDER: 'fixture_a' } })
   const threadId = await startChat(first)

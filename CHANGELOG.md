@@ -14,6 +14,9 @@ versioning or publishing metadata.
   AsterGate models. Native chats retain their provider, approvals and history
   across adapter restarts. Existing `codex exec` chats keep their route. See
   [Harnesses](docs/guide/backends.md#harnesses) for configuration and helper chats.
+- A native Codex chat keeps its active sidebar state when another adapter opens
+  the same state directory. A later startup clears the activity marker if the
+  adapter that ran the native turn has exited.
 
 ### `ws://` listener authentication
 
@@ -274,6 +277,9 @@ versioning or publishing metadata.
   (`-32600`) while a turn runs or is still starting on the thread. They used
   to start a second Claude run that took over the thread, and the running
   turn's remaining output was lost. (#240, #241)
+- Startup recovery streams the completed history and rechecks a turn before
+  repairing its activity markers. A report another adapter finished while
+  recovery was scanning stays in the conversation.
 - Adapters sharing one state directory claim an adapter-managed turn in SQLite.
   A window attached to another adapter can read the chat while a turn runs and
   retry a message after it completes. A surviving adapter can start the next

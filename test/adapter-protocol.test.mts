@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -1828,6 +1828,65 @@ test('TTY process/spawn closeStdin stops a same-group descendant that outlives t
     assert.ok(Date.now() - started < 5_000)
   } finally {
     proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('closing an App terminal stops a slow-stopping same-group child after its leader exits', {
+  timeout: 20_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ccx-pty-group-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const childFile = join(home, 'child.pid')
+  let childPid = 0
+  const running = () => {
+    if (!childPid) return false
+    const state = spawnSync('ps', ['-o', 'stat=', '-p', String(childPid)], {
+      encoding: 'utf8',
+    }).stdout.trim()
+    return state !== '' && !state.startsWith('Z')
+  }
+  try {
+    const script = [
+      'import os, signal, sys, time',
+      'if os.fork() == 0:',
+      '    signal.signal(signal.SIGTERM, signal.SIG_IGN)',
+      '    signal.signal(signal.SIGHUP, signal.SIG_IGN)',
+      '    fd = os.open(os.devnull, os.O_RDWR)',
+      '    for stream in (0, 1, 2): os.dup2(fd, stream)',
+      "    with open(sys.argv[1], 'w') as f: f.write(str(os.getpid()))",
+      'time.sleep(15)',
+    ].join('\n')
+    const processHandle = 'slow-pty-child'
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'process/spawn',
+        params: { processHandle, tty: true, command: ['python3', '-c', script, childFile] },
+      }),
+    )
+    await reader.nextResponse(1)
+    const ready = Date.now() + 5000
+    while (!childPid && Date.now() < ready) {
+      childPid = Number(await readFile(childFile, 'utf8').catch(() => ''))
+      if (!childPid) await delay(20)
+    }
+    assert.ok(childPid > 1)
+    proc.stdin.write(
+      json({ id: 2, method: 'process/writeStdin', params: { processHandle, closeStdin: true } }),
+    )
+    const messages = await readUntil(
+      reader,
+      (m) => m.method === 'process/exited' && m.params.processHandle === processHandle,
+    )
+    assert.equal(messages.at(-1)?.params.exitCode, 143)
+    const stopped = Date.now() + 2000
+    while (running() && Date.now() < stopped) await delay(30)
+    assert.equal(running(), false, 'terminal descendant still running after closeStdin')
+  } finally {
+    if (running()) process.kill(childPid, 'SIGKILL')
+    await stopProcess(proc)
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
