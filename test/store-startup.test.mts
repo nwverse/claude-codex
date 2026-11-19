@@ -215,3 +215,35 @@ test('a clean store opens while another connection holds the write lock', async 
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
+
+test('startup recovery preserves completed history that changes between scan and repair', async () => {
+  const { home, path } = await cleanStore()
+  const store = new SessionStore(path)
+  const raw = new DatabaseSync(path)
+  try {
+    raw.exec(`
+      INSERT INTO turns (id, thread_id, status, items_json) VALUES
+        ('a', 'clean', 'completed', '[{"id":"a","type":"mcpToolCall","status":"inProgress"}]'),
+        ('b', 'clean', 'completed', '[{"id":"b","type":"mcpToolCall","status":"inProgress"}]'),
+        ('c', 'clean', 'completed', '[  {"type":"agentMessage","text":"unchanged"}  ]');
+      CREATE TRIGGER finish_second_during_repair AFTER UPDATE OF items_json ON turns
+      WHEN NEW.id = 'a' BEGIN
+        UPDATE turns SET items_json = '[{"type":"agentMessage","text":"finished elsewhere"}]' WHERE id = 'b';
+      END;
+    `)
+    const recovered = store.recoverStaleInProgressTurns()
+    assert.deepEqual(store.getTurn('b')?.items, [
+      { type: 'agentMessage', text: 'finished elsewhere' },
+    ])
+    assert.equal(
+      raw.prepare("SELECT items_json FROM turns WHERE id = 'c'").all()[0]?.items_json,
+      '[  {"type":"agentMessage","text":"unchanged"}  ]',
+    )
+    assert.equal(recovered, 1)
+    assert.equal(store.recoverStaleInProgressTurns(), 0)
+  } finally {
+    raw.close()
+    store.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})

@@ -277,6 +277,9 @@ versioning or publishing metadata.
   (`-32600`) while a turn runs or is still starting on the thread. They used
   to start a second Claude run that took over the thread, and the running
   turn's remaining output was lost. (#240, #241)
+- Startup recovery streams the completed history and rechecks a turn before
+  repairing its activity markers. A report another adapter finished while
+  recovery was scanning stays in the conversation.
 - Adapters sharing one state directory claim an adapter-managed turn in SQLite.
   A window attached to another adapter can read the chat while a turn runs and
   retry a message after it completes. A surviving adapter can start the next

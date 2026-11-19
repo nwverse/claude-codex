@@ -2101,27 +2101,42 @@ export class SessionStore {
     for (const threadId of seenThreads) {
       reconcileThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId, 'inProgress')
     }
-    const terminalRows = this.db
-      .prepare(
-        'SELECT id, thread_id, status, items_json, owner_pid, owner_started FROM turns WHERE status <> ?',
-      )
-      .all('inProgress') as Array<{
-      id: string
-      thread_id: string
-      status: TurnStatus
-      items_json: string
-      owner_pid: number | null
-      owner_started: string | null
-    }>
-    const updateItems = this.db.prepare('UPDATE turns SET items_json = ? WHERE id = ?')
+    // Stream finished turns. Keeping their entire transcripts in an array
+    // makes startup memory scale with the total size of every chat. Finish
+    // the read cursor before issuing writes to the table it is traversing.
+    const terminalRows = this.db.prepare(
+      "SELECT id, items_json FROM turns WHERE status <> 'inProgress' ORDER BY rowid",
+    )
+    const repairs: string[] = []
+    for (const row of terminalRows.iterate() as Iterable<{ id: string; items_json: string }>) {
+      if (this.terminalizeStaleItems(row.items_json, message, isDead) !== row.items_json)
+        repairs.push(row.id)
+    }
+
+    const readItems = this.db.prepare(`SELECT thread_id, items_json, owner_pid, owner_started
+      FROM turns WHERE id = ? AND status <> 'inProgress'`)
+    const updateItems = this.db.prepare(`UPDATE turns SET items_json = ?
+      WHERE id = ? AND status <> 'inProgress' AND items_json = ?
+        AND owner_pid IS ? AND owner_started IS ?`)
     const repairThreadIds = new Set<string>()
-    for (const row of terminalRows) {
-      // A background agent outlives the parent turn that spawned it, so its
-      // markers can sit in a turn that ended long before the restart.
+    for (const id of repairs) {
+      // A live adapter may have finished an agent, appended a report or
+      // deleted the turn since the scan. Heal only the snapshot just read.
+      const row = readItems.get(id) as
+        | Pick<StaleTurnRow, 'thread_id' | 'items_json' | 'owner_pid' | 'owner_started'>
+        | undefined
+      if (!row || ownerRunning(row)) continue
       const itemsJson = this.terminalizeStaleItems(row.items_json, message, isDead)
-      if (itemsJson === row.items_json || ownerRunning(row)) continue
-      updateItems.run(itemsJson, row.id)
-      repairThreadIds.add(String(row.thread_id))
+      if (itemsJson === row.items_json) continue
+      const updated = updateItems.run(
+        itemsJson,
+        id,
+        row.items_json,
+        row.owner_pid,
+        row.owner_started,
+      )
+      if (Number(updated.changes) === 0) continue
+      repairThreadIds.add(row.thread_id)
       recoveredCount += 1
     }
     for (const threadId of repairThreadIds) {
@@ -2219,6 +2234,7 @@ export class SessionStore {
     }
     if (!Array.isArray(parsed)) return '[]'
 
+    let changed = false
     const items = parsed.map((raw) => {
       if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return raw
       const item = raw as Record<string, unknown>
@@ -2227,8 +2243,10 @@ export class SessionStore {
         (item.kind === 'started' || item.kind === 'interacted') &&
         isDead(String(item.agentThreadId))
       ) {
+        changed = true
         return { ...item, kind: 'interrupted' }
       }
+      if (item.status === 'inProgress') changed = true
       if (item.type === 'collabAgentToolCall') {
         const agentsStates = item.agentsStates
         const nextStates =
@@ -2244,6 +2262,7 @@ export class SessionStore {
                       !isDead(threadId)
                     )
                       return [threadId, state]
+                    changed = true
                     return [
                       threadId,
                       { ...state, status: 'errored', message: state.message ?? message },
@@ -2261,7 +2280,7 @@ export class SessionStore {
       if (item.status === 'inProgress') return { ...item, status: 'failed' }
       return item
     })
-    return JSON.stringify(items)
+    return changed ? JSON.stringify(items) : itemsJson
   }
 
   updateTurnDiff(turnId: string, diff: string): TurnRecord | null {
