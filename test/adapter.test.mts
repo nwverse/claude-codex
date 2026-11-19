@@ -9,7 +9,7 @@ import {
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -3609,6 +3609,89 @@ test('remote utility methods use v2 response shapes', async () => {
   }
 })
 
+test('command/exec stops the whole process group on timeout or terminate and drains briefly', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  const leftRunning: number[] = []
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+  let id = 0
+  const exec = async (params: Record<string, unknown>) => {
+    const requestId = ++id
+    const started = Date.now()
+    proc.stdin.write(json({ id: requestId, method: 'command/exec', params }))
+    const { result } = await reader.nextResponse(requestId)
+    return { result, elapsed: Date.now() - started }
+  }
+  // The shell prints the pid of the sleep it put in the background.
+  const sleeper = (rest: string) => ['sh', '-c', `sleep 30 & echo $!; ${rest}`]
+  const sleepPid = (stdout: string): number => {
+    const pid = Number(stdout.trim().split('\n')[0])
+    assert.ok(Number.isInteger(pid) && pid > 0, `no background pid in ${JSON.stringify(stdout)}`)
+    leftRunning.push(pid)
+    return pid
+  }
+  const gone = async (pid: number) => {
+    for (let waited = 0; alive(pid) && waited < 3_000; waited += 50) await delay(50)
+    assert.equal(alive(pid), false, `process ${pid} still running`)
+  }
+  try {
+    const timedOut = await exec({ command: sleeper('wait'), timeoutMs: 300 })
+    assert.equal(timedOut.result.exitCode, 124)
+    assert.ok(timedOut.elapsed < 5_000, `answered after ${timedOut.elapsed} ms`)
+    await gone(sleepPid(timedOut.result.stdout))
+
+    // SIGTERM is ignored by the shell and the sleep it runs: SIGKILL follows.
+    const stubborn = await exec({
+      command: ['sh', '-c', 'trap "" TERM; sleep 30 & echo $!; wait'],
+      timeoutMs: 300,
+    })
+    assert.equal(stubborn.result.exitCode, 124)
+    assert.ok(stubborn.elapsed < 5_000, `answered after ${stubborn.elapsed} ms`)
+    await gone(sleepPid(stubborn.result.stdout))
+
+    // A command that exits is answered after a bounded drain, not when the
+    // process it left in the background exits.
+    const background = await exec({ command: sleeper('echo started') })
+    assert.equal(background.result.exitCode, 0)
+    assert.match(background.result.stdout, /started\n$/)
+    assert.ok(background.elapsed < 5_000, `answered after ${background.elapsed} ms`)
+    assert.equal(alive(sleepPid(background.result.stdout)), true)
+
+    const requestId = ++id
+    proc.stdin.write(
+      json({
+        id: requestId,
+        method: 'command/exec',
+        params: { processId: 'stop-me', command: sleeper('wait'), disableTimeout: true },
+      }),
+    )
+    await delay(300)
+    proc.stdin.write(
+      json({ id: ++id, method: 'command/exec/terminate', params: { processId: 'stop-me' } }),
+    )
+    const { result: terminated } = await reader.nextResponse(requestId)
+    assert.notEqual(terminated.exitCode, 0)
+    await gone(sleepPid(terminated.stdout))
+  } finally {
+    for (const pid of leftRunning) if (pid > 0 && alive(pid)) process.kill(pid, 'SIGKILL')
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('process/spawn supports shell strings, errors, and debug logs terminal lifecycle', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const debugLog = join(home, 'adapter-debug.jsonl')
@@ -4164,11 +4247,11 @@ test('a Claude Code that refused to start fails the turn with why, retryable onl
         reason,
       )
       // The CLI's own text, with the proxy's credentials, reaches no one.
-      assert.doesNotMatch(JSON.stringify(failed), /secret|proxy\.invalid/, reason)
+      assert.doesNotMatch(JSON.stringify(failed), /user:secret|proxy\.invalid/, reason)
     }
     proc.stdin.write(json({ id, method: 'thread/read', params: { threadId, includeTurns: true } }))
     const read = await reader.nextResponse(id)
-    assert.doesNotMatch(JSON.stringify(read.result), /secret|proxy\.invalid/)
+    assert.doesNotMatch(JSON.stringify(read.result), /user:secret|proxy\.invalid/)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -10169,11 +10252,10 @@ test('AskUserQuestion is bridged to Codex item/tool/requestUserInput', async () 
     assert.equal(Array.isArray(askRequest.params.questions), true)
     assert.equal(askRequest.params.questions[0].header, 'Auth')
     assert.equal(askRequest.params.questions[0].question, 'Which auth method do you want?')
-    // The bridge auto-appends an "Other" option so the App's free-text
-    // affordance lights up even when Claude didn't model one explicitly.
+    assert.equal(askRequest.params.questions[0].isOther, true)
     assert.equal(
       askRequest.params.questions[0].options.some((o: any) => o.label === 'Other'),
-      true,
+      false,
     )
 
     // Answer as the App would.
@@ -12307,6 +12389,27 @@ test('direct MCP stdio resource and tool calls work', async () => {
     assert.equal(resource.result.contents[0].text, 'resource-ok')
     // No hosted app scoped the read.
     assert.equal(resource.result.originCallId, null)
+    // Each direct connection initializes with id 1 and calls the tool with id 2.
+    for (const [index, args] of [
+      { id: 2 },
+      { id: 37 },
+      {},
+      { id: 2, method: 'unsupported' },
+    ].entries()) {
+      const requestId = 3 + index
+      proc.stdin.write(
+        json({
+          id: requestId,
+          method: 'mcpServer/tool/call',
+          params: { threadId: 't', server: 'fixture', tool: 'ping', arguments: args },
+        }),
+      )
+      const ping = await reader.nextResponse(requestId)
+      assert.equal(
+        ping.result.content[0].text,
+        args.method ? 'pong:{"code":-32601,"message":"Method not found: unsupported"}' : 'pong:{}',
+      )
+    }
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -12900,16 +13003,22 @@ test('direct MCP HTTP tool calls work', async () => {
         )
         return
       }
+      res.setHeader('content-type', 'text/event-stream')
+      // A colliding server request and a notification are not the tool reply.
+      res.write(`data: ${JSON.stringify({ jsonrpc: '2.0', id: message.id, method: 'ping' })}\n\n`)
+      res.write(`data: ${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/message' })}\n\n`)
       res.end(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: message.id,
-          result: {
-            content: [{ type: 'text', text: `http:${message.params.name}` }],
-            structuredContent: { http: true },
-            isError: false,
-          },
-        }),
+        'data: ' +
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: message.id,
+            result: {
+              content: [{ type: 'text', text: `http:${message.params.name}` }],
+              structuredContent: { http: true },
+              isError: false,
+            },
+          }) +
+          '\n\n',
       )
     })
   })
@@ -13627,6 +13736,69 @@ test('thread sections paginate without losing entries at page boundaries', async
   } finally {
     proc.kill()
     await once(proc, 'exit')
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('direct MCP requests use thread cwd and separate status caches by project', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-mcp-cwd-'))
+  const fixture = await readFile(resolve('test/fixtures/mcp-stdio-server.mjs'), 'utf8')
+  const projects = [join(home, 'project-a'), join(home, 'project-b')]
+  for (const [index, project] of projects.entries()) {
+    await mkdir(project)
+    await writeFile(
+      join(project, 'server.mjs'),
+      fixture.replace("name: 'echo'", `name: 'echo${index}'`),
+    )
+  }
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    cwd: home,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+        fixture: { type: 'stdio', command: process.execPath, args: ['server.mjs'] },
+      }),
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  let id = 1
+  const request = async (method: string, params: Record<string, unknown>) => {
+    const requestId = id++
+    proc.stdin.write(json({ id: requestId, method, params }))
+    const response = await reader.nextResponse(requestId)
+    assert.equal(response.error, undefined)
+    return response.result
+  }
+  try {
+    for (const [index, project] of projects.entries()) {
+      const started = await request('thread/start', { cwd: project })
+      const threadId = started.thread.id
+      const status = await request('mcpServerStatus/list', { threadId })
+      const server = status.data.find((entry: any) => entry.name === 'fixture')
+      assert.ok(
+        server.tools[`echo${index}`],
+        'status must come from this project, not cached from another',
+      )
+      const tool = await request('mcpServer/tool/call', {
+        threadId,
+        server: 'fixture',
+        tool: 'process',
+        arguments: {},
+      })
+      assert.equal(tool.structuredContent.cwd, await realpath(project))
+      const resource = await request('mcpServer/resource/read', {
+        threadId,
+        server: 'fixture',
+        uri: 'fixture://resource',
+      })
+      assert.equal(resource.contents[0].text, 'resource-ok')
+    }
+  } finally {
+    proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
