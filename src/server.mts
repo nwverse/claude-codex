@@ -855,6 +855,9 @@ export class CodexClaudeAppServer {
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
+    // command/exec runs in its own process group, out of reach of a signal to
+    // the adapter's group (launchd job stop, Ctrl-C): end what is still running.
+    for (const child of this.commandProcesses.values()) signalProcessGroup(child, 'SIGTERM')
     this.stopCommandsListener()
     this.sleepMonitor.stop?.()
     this.idleSleep.stop()
