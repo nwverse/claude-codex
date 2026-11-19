@@ -1189,10 +1189,11 @@ export class CodexClaudeAppServer {
       case 'plugin/install':
         return this.pluginInstall(asRecord(params))
       case 'skills/config/write':
+        // App rule: settings-write-errors
         if (asRecord(params).enabled === false) {
           throw invalidRequest('Disabling skills is not supported for Claude threads.')
         }
-        return { effectiveEnabled: asRecord(params).enabled === true }
+        return { effectiveEnabled: true }
       case 'plugin/share/list':
         return { data: [] }
       // Stub the three RPC methods Codex App may call that our dispatcher
