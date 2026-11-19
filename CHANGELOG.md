@@ -14,6 +14,9 @@ versioning or publishing metadata.
   AsterGate models. Native chats retain their provider, approvals and history
   across adapter restarts. Existing `codex exec` chats keep their route. See
   [Harnesses](docs/guide/backends.md#harnesses) for configuration and helper chats.
+- A native Codex chat keeps its active sidebar state when another adapter opens
+  the same state directory. A later startup clears the activity marker if the
+  adapter that ran the native turn has exited.
 
 ### `ws://` listener authentication
 

@@ -75,6 +75,7 @@ function handle(message) {
       }
       reply({ turn: { id: turnId, status: 'inProgress', items: [] } })
       send({ method: 'turn/started', params: { threadId: p.threadId, turn: { id: turnId, status: 'inProgress', items: [] } } })
+      send({method:'thread/status/changed',params:{threadId:p.threadId,status:{type:'active',activeFlags:['waitingOnApproval']}}})
       const requestId = 900 + next
       waiting.set(requestId, (result) => {
         send({ method: 'serverRequest/resolved', params: { threadId: p.threadId, requestId } })

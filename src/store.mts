@@ -298,6 +298,9 @@ export class SessionStore {
     // by `codex exec` as thread.started.thread_id). NULL until first turn.
     this.ensureColumn('threads', 'codex_session_id', 'TEXT')
     this.ensureColumn('threads', 'native_codex_provider', 'TEXT')
+    // Native turn rows live in Codex's rollout rather than the turns table.
+    this.ensureColumn('threads', 'native_active_owner_pid', 'INTEGER')
+    this.ensureColumn('threads', 'native_active_owner_started', 'TEXT')
     // Claude transcript checkpoints for thread/rollback, thread/revert and
     // thread/fork: see setTurnCheckpoint and rewindClaudeSession.
     this.ensureColumn('threads', 'claude_resume_at', 'TEXT')
@@ -1286,6 +1289,38 @@ export class SessionStore {
       .run(preview, threadId)
   }
 
+  startNativeTurnActivity(threadId: string): void {
+    const owner = currentProcessOwner()
+    // An earlier status event may already carry waitingOnApproval or other flags.
+    this.db
+      .prepare(`
+      UPDATE threads SET native_active_owner_pid = ?, native_active_owner_started = ?,
+        status_json = CASE WHEN json_extract(status_json, '$.type') = 'active'
+                           THEN status_json ELSE ? END, updated_at = ?
+      WHERE id = ?`)
+      .run(
+        owner.pid,
+        owner.started,
+        JSON.stringify({ type: 'active', activeFlags: [] }),
+        nowSeconds(),
+        threadId,
+      )
+  }
+
+  updateNativeThreadStatus(threadId: string, status: ThreadStatus): void {
+    const owner = currentProcessOwner()
+    const release =
+      status.type === 'active'
+        ? ''
+        : ', native_active_owner_pid = NULL, native_active_owner_started = NULL'
+    this.db
+      .prepare(`
+      UPDATE threads SET status_json = ?, updated_at = ?${release}
+      WHERE id = ? AND (native_active_owner_pid IS NULL OR
+        (native_active_owner_pid = ? AND native_active_owner_started IS ?))`)
+      .run(JSON.stringify(status), nowSeconds(), threadId, owner.pid, owner.started)
+  }
+
   updateThreadStatus(threadId: string, status: ThreadStatus): boolean {
     // Another adapter may have claimed the next turn since the previous one
     // finished. Its new active state takes precedence over the late idle update.
@@ -2100,6 +2135,7 @@ export class SessionStore {
     const reconcileTerminalActiveThreads = this.db.prepare(
       `UPDATE threads SET status_json = ?, updated_at = ?
        WHERE json_extract(status_json, '$.type') = 'active'
+         AND native_active_owner_pid IS NULL
          AND NOT EXISTS (SELECT 1 FROM turns WHERE thread_id = threads.id AND status = ?)`,
     )
     const reconciled = reconcileTerminalActiveThreads.run(
@@ -2108,6 +2144,33 @@ export class SessionStore {
       'inProgress',
     ) as { changes?: number }
     recoveredCount += Number(reconciled.changes ?? 0)
+    // The native child owns the rollout; an empty SQLite turn list says
+    // nothing about its liveness. Only clear a marker left by a dead adapter.
+    const native = this.db
+      .prepare(`SELECT id, native_active_owner_pid AS owner_pid,
+      native_active_owner_started AS owner_started FROM threads
+      WHERE native_active_owner_pid IS NOT NULL`)
+      .all() as Array<{
+      id: string
+      owner_pid: number
+      owner_started: string | null
+    }>
+    const clearNative = this.db.prepare(`UPDATE threads SET status_json = ?,
+      updated_at = ?, native_active_owner_pid = NULL, native_active_owner_started = NULL
+      WHERE id = ? AND native_active_owner_pid = ? AND native_active_owner_started IS ?`)
+    const self = currentProcessOwner()
+    for (const row of native) {
+      if ((row.owner_pid === self.pid && row.owner_started === self.started) || ownerRunning(row))
+        continue
+      const cleared = clearNative.run(
+        JSON.stringify({ type: 'idle' }),
+        completedAt,
+        row.id,
+        row.owner_pid,
+        row.owner_started,
+      )
+      recoveredCount += Number(cleared.changes)
+    }
     return recoveredCount
   }
 
