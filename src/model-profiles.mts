@@ -10,6 +10,7 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
+import { jsonSyntaxReason } from './json-syntax.mjs'
 
 // Model process profiles: each selectable model id maps to its own Claude Code
 // process (executable, provider environment, CLAUDE_CONFIG_DIR). Profiles come
@@ -140,16 +141,6 @@ function loadFailureReason(error: unknown): string {
   if (code === 'EACCES' || code === 'EPERM') return 'permission denied'
   if (code === 'ENOTDIR') return 'part of the path is not a folder'
   return `cannot read the file (${code})`
-}
-
-// JSON.parse quotes the text around a syntax error (`Unexpected token 'x',
-// ..."ls": [x, "y"]"... is not valid JSON`): keep what comes before the
-// quote. Its other messages give a position and quote nothing.
-function jsonSyntaxReason(error: unknown): string {
-  const message = oneLine(errorMessage(error))
-  const quote = message.indexOf('"')
-  const reason = (quote < 0 ? message : message.slice(0, quote)).replace(/[\s,.]+$/, '')
-  return reason || 'not valid JSON'
 }
 
 function parseClaudeModelProfiles(env: Environment): ClaudeModelProfile[] {

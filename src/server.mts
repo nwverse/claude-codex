@@ -242,6 +242,7 @@ import {
   failedImageRead,
   imageReadPath,
   isExploreTool,
+  readsOnly,
   splitMcpToolName,
 } from './tool-items.mjs'
 import {
@@ -680,6 +681,11 @@ export class CodexClaudeAppServer {
   private subscribersByThread = new Map<string, Map<string, RpcPeer>>()
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
+  // Threads a thread/delete is removing. It waits for their turns to end
+  // first; a turn/start in that gap, on one of them or on a subagent thread
+  // below one, is refused rather than starting a turn on a thread that is
+  // about to go.
+  private deletingThreads = new Set<string>()
   private readonly startingTurnByThread = new Map<string, Promise<void>>()
   // Turns whose runtime run is scheduled or has not returned yet. A turn outside this
   // set has nothing left that would ever end it.
@@ -2229,7 +2235,7 @@ export class CodexClaudeAppServer {
   // The App pages a long thread from its newest turn, and loads a search
   // match by reading both ways from the match's turn.
   private threadTurnsList(params: Record<string, unknown>): unknown {
-    const threadId = stringOr(params.threadId, '')
+    const threadId = this.knownThreadId(params)
     const itemsView = turnItemsView(params.itemsView)
     const page = pageTurns(this.store.historyTurns(threadId), {
       cursor: params.cursor,
@@ -2240,7 +2246,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadItemsList(params: Record<string, unknown>): unknown {
-    return pageItems(this.store.historyTurns(stringOr(params.threadId, '')), {
+    return pageItems(this.store.historyTurns(this.knownThreadId(params)), {
       turnId: stringOr(params.turnId, '') || null,
       cursor: params.cursor,
       limit: pageLimit(params.limit),
@@ -2249,7 +2255,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadTimelineList(params: Record<string, unknown>): unknown {
-    return pageTimeline(this.store.historyTurns(stringOr(params.threadId, '')), {
+    return pageTimeline(this.store.historyTurns(this.knownThreadId(params)), {
       cursor: params.cursor,
       limit: pageLimit(params.limit),
     })
@@ -2355,6 +2361,7 @@ export class CodexClaudeAppServer {
   private threadTurnItemsList(params: Record<string, unknown>): unknown {
     const turnId = stringOr(params.turnId, '')
     const threadId = stringOr(params.threadId, '')
+    if (threadId && !this.store.getThread(threadId)) throw unknownThread(threadId)
     // A fork's inherited turns keep their ids, so the thread names which copy.
     const turn = threadId ? this.store.historyTurn(threadId, turnId) : this.store.getTurn(turnId)
     return {
@@ -2365,7 +2372,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadNameSet(params: Record<string, unknown>): unknown {
-    const threadId = stringOr(params.threadId, '')
+    const threadId = this.knownThreadId(params)
     const name = params.name == null ? null : String(params.name)
     this.store.updateThreadName(threadId, name)
     this.notifyThread(threadId, {
@@ -2376,7 +2383,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadArchive(params: Record<string, unknown>, archived: boolean): unknown {
-    const threadId = stringOr(params.threadId, '')
+    const threadId = this.knownThreadId(params)
     this.store.setArchived(threadId, archived)
     this.notifyThread(threadId, {
       method: archived ? 'thread/archived' : 'thread/unarchived',
@@ -2426,10 +2433,12 @@ export class CodexClaudeAppServer {
 
   private threadLoadedList(params: Record<string, unknown>): unknown {
     const loaded = Array.from(this.subscribersByThread.keys())
-    const limit = numberOr(params.limit, loaded.length || 50)
+    const offset = offsetCursor(params.cursor, 'loaded thread')
+    const limit = pageLimit(params.limit) ?? (loaded.length || 50)
+    const end = offset + limit
     return {
-      data: loaded.slice(0, limit),
-      nextCursor: loaded.length > limit ? String(limit) : null,
+      data: loaded.slice(offset, end),
+      nextCursor: end < loaded.length ? String(end) : null,
     }
   }
 
@@ -2509,7 +2518,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadGoalGet(params: Record<string, unknown>): unknown {
-    return { goal: this.store.getGoal(stringOr(params.threadId, '')) }
+    return { goal: this.store.getGoal(this.knownThreadId(params)) }
   }
 
   private threadGoalClear(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -2522,6 +2531,14 @@ export class CodexClaudeAppServer {
     if (cleared)
       this.notifyThread(threadId, { method: 'thread/goal/cleared', params: { threadId } })
     return { cleared }
+  }
+
+  // The request's threadId, refused the way Codex refuses a thread it does
+  // not have, before a handler writes, notifies or answers an empty page.
+  private knownThreadId(params: Record<string, unknown>): string {
+    const threadId = stringOr(params.threadId, '')
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
+    return threadId
   }
 
   private goalThread(threadId: string): ThreadRecord {
@@ -3305,6 +3322,16 @@ export class CodexClaudeAppServer {
       if (params.missingRolloutRecovery === true) return {}
       throw new Error(`no rollout found for thread id ${threadId}`)
     }
+    this.deletingThreads.add(threadId)
+    try {
+      await this.removeThread(peer, threadId)
+    } finally {
+      this.deletingThreads.delete(threadId)
+    }
+    return {}
+  }
+
+  private async removeThread(peer: RpcPeer, threadId: string): Promise<void> {
     if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
     // Background agents go with the thread that launched them (or that they
     // are, or that they hang off): their turns end before their threads do.
@@ -3333,7 +3360,6 @@ export class CodexClaudeAppServer {
       for (const target of targets.values())
         this.sendNotification(target, { method: 'thread/deleted', params: { threadId: id } })
     }
-    return {}
   }
 
   private threadShellCommand(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -4000,7 +4026,7 @@ export class CodexClaudeAppServer {
         addDirs: [],
         enableFileCheckpointing: false,
         outputFormat: null,
-        approvalPolicy: 'never',
+        approvalPolicy: 'on-request',
         sandboxMode: 'read-only',
         systemPromptAddendum: null,
         planMode: false,
@@ -4010,7 +4036,7 @@ export class CodexClaudeAppServer {
         onEvent: async (event) => {
           if (event.type === 'text_delta' && event.delta && active()) {
             collected += event.delta
-            this.store.updateItem(turnId, agentItemId, (item) =>
+            this.store.streamItem(turnId, agentItemId, (item) =>
               item.type === 'agentMessage' ? { ...item, text: item.text + event.delta } : item,
             )
             this.notify(peer, {
@@ -4023,8 +4049,10 @@ export class CodexClaudeAppServer {
             throw new Error(event.result ?? 'compaction turn failed')
           }
         },
-        // Compaction never asks for approvals — it's read-only summarisation.
-        onPermissionRequest: async () => ({ decision: 'accept' }),
+        // The summary needs no tool beyond the reads allowed up front;
+        // anything else is refused, never approved. A decline, not a cancel,
+        // so Claude goes on writing the summary.
+        onPermissionRequest: async () => ({ decision: 'decline' }),
         // Compaction shouldn't ever invoke AskUserQuestion; if it does, return
         // an empty answer so the model proceeds with its summary.
         onUserInputRequest: async (event) => ({
@@ -4060,8 +4088,7 @@ export class CodexClaudeAppServer {
 
   private async startClaimedTurn(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
-    const thread = this.store.getThread(threadId)
-    if (!thread) throw unknownThread(threadId)
+    let thread = this.startableThread(threadId)
     this.checkModelProfileBinding(thread)
     // Follow-up turns the adapter starts itself have no requesting peer.
     if (peer !== DETACHED_PEER) this.subscribe(threadId, peer)
@@ -4111,6 +4138,9 @@ export class CodexClaudeAppServer {
         workflowCommand?.type === 'list',
       )
       if (joined) return { turn: this.toLifecycleTurn(joined) }
+      // Other requests ran while the input waited: take the thread as they
+      // left it, so this turn's write keeps a rename and a delete holds.
+      thread = this.startableThread(threadId)
     }
     // A structured summary or title turn runs its model, mapped to the
     // summary model, for that turn alone; it never rebinds the thread's.
@@ -4270,6 +4300,19 @@ export class CodexClaudeAppServer {
       })
     })
     return { turn: publicTurn }
+  }
+
+  private startableThread(threadId: string): ThreadRecord {
+    const thread = this.store.getThread(threadId)
+    if (!thread || this.isBeingDeleted(threadId)) throw unknownThread(threadId)
+    return thread
+  }
+
+  // store.deleteThread takes a thread's subagent threads with it.
+  private isBeingDeleted(threadId: string): boolean {
+    for (const id of this.deletingThreads)
+      if (id === threadId || this.isSubagentDescendant(threadId, id)) return true
+    return false
   }
 
   // Steers input into the thread's running turn. Returns null when there is
@@ -5718,7 +5761,7 @@ export class CodexClaudeAppServer {
             completeReasoningItem()
             hasTextOutput = true
             const itemId = ensureAgentItem()
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type === 'agentMessage') return { ...item, text: item.text + event.delta }
               return item
             })
@@ -5732,7 +5775,7 @@ export class CodexClaudeAppServer {
             if (event.delta.length === 0) return
             completeAgentItem('commentary')
             const itemId = ensureReasoningItem()
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type !== 'reasoning') return item
               return reasoningVisible
                 ? { ...item, summary: [(item.summary[0] ?? '') + event.delta] }
@@ -5828,7 +5871,7 @@ export class CodexClaudeAppServer {
             // Output that comes after the result is not the item's any more.
             if (!itemId || !openToolItems.has(itemId)) return
             commandOutputSeen.add(itemId)
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
                 return {
                   ...item,
@@ -5856,7 +5899,7 @@ export class CodexClaudeAppServer {
               const started = itemStartedAtMs.get(itemId)
               return started == null ? null : Math.max(0, nowMillis() - started)
             })()
-            const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
+            const parsedExitCode = event.isError ? (parseExitCodeFromResult(event.content) ?? 1) : 0
             const output = exploreItemIds.has(itemId) ? capOutput(resultText) : resultText
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
@@ -6152,8 +6195,11 @@ export class CodexClaudeAppServer {
             )
             itemId = item.id
             itemIds.set(event.toolUseId, item.id)
+            itemStartedAtMs.set(item.id, nowMillis())
             openToolItems.add(item.id)
             if (isExploreTool(event.toolName)) exploreItemIds.add(item.id)
+            else if (item.type === 'commandExecution')
+              this.rememberCommandItem(event.toolUseId, thread.id, turn.id, item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -7156,7 +7202,7 @@ export class CodexClaudeAppServer {
     const at = this.commandItems.get(event.toolUseId)
     if (!at || at.threadId !== threadId || !event.delta) return
     let found = false
-    this.store.updateItem(at.turnId, at.itemId, (item) => {
+    this.store.streamItem(at.turnId, at.itemId, (item) => {
       if (item.type !== 'commandExecution') return item
       found = true
       return { ...item, aggregatedOutput: appendCommandOutput(item.aggregatedOutput, event.delta) }
@@ -7810,6 +7856,10 @@ export class CodexClaudeAppServer {
       thread &&
       (thread.approvalPolicy === 'never' || thread.sandboxMode === 'danger-full-access')
     ) {
+      // A read-only sandbox that never asks runs reads alone and refuses the
+      // rest: nothing would confine another call to reading.
+      if (thread.sandboxMode === 'read-only' && !readsOnly(event.toolName))
+        return { decision: 'decline' }
       return { decision: 'accept' }
     }
     // App rule: mcp-tool-approval
@@ -8166,6 +8216,8 @@ export class CodexClaudeAppServer {
   private async turnInterrupt(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const requestedTurnId = stringOr(params.turnId, '')
+    // Subagent threads are stored too, so this check covers them.
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     this.subscribe(threadId, peer)
     // A background child has no runtime turn of its own; stop its task.
     const background = this.backgroundSubagents.get(threadId)
@@ -10532,22 +10584,7 @@ export class CodexClaudeAppServer {
   }
 
   private bindPeerToDescendants(peer: RpcPeer, rootThreadId: string): void {
-    const queue = [rootThreadId]
-    const seen = new Set<string>()
-    while (queue.length > 0) {
-      const parentId = queue.shift()
-      if (!parentId || seen.has(parentId)) continue
-      seen.add(parentId)
-      for (const child of this.store.listThreads({
-        includeEphemeral: true,
-        parentThreadId: parentId,
-        sortKey: 'created_at',
-        sortDirection: 'asc',
-      })) {
-        this.subscribe(child.id, peer)
-        queue.push(child.id)
-      }
-    }
+    for (const id of this.store.descendantThreadIds(rootThreadId)) this.subscribe(id, peer)
   }
 
   private loadPersistedConfig(): void {

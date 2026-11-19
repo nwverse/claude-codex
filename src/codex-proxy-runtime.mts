@@ -6,13 +6,14 @@
 //
 // Multi-turn continuity: Codex's `thread.started.thread_id` returned on the
 // first turn is persisted on our ThreadRecord.codexSessionId; subsequent
-// turns invoke `codex exec resume <id>` so the conversation history survives.
+// turns invoke `codex exec <options> resume <id>` so the conversation history survives.
 //
 // Auth: relies on real Codex's own auth state (login via the Codex desktop
 // app or `codex login`). We don't manage tokens for it — just forward what
 // the OS user has.
 
 import { type ChildProcess, spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { createInterface, type Interface } from 'node:readline'
 import { flatPrompt } from './turn-context.mjs'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
@@ -67,36 +68,30 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       //                                approvalPolicy/sandboxMode; codex
       //                                would otherwise prompt on stdin and
       //                                deadlock the JSONL stream.
+      //   -s <mode>                    read-only / workspace-write sandbox (any other mode takes
+      //                                the bypass flag)
       //   -m <model>                   the model the user picked in the App
       //   -C <cwd>                     anchor the workspace
-      //   resume <sessionId>           multi-turn continuity
+      //   --add-dir <dir>              extra writable roots (CLAUDE_CODEX_ADD_DIRS)
+      //   resume <sessionId>           multi-turn continuity; goes after all the options above,
+      //                                since `codex exec resume` takes no -C, -s or --add-dir
+      //                                of its own
       const resumeId = context.claudeSessionId
-      const args: string[] = ['exec']
-      if (resumeId) {
-        args.push('resume', resumeId, '--json', '--skip-git-repo-check')
-        if (context.sandboxMode === 'danger-full-access' || !context.sandboxMode) {
-          args.push('--dangerously-bypass-approvals-and-sandbox')
-        }
-        if (context.model) args.push('-m', context.model)
+      const args: string[] = ['exec', '--json', '--skip-git-repo-check']
+      if (context.sandboxMode === 'read-only' || context.sandboxMode === 'workspace-write') {
+        args.push('-s', context.sandboxMode)
       } else {
-        args.push('--json', '--skip-git-repo-check')
-        if (context.sandboxMode === 'danger-full-access') {
-          args.push('--dangerously-bypass-approvals-and-sandbox')
-        } else if (
-          context.sandboxMode === 'read-only' ||
-          context.sandboxMode === 'workspace-write'
-        ) {
-          args.push('-s', context.sandboxMode)
-        } else {
-          args.push('--dangerously-bypass-approvals-and-sandbox')
-        }
-        if (context.model) args.push('-m', context.model)
-        if (context.cwd) args.push('-C', context.cwd)
-        if (context.addDirs && context.addDirs.length > 0) {
-          for (const dir of context.addDirs) args.push('--add-dir', dir)
-        }
+        args.push('--dangerously-bypass-approvals-and-sandbox')
       }
-      args.push(flatPrompt(context.prompt, context.promptContext))
+      if (context.model) args.push('-m', context.model)
+      if (context.cwd) args.push('-C', context.cwd)
+      for (const dir of context.addDirs ?? []) args.push('--add-dir', dir)
+      if (resumeId) args.push('resume', resumeId)
+      // PROMPT `-` makes codex read the prompt from stdin. As an argv entry a
+      // prompt starting with '-' parses as a flag, and one over 128 KiB fails
+      // the spawn with E2BIG on Linux (MAX_ARG_STRLEN).
+      args.push('-')
+      const prompt = flatPrompt(context.prompt, context.promptContext)
 
       debugLog('codex-proxy.spawn', {
         binary,
@@ -106,9 +101,16 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       })
 
       const proc = spawn(binary, args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: context.cwd || undefined,
+        stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
       })
+      // codex may exit before it reads the whole prompt (bad flag, auth
+      // failure); the exit handler reports the turn, so only log EPIPE here.
+      proc.stdin.on('error', (err) => {
+        debugLog('codex-proxy.stdinError', { turnId: context.turnId, err: String(err) })
+      })
+      proc.stdin.end(prompt)
 
       const pending: PendingTurn = {
         context,
@@ -173,6 +175,12 @@ export class CodexProxyRuntime implements ClaudeRuntime {
         if (pending.resolved) return
         pending.resolved = true
         this.turns.delete(context.turnId)
+        // spawn() reports a missing cwd as ENOENT on the codex binary itself.
+        const code = (err as NodeJS.ErrnoException).code
+        if (code === 'ENOENT' && context.cwd && !existsSync(context.cwd)) {
+          reject(new Error(`Project folder not found: ${context.cwd}`))
+          return
+        }
         reject(err)
       })
     })
@@ -241,7 +249,13 @@ export class CodexProxyRuntime implements ClaudeRuntime {
             type: 'tool_use',
             toolUseId: String(item.id ?? `codex-${Date.now()}`),
             toolName: 'Edit',
-            input: { file_path: stringOr(item.path) ?? '', changes: item.changes ?? [] },
+            input: {
+              file_path:
+                stringOr(item.path) ??
+                stringOr(asRecord(Array.isArray(item.changes) ? item.changes[0] : null).path) ??
+                '',
+              changes: item.changes ?? [],
+            },
           })
         } else if (itemType === 'mcp_tool_call') {
           await handlers.onEvent({
@@ -286,17 +300,39 @@ export class CodexProxyRuntime implements ClaudeRuntime {
           itemType === 'file_change' ||
           itemType === 'mcp_tool_call'
         ) {
-          // Tool result side — synthesize a tool_result so the server's
-          // matching tool item closes properly.
+          let content =
+            stringOr(item.aggregated_output) ?? stringOr(item.summary) ?? stringOr(item.result)
+          let isError =
+            item.status === 'failed' ||
+            item.status === 'declined' ||
+            Boolean(item.error ?? item.is_error)
+          if (itemType === 'command_execution') {
+            const exitCode = typeof item.exit_code === 'number' ? item.exit_code : null
+            isError ||= exitCode !== null && exitCode !== 0
+            // A failed command's exit status goes last, for the server's Bash result
+            // parser; a successful command's output stays as the command printed it.
+            if (exitCode !== null && exitCode !== 0) {
+              const output = content ?? ''
+              const separator = output && !output.endsWith('\n') ? '\n' : ''
+              content = `${output}${separator}Exit code: ${exitCode}`
+            }
+          } else if (itemType === 'mcp_tool_call') {
+            const result = asRecord(item.result)
+            const message = stringOr(asRecord(item.error).message)
+            content =
+              message ??
+              (Array.isArray(result.content)
+                ? result.content
+                    .map((part) => stringOr(asRecord(part).text))
+                    .filter((text) => text !== null)
+                    .join('\n')
+                : content)
+          }
           await handlers.onEvent({
             type: 'tool_result',
             toolUseId: itemId,
-            content:
-              stringOr(item.aggregated_output) ??
-              stringOr(item.summary) ??
-              stringOr(item.result) ??
-              null,
-            isError: Boolean(item.error ?? item.is_error),
+            content,
+            isError,
           })
         }
         break
@@ -305,11 +341,15 @@ export class CodexProxyRuntime implements ClaudeRuntime {
         if (pending.resolved) return
         const usage = asRecord(event.usage)
         if (Object.keys(usage).length > 0) {
+          // Codex input includes cached tokens; the shared Claude usage shape does not.
+          const rawInput = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0
+          const rawCached =
+            typeof usage.cached_input_tokens === 'number' ? usage.cached_input_tokens : 0
           await handlers.onEvent({
             type: 'usage',
             usage: {
-              input_tokens: usage.input_tokens ?? 0,
-              cache_read_input_tokens: usage.cached_input_tokens ?? 0,
+              input_tokens: Math.max(0, rawInput - rawCached),
+              cache_read_input_tokens: rawCached,
               output_tokens: usage.output_tokens ?? 0,
               reasoning_output_tokens: usage.reasoning_output_tokens ?? 0,
             },

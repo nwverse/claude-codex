@@ -106,10 +106,12 @@ resolved secrets, or private infrastructure URLs.
 Codex App keeps using its native SSH flow: it probes `codex --version`, starts
 `codex app-server --listen unix://`, then connects via `codex app-server proxy`.
 The shim routes every first-argument `app-server` call that reaches it to the
-adapter, regardless of the calling client. `CODEX_REAL` is the fallback for
-other commands; it does not protect an Orca/native app-server invocation from
-this routing in adapter mode. Prefer the isolated launcher above on a shared
-workstation. The SSH integration remains available for dedicated remote hosts.
+adapter, regardless of the calling client, except the schema generators
+(`codex app-server generate-ts` and `generate-json-schema`), which go to the
+real codex. `CODEX_REAL` is the fallback for other commands; it does not
+protect an Orca/native app-server invocation from this routing in adapter mode.
+Prefer the isolated launcher above on a shared workstation. The SSH integration
+remains available for dedicated remote hosts.
 
 ::: tip Custom Anthropic endpoints
 If your organization uses a supported custom Anthropic endpoint, configure

@@ -2913,6 +2913,84 @@ test('native SDK permission request between turns falls back to the standing pol
   )
 })
 
+test('native SDK read-only sandbox that never asks runs reads alone, and refuses the rest without a card', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const notices: string[] = []
+  runtime.setBackgroundListener({
+    onTaskEvent: () => {},
+    onAutonomousTurn: () => {},
+    onSessionReleased: () => {},
+    onNotice: (_threadId, message) => notices.push(message),
+  })
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const requests: any[] = []
+  const signal = new AbortController().signal
+  const plain = { toolUseID: 'tool', signal }
+  const handlers = (decision: string) => ({
+    onPermissionRequest: async (event: unknown) => {
+      requests.push(event)
+      return { decision }
+    },
+  })
+  const context = nativeTurnContext({ approvalPolicy: 'never', sandboxMode: 'read-only' })
+  const current = { context, resolved: false, handlers: handlers('accept') }
+  const inTurn = makeCanUseTool.call(runtime, () => ({ current, lastContext: context }))
+  // Between turns the thread's standing policy answers the same way.
+  const between = makeCanUseTool.call(runtime, () => ({ current: null, lastContext: context }))
+  const refused = (tool: string) => ({
+    behavior: 'deny',
+    message: `${tool} is not allowed: the thread's sandbox is read-only`,
+  })
+  for (const canUseTool of [inTurn, between]) {
+    assert.deepEqual(await canUseTool('Bash', { command: 'rm -rf build' }, plain), refused('Bash'))
+    assert.deepEqual(
+      await canUseTool('Write', { file_path: '/etc/hosts', content: '' }, plain),
+      refused('Write'),
+    )
+    assert.deepEqual(
+      await canUseTool('mcp__docs__update', { page: 'home' }, plain),
+      refused('mcp__docs__update'),
+    )
+    assert.deepEqual(await canUseTool('Read', { file_path: '/etc/hosts' }, plain), {
+      behavior: 'allow',
+    })
+    assert.deepEqual(await canUseTool('Grep', { pattern: 'TODO', path: '/' }, plain), {
+      behavior: 'allow',
+    })
+  }
+  assert.equal(requests.length, 0)
+  assert.deepEqual(notices, [])
+
+  // A call only the user may answer still reaches the user.
+  await inTurn('Bash', { command: 'git push' }, { ...plain, requiresUserInteraction: true })
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].requiresUser, true)
+
+  // A read-only sandbox that asks still asks: the compaction summary's
+  // policy, whose handler declines, refuses the call and lets Claude go on.
+  const asking = nativeTurnContext({ approvalPolicy: 'on-request', sandboxMode: 'read-only' })
+  const summary = makeCanUseTool.call(runtime, () => ({
+    current: { context: asking, resolved: false, handlers: handlers('decline') },
+    lastContext: asking,
+  }))
+  assert.deepEqual(await summary('Bash', { command: 'rm -rf build' }, plain), {
+    behavior: 'deny',
+    message: 'declined by user',
+  })
+  assert.equal(requests.length, 2)
+
+  // A workspace that never asks, or Full access, still runs every call.
+  for (const sandboxMode of ['workspace-write', 'danger-full-access', null]) {
+    const open = nativeTurnContext({ approvalPolicy: 'never', sandboxMode })
+    const ask = makeCanUseTool.call(runtime, () => ({
+      current: { context: open, resolved: false, handlers: handlers('decline') },
+      lastContext: open,
+    }))
+    assert.deepEqual(await ask('Bash', { command: 'make' }, plain), { behavior: 'allow' })
+  }
+  assert.equal(requests.length, 2)
+})
+
 test('native SDK plan mode carries ExitPlanMode and AskUserQuestion to the App', async () => {
   const runtime = new NativeClaudeRuntime()
   const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
@@ -3464,6 +3542,68 @@ test('claude-p runtime keeps the tools a thread must not have from Claude', asyn
   }
 })
 
+test('claude-p runtime skips permissions for a thread that never asks only outside a read-only sandbox', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-skip-test-'))
+  const command = join(tmp, 'fake-claude-p.mjs')
+  await writeFile(
+    command,
+    [
+      '#!/usr/bin/env node',
+      'const args = process.argv.slice(2);',
+      'const flag = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : null);',
+      'const result = JSON.stringify({ allowed: flag("--allowedTools"), skip: args.includes("--dangerously-skip-permissions") });',
+      'console.log(JSON.stringify({ result, session_id: null, is_error: false }));',
+    ].join('\n'),
+  )
+  await chmod(command, 0o755)
+  const run = async (
+    skipPermissions: boolean,
+    name: string,
+    overrides: Partial<RuntimeTurnContext>,
+  ): Promise<{ allowed: string | null; skip: boolean }> => {
+    const runtime = new ClaudePTranscriptRuntime({
+      command,
+      extraArgs: [],
+      timeoutMs: 20_000,
+      skipPermissions,
+      resume: false,
+    })
+    let text = ''
+    await runtime.runTurn(
+      nativeTurnContext({ threadId: `thread-${name}`, cwd: tmp, ...overrides }),
+      {
+        onEvent: (event) => {
+          if (event.type === 'text_delta') text += event.delta
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+    return JSON.parse(text)
+  }
+  try {
+    const [readOnly, workspace, fullAccess, pinned] = await Promise.all([
+      run(false, 'read-only', { approvalPolicy: 'never', sandboxMode: 'read-only' }),
+      run(false, 'workspace', { approvalPolicy: 'never', sandboxMode: 'workspace-write' }),
+      run(false, 'full-access', {
+        approvalPolicy: 'on-request',
+        sandboxMode: 'danger-full-access',
+      }),
+      run(true, 'pinned', { approvalPolicy: 'never', sandboxMode: 'read-only' }),
+    ])
+    // Read-only keeps to the read tools it pre-approves.
+    assert.deepEqual(readOnly, {
+      allowed: 'Read,Glob,Grep,WebSearch,WebFetch,TodoWrite,Task',
+      skip: false,
+    })
+    assert.equal(workspace.skip, true)
+    assert.equal(fullAccess.skip, true)
+    // The runtime's own skip-permissions setting still wins.
+    assert.equal(pinned.skip, true)
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
 test('claude-p runtime timeout terminates spawned process tree', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-timeout-test-'))
   const command = join(tmp, 'hanging-claude-p.mjs')
@@ -3990,4 +4130,27 @@ test('native SDK sends desktop presentation guidance on fresh and resumed turns'
     assert.match(options.systemPrompt.append, /fenced Mermaid diagrams/)
     assert.match(options.systemPrompt.append, /Answer in Chinese\./)
   }
+})
+
+test('native SDK runtime forwards file checkpointing only when enabled', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  for (const enabled of [true, false, undefined]) {
+    const context = nativeTurnContext({ enableFileCheckpointing: enabled === true })
+    if (enabled === undefined) Reflect.deleteProperty(context, 'enableFileCheckpointing')
+    const options = buildOptions.call(runtime, {}, context, new AbortController(), () => null)
+    if (enabled) assert.equal(options.enableFileCheckpointing, true)
+    else assert.equal(Object.hasOwn(options, 'enableFileCheckpointing'), false)
+  }
+})
+
+test('file checkpointing changes the session signature when toggled', () => {
+  const disabled = sessionSignature(nativeTurnContext({ enableFileCheckpointing: false }))
+  const unset = nativeTurnContext()
+  Reflect.deleteProperty(unset, 'enableFileCheckpointing')
+  const omitted = sessionSignature(unset)
+  const enabled = sessionSignature(nativeTurnContext({ enableFileCheckpointing: true }))
+  assert.equal(disabled, omitted)
+  assert.notEqual(enabled, disabled)
+  assert.notEqual(enabled, omitted)
 })

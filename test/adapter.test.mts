@@ -22,6 +22,7 @@ import type { ProviderLoopConfigProjectionResult } from '../src/provider-loop-co
 import { QUIET_TURN_HEARTBEAT } from '../src/quiet-turns.mjs'
 import { fileChangeFromTool } from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
+import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
 const shim = resolve('scripts/codex-shim')
@@ -5664,6 +5665,42 @@ test('Codex App approvalPolicy=never + sandbox=danger-full-access auto-accepts t
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
+})
+
+test('approvalPolicy=never with a read-only sandbox runs reads and refuses the rest without a card', async () => {
+  const decisions: Array<[string, string]> = []
+  const calls: Array<[string, Record<string, unknown>]> = [
+    ['Bash', { command: 'rm -rf build' }],
+    ['Write', { file_path: '/etc/hosts', content: '' }],
+    ['Read', { file_path: '/etc/hosts' }],
+  ]
+  const runtime = scriptedRuntime(async (_context, handlers) => {
+    for (const [toolName, input] of calls) {
+      const decision = await handlers.onPermissionRequest({
+        type: 'permission_request',
+        requestId: `perm-${toolName}`,
+        toolUseId: `tool-${toolName}`,
+        toolName,
+        input,
+      })
+      decisions.push([toolName, decision.decision])
+    }
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread({ approvalPolicy: 'never', sandbox: 'read-only' })
+    const turnId = await app.startTurn(threadId, 'look around')
+    assert.equal((await app.turnCompleted(turnId)).status, 'completed')
+    assert.deepEqual(decisions, [
+      ['Bash', 'decline'],
+      ['Write', 'decline'],
+      ['Read', 'accept'],
+    ])
+    assert.deepEqual(
+      app.messages.filter((message) => /requestApproval$/.test(message.method ?? '')),
+      [],
+    )
+  })
 })
 
 test('Task subagent emits the canonical activity lifecycle and leaves wait as the terminal display state', async () => {
@@ -13797,6 +13834,109 @@ test('direct MCP requests use thread cwd and separate status caches by project',
       })
       assert.equal(resource.contents[0].text, 'resource-ok')
     }
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('TTY process/spawn drains output and reports child exit status without process/kill', {
+  timeout: 20_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-pty-exit-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const cases = [
+      { command: ['sh', '-c', 'printf bye; exit 3'], code: 3, output: 'bye' },
+      { command: ['sh', '-c', 'kill -TERM $$'], code: 143, output: '' },
+      { command: ['/definitely/missing/claude-codex-pty-test'], code: 127, output: '' },
+    ]
+    for (const [index, scenario] of cases.entries()) {
+      const processHandle = `tty-exit-${index}`
+      proc.stdin.write(
+        json({
+          id: index + 1,
+          method: 'process/spawn',
+          params: {
+            processHandle,
+            command: scenario.command,
+            tty: true,
+            streamStdoutStderr: false,
+          },
+        }),
+      )
+      await reader.nextResponse(index + 1)
+      const messages = await readUntil(
+        reader,
+        (message) =>
+          message.method === 'process/exited' && message.params.processHandle === processHandle,
+      )
+      const exited = messages.at(-1)?.params
+      assert.equal(exited.exitCode, scenario.code)
+      const output = messages
+        .filter((message) => message.method === 'process/outputDelta')
+        .map((message) => Buffer.from(message.params.deltaBase64, 'base64').toString('utf8'))
+        .join('')
+      assert.equal(output, scenario.output)
+    }
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('TTY process/spawn closeStdin stops a same-group descendant that outlives the leader', {
+  timeout: 20_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-pty-close-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const processHandle = 'tty-close'
+    const script = [
+      'import os, signal, time',
+      'signal.signal(signal.SIGHUP, signal.SIG_IGN)',
+      'leader = os.getpid()',
+      'if os.fork() == 0:',
+      '    while os.getppid() == leader:',
+      '        time.sleep(0.02)',
+      "    os.write(1, b'orphaned')",
+      '    time.sleep(30)',
+      '    os._exit(0)',
+      'os._exit(3)',
+    ].join('\n')
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'process/spawn',
+        params: {
+          processHandle,
+          command: ['python3', '-c', script],
+          tty: true,
+          streamStdoutStderr: false,
+        },
+      }),
+    )
+    await reader.nextResponse(1)
+    await readUntil(
+      reader,
+      (message) =>
+        message.method === 'process/outputDelta' &&
+        message.params.processHandle === processHandle &&
+        Buffer.from(message.params.deltaBase64, 'base64').toString('utf8').includes('orphaned'),
+    )
+    const started = Date.now()
+    proc.stdin.write(
+      json({ id: 2, method: 'process/writeStdin', params: { processHandle, closeStdin: true } }),
+    )
+    const messages = await readUntil(
+      reader,
+      (message) =>
+        message.method === 'process/exited' && message.params.processHandle === processHandle,
+    )
+    assert.equal(messages.at(-1)?.params.exitCode, 3)
+    assert.ok(Date.now() - started < 5_000)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
