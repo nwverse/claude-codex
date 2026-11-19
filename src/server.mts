@@ -9801,10 +9801,14 @@ export class CodexClaudeAppServer {
   }
 
   private getConversationSummary(params: Record<string, unknown>): unknown {
+    // The v1 request matches rolloutPath first when a client sends both
+    // selectors. Adapter threads are indexed by id and have no rollout path.
+    if (typeof params.rolloutPath === 'string') throw unknownThread(params.rolloutPath)
     const threadId = stringOr(params.conversationId, '')
+    if (!threadId)
+      throw invalidRequest('getConversationSummary requires a conversationId or rolloutPath')
     const thread = this.store.getThread(threadId)
-    // Threads here have no rollout file, so a rolloutPath names none of them.
-    if (!thread) throw unknownThread(threadId || stringOr(params.rolloutPath, ''))
+    if (!thread) throw unknownThread(threadId)
     return {
       summary: {
         conversationId: thread.id,

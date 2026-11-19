@@ -1844,18 +1844,24 @@ test('threads carry the git info of their workspace without listing running git'
 
 test('getConversationSummary refuses a thread it does not know and dates one it does', async () => {
   await withServer(async (server) => {
-    // The newest thread, whose summary an unknown id must not get.
-    const threadId = await server.startThread()
-    const refused = (params: Record<string, unknown>, id: string) =>
+    const refused = (params: Record<string, unknown>, message: string) =>
       assert.rejects(server.request('getConversationSummary', params), (error: unknown) => {
         assert.ok(error instanceof RpcError)
         assert.equal(error.code, -32600)
-        assert.equal(error.message, `unknown thread: ${id}`)
+        assert.equal(error.message, message)
         return true
       })
-    await refused({ conversationId: 'nope' }, 'nope')
-    // Threads here have no rollout file, so no rollout path names one.
-    await refused({ rolloutPath: '/nope/rollout.jsonl' }, '/nope/rollout.jsonl')
+    await refused({ conversationId: 'nope' }, 'unknown thread: nope')
+    // A request for a different thread must also fail once the store is populated.
+    const threadId = await server.startThread()
+    await refused({ conversationId: 'nope' }, 'unknown thread: nope')
+    const rolloutPath = '/nope/rollout.jsonl'
+    await refused({ rolloutPath }, `unknown thread: ${rolloutPath}`)
+    await refused({ rolloutPath, conversationId: threadId }, `unknown thread: ${rolloutPath}`)
+    // This legacy method uses conversationId. A v2 threadId does not select a thread.
+    for (const params of [{}, { threadId }]) {
+      await refused(params, 'getConversationSummary requires a conversationId or rolloutPath')
+    }
 
     // The thread's own times, which are whole seconds, not the request's.
     await delay(1100)
