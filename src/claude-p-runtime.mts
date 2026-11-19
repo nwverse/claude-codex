@@ -1,7 +1,8 @@
-import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
+import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { autoCompactWindowEnv } from './auto-compact.mjs'
 import { autoMemoryEnv } from './memories.mjs'
 import { flatPrompt } from './turn-context.mjs'
@@ -17,6 +18,8 @@ export interface ClaudePRuntimeOptions {
 }
 
 const READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch', 'TodoWrite', 'Task']
+
+const execFileAsync = promisify(execFile)
 
 export class ClaudePTranscriptRuntime implements ClaudeRuntime {
   private active = new Map<string, ChildProcess>()
@@ -91,16 +94,18 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
   async interrupt(threadId: string): Promise<void> {
     const child = this.active.get(threadId)
     if (!child) return
-    terminateProcessTree(child, 'SIGINT')
+    const treePids = await terminateProcessTree(child, 'SIGINT')
     setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null)
-        terminateProcessTree(child, 'SIGTERM')
+      // The leader usually exits on SIGINT before this fires; the follow-up
+      // must still reach whatever is left of the tree (see #263).
+      void terminateProcessTree(child, 'SIGTERM', treePids)
     }, 1500).unref()
   }
 
   async stop(): Promise<void> {
-    for (const child of this.active.values()) terminateProcessTree(child, 'SIGTERM')
+    const children = [...this.active.values()]
     this.active.clear()
+    await Promise.all(children.map((child) => terminateProcessTree(child, 'SIGTERM')))
   }
 
   private argsForContext(context: RuntimeTurnContext, inputFile: string): string[] {
@@ -127,9 +132,11 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     // route passes them; claude-p hands the flag on to Claude Code.
     if (context.disallowedTools && context.disallowedTools.length > 0)
       args.push('--disallowedTools', context.disallowedTools.join(','))
+    // A read-only thread that never asks keeps to the read tools allowed
+    // above: skipping permissions would let every other tool run too.
     if (
       this.options.skipPermissions ||
-      context.approvalPolicy === 'never' ||
+      (context.approvalPolicy === 'never' && context.sandboxMode !== 'read-only') ||
       context.sandboxMode === 'danger-full-access'
     ) {
       args.push('--dangerously-skip-permissions')
@@ -167,21 +174,27 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
       let killTimer: NodeJS.Timeout | null = null
       const timeout = setTimeout(() => {
         timedOut = true
-        terminateProcessTree(child, 'SIGTERM')
-        killTimer = setTimeout(() => {
-          if (child.exitCode === null && child.signalCode === null)
-            terminateProcessTree(child, 'SIGKILL')
-        }, 1500).unref()
+        void terminateProcessTree(child, 'SIGTERM').then((treePids) => {
+          killTimer = setTimeout(() => {
+            // Escalate whether or not the leader has exited by now: it
+            // normally exits on SIGTERM well within the grace period, but
+            // descendants that trapped SIGTERM are still alive (see #263).
+            void terminateProcessTree(child, 'SIGKILL', treePids)
+          }, 1500).unref()
+        })
       }, this.options.timeoutMs)
       child.once('error', (error) => {
         clearTimeout(timeout)
-        if (killTimer) clearTimeout(killTimer)
+        if (killTimer && !timedOut) clearTimeout(killTimer)
         this.active.delete(threadId)
         reject(error)
       })
       child.once('close', (code) => {
         clearTimeout(timeout)
-        if (killTimer) clearTimeout(killTimer)
+        // On the timeout path the escalation must survive `close`: the
+        // leader exiting (and its stdio closing) is what used to cancel
+        // the SIGKILL. On a normal exit there is no kill timer to keep.
+        if (killTimer && !timedOut) clearTimeout(killTimer)
         this.active.delete(threadId)
         if (timedOut) {
           reject(new Error(`claude-p timed out after ${this.options.timeoutMs}ms`))
@@ -240,10 +253,20 @@ function isClaudePTimeoutError(error: unknown): boolean {
   return error instanceof Error && /^claude-p timed out after \d+ms$/.test(error.message)
 }
 
-function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (child.exitCode !== null || child.signalCode !== null) return
-  const childPids = child.pid ? descendantPids(child.pid) : []
-  for (const pid of childPids.reverse()) {
+async function terminateProcessTree(
+  child: ChildProcess,
+  signal: NodeJS.Signals,
+  knownDescendants: number[] = [],
+): Promise<number[]> {
+  // Kill descendants deepest first, then the process group, then the leader.
+  // Callers pass the snapshot taken while the leader was alive; while the
+  // leader is still alive, union it with a fresh snapshot (it may have
+  // spawned more since). Once Node has reaped the leader, skip the fresh
+  // snapshot and the leader kill because its PID may be reused; the group
+  // kill stays because a PGID is not reused while members survive (see #263).
+  const fresh = leaderAlive(child) && child.pid ? await descendantPids(child.pid) : []
+  const childPids = [...new Set([...knownDescendants, ...fresh])]
+  for (const pid of [...childPids].reverse()) {
     killPid(pid, signal)
   }
   if (process.platform !== 'win32' && child.pid) {
@@ -251,7 +274,13 @@ function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void
       process.kill(-child.pid, signal)
     } catch {}
   }
-  killPid(child.pid, signal)
+  // Asked again: the leader may have been reaped while `ps` ran.
+  if (leaderAlive(child)) killPid(child.pid, signal)
+  return childPids
+}
+
+function leaderAlive(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null
 }
 
 function killPid(pid: number | undefined, signal: NodeJS.Signals): void {
@@ -261,10 +290,20 @@ function killPid(pid: number | undefined, signal: NodeJS.Signals): void {
   } catch {}
 }
 
-function descendantPids(rootPid: number): number[] {
+// `ps -eo` lists every process on the host. On a busy Mac (1500+ processes,
+// load well above the core count) that can take several seconds, so run it
+// without blocking the event loop and give it time: a snapshot that times out
+// comes back empty, and then a timeout or interrupt never reaches descendants
+// that started their own process group.
+const PS_TIMEOUT_MS = 10_000
+
+async function descendantPids(rootPid: number): Promise<number[]> {
   if (process.platform === 'win32') return []
   try {
-    const output = execFileSync('ps', ['-eo', 'pid=,ppid='], { encoding: 'utf8', timeout: 1000 })
+    const { stdout: output } = await execFileAsync('ps', ['-eo', 'pid=,ppid='], {
+      encoding: 'utf8',
+      timeout: PS_TIMEOUT_MS,
+    })
     const children = new Map<number, number[]>()
     for (const line of output.split(/\r?\n/)) {
       const parts = line.trim().split(/\s+/)

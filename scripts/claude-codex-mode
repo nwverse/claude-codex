@@ -113,23 +113,30 @@ rewrite_env_value() {
   local value="$2"
   python3 - "$ENV_FILE" "$key" "$value" <<'PY'
 import pathlib
+import shlex
 import sys
 
 path = pathlib.Path(sys.argv[1])
 key = sys.argv[2]
 value = sys.argv[3]
+# The file is rewritten line by line, so a value must stay on one line.
+if value.splitlines() not in ([], [value]):
+    sys.exit(f"refusing to write {key}: the value contains a line break")
+# Quoted for the shell: the shim and this script source the file, and must
+# read a model or cwd back as written, without expanding or running any of it.
+entry = f"export {key}={shlex.quote(value)}"
 lines = path.read_text().splitlines() if path.exists() else []
 out = []
 seen = False
 prefixes = (f"export {key}=", f"{key}=")
 for line in lines:
     if line.startswith(prefixes):
-        out.append(f'export {key}="{value}"')
+        out.append(entry)
         seen = True
     else:
         out.append(line)
 if not seen:
-    out.append(f'export {key}="{value}"')
+    out.append(entry)
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text("\n".join(out) + "\n")
 PY
@@ -338,14 +345,13 @@ prune_bridge_pool() {
   done < <(pool_dirs)
 }
 
+# Prints the pooled bridge log of <mode> written to most recently, or nothing.
 latest_bridge_log() {
   local mode="$1"
-  local dir newest=""
+  local dir
   while IFS= read -r dir; do
-    [ -f "$dir/log" ] || continue
-    newest="$dir/log"
-  done < <(for dir in $(pool_dirs "$mode"); do [ -d "$dir" ] && printf '%s\n' "$dir"; done | sort_by_mtime)
-  printf '%s\n' "$newest"
+    if [ -f "$dir/log" ]; then printf '%s\n' "$dir/log"; fi
+  done < <(pool_dirs "$mode") | sort_by_mtime | awk 'NR == 1'
 }
 
 sort_by_mtime() {
@@ -365,15 +371,31 @@ stop_pidfile() {
   if [ ! -f "$file" ]; then return 0; fi
   local pid
   pid="$(cat "$file" 2>/dev/null || true)"
+  # Only a real pid: 0 or a negative value would signal a whole process group.
+  case "$pid" in
+    '' | *[!0-9]* | 0 | 1) rm -f "$file"; return 0 ;;
+  esac
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true
-    for _ in $(seq 1 30); do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 0.1
-    done
-    kill -TERM "$pid" 2>/dev/null || true
+    if ! wait_pid_exit "$pid" 30; then
+      # Still running after 3s: force it, so the port and pidfile are not
+      # left to a process nothing tracks any more.
+      kill -KILL "$pid" 2>/dev/null || true
+      wait_pid_exit "$pid" 20 || echo "pid $pid did not exit after SIGKILL" >&2
+    fi
   fi
   rm -f "$file"
+}
+
+# Waits up to <tries> x 0.1s for <pid> to exit; fails if it is still running.
+wait_pid_exit() {
+  local pid="$1"
+  local tries="$2"
+  for _ in $(seq 1 "$tries"); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  ! kill -0 "$pid" 2>/dev/null
 }
 
 stop_adapter() {
@@ -391,9 +413,10 @@ stop_adapter() {
       fi
       sleep 0.1
     done
+    # Anything left ignored SIGTERM for 3s: force it.
     while read -r pid; do
       [ -n "$pid" ] || continue
-      kill -TERM "$pid" 2>/dev/null || true
+      kill -KILL "$pid" 2>/dev/null || true
     done < <(app_server_pids)
     echo "app-server stopped; Codex App Remote will start the new route on reconnect."
   else

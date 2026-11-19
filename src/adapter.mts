@@ -1,16 +1,17 @@
 #!/usr/bin/env node
-import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { APP_PLUGIN_SERVER_ENV, setAppPluginConfigOverrides } from './app-plugin-mcp.mjs'
 import { sweepCliMcpConfigs } from './cli-mcp-config.mjs'
 import { reapOrphanedCliChildren } from './cli-orphans.mjs'
-import { daemonProbe, startupConfigProbe } from './cli-probes.mjs'
+import { daemonProbe, listening, startupConfigProbe } from './cli-probes.mjs'
 import { inheritedHooksWarning } from './inherited-config.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
 import { SessionStore } from './store.mjs'
 import {
   normalizeListenUrl,
+  parseListenUrl,
   parseProxySockArg,
   prepareWebSocketAuth,
   type RunningTransport,
@@ -27,7 +28,7 @@ import { debugLog, defaultSocketPath, ensureParent, sleep } from './util.mjs'
 // the daemon — observed as pid churn (one daemon process per few minutes)
 // with no error trace in debug.jsonl. Logging here puts the cause on disk
 // AND keeps the daemon alive so the App's reconnect is a no-op.
-process.on('uncaughtException', (error: unknown) => {
+function onUncaughtException(error: unknown): void {
   const err = error as NodeJS.ErrnoException
   const code = err?.code ?? null
   const isExpected = code === 'EPIPE' || code === 'ECONNRESET' || code === 'EBADF'
@@ -39,13 +40,17 @@ process.on('uncaughtException', (error: unknown) => {
   })
   // EPIPE/ECONNRESET from peer disconnects are routine; swallow them so the
   // daemon keeps serving other peers. Anything else: re-throw on next tick to
-  // preserve normal error semantics (and we already logged it).
+  // preserve normal error semantics (and we already logged it). The listener
+  // comes off first: a throw it is still listening for comes straight back
+  // here, and the process would log and re-throw forever instead of exiting.
   if (!isExpected) {
+    process.off('uncaughtException', onUncaughtException)
     setImmediate(() => {
       throw error
     })
   }
-})
+}
+process.on('uncaughtException', onUncaughtException)
 process.on('unhandledRejection', (reason: unknown) => {
   const err = reason as NodeJS.ErrnoException
   debugLog('adapter.unhandledRejection', {
@@ -88,7 +93,8 @@ async function main(): Promise<void> {
 
   const proxyIndex = args.indexOf('proxy')
   if (proxyIndex >= 0) {
-    await runProxy(parseProxySockArg(args.slice(proxyIndex + 1)))
+    const socketPath = checkOptions(() => parseProxySockArg(args.slice(proxyIndex + 1)))
+    await runProxy(socketPath)
     return
   }
 
@@ -97,7 +103,7 @@ async function main(): Promise<void> {
     return
   }
 
-  const listen = getArg(args, '--listen') ?? 'stdio://'
+  const listen = checkOptions(() => listenArg(args))
   if (listen === 'off') return
   const wsAuth = {
     auth: getArg(args, '--ws-auth'),
@@ -109,6 +115,8 @@ async function main(): Promise<void> {
   // Before anything else starts, so a listener that would be unprotected
   // fails without touching the store or other processes.
   const preparedWsAuth = checkOptions(() => {
+    const normalizedListen = normalizeListenUrl(listen)
+    if (normalizedListen !== 'stdio://') parseListenUrl(normalizedListen)
     if (
       !listen.startsWith('ws://') &&
       (allowUnauthenticated || Object.values(wsAuth).some((value) => value !== null))
@@ -125,7 +133,7 @@ async function main(): Promise<void> {
   const isUnixDaemon = listen.startsWith('unix://')
   let pidFile: string | null = null
   if (isUnixDaemon) {
-    pidFile = ensureSingleUnixDaemon(listen)
+    pidFile = await ensureSingleUnixDaemon(listen)
   }
 
   const store = new SessionStore()
@@ -277,6 +285,16 @@ function checkOptions<T>(check: () => T): T {
   }
 }
 
+// The --listen value, stdio:// when the flag is absent. `--listen` with no
+// value, or followed by another flag, is an error rather than a silent stdio://.
+function listenArg(args: string[]): string {
+  const value = getArg(args, '--listen')
+  if (args.includes('--listen') && (value === null || value.startsWith('-'))) {
+    throw new Error('--listen needs a value')
+  }
+  return value ?? 'stdio://'
+}
+
 function getArg(args: string[], name: string): string | null {
   const index = args.indexOf(name)
   if (index >= 0) return args[index + 1] ?? null
@@ -297,19 +315,23 @@ function configArgs(args: string[]): string[] {
   return values
 }
 
-function ensureSingleUnixDaemon(listen: string): string {
+// How long after writing its pid file a starting daemon may take to listen.
+// A younger pid file whose process is alive counts as a daemon on its way up.
+const DAEMON_STARTUP_GRACE_MS = 10_000
+
+async function ensureSingleUnixDaemon(listen: string): Promise<string> {
   const socketPath = listen === 'unix://' ? defaultSocketPath() : listen.slice('unix://'.length)
   const pidFile = `${socketPath}.pid`
   ensureParent(socketPath)
-  if (existsSync(pidFile)) {
-    const pid = Number(readFileSync(pidFile, 'utf8'))
-    if (Number.isFinite(pid) && processIsAlive(pid)) {
-      process.stderr.write(
-        `[claude-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`,
-      )
-      process.exit(0)
-    }
+  const pid = readDaemonPid(pidFile)
+  if (pid !== null && (await daemonIsRunning(pid, socketPath, pidFile))) {
+    process.stderr.write(
+      `[claude-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`,
+    )
+    process.exit(0)
   }
+  // Anything else is a stale file: empty or truncated by a crash, or a pid
+  // the system has since handed to another process. This daemon replaces it.
   try {
     if (existsSync(socketPath)) unlinkSync(socketPath)
   } catch {}
@@ -318,6 +340,42 @@ function ensureSingleUnixDaemon(listen: string): string {
     chmodSync(dirname(socketPath), 0o700)
   } catch {}
   return pidFile
+}
+
+// The pid in the file, or null when it is missing or could not name another
+// daemon. Number('') is 0, and kill(0) or kill(-n) signals a process group,
+// so only a plain positive pid other than init and this process counts.
+function readDaemonPid(pidFile: string): number | null {
+  let text: string
+  try {
+    text = readFileSync(pidFile, 'utf8').trim()
+  } catch {
+    return null
+  }
+  if (!/^\d+$/.test(text)) return null
+  const pid = Number(text)
+  return Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid ? pid : null
+}
+
+// A live pid alone may be a recycled one, so the socket has to accept a
+// connection too. A daemon that wrote its pid file moments ago may still be
+// starting; give it until the grace window ends to begin listening.
+async function daemonIsRunning(pid: number, socketPath: string, pidFile: string): Promise<boolean> {
+  let writtenAt: number
+  try {
+    writtenAt = statSync(pidFile).mtimeMs
+  } catch {
+    return false
+  }
+  // A pid file dated in the future (clock stepped back, network file system)
+  // gets one grace window from now, not until its date comes round.
+  const deadline = Math.min(writtenAt, Date.now()) + DAEMON_STARTUP_GRACE_MS
+  for (;;) {
+    if (!processIsAlive(pid)) return false
+    if (await listening(socketPath)) return true
+    if (Date.now() >= deadline) return false
+    await sleep(200)
+  }
 }
 
 function processIsAlive(pid: number): boolean {

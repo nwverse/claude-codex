@@ -1,6 +1,6 @@
 import { defineConfig } from 'vitepress'
 
-const repo = 'https://github.com/fuergaosi233/claude-codex'
+const repo = 'https://github.com/nwverse/claude-codex'
 
 export default defineConfig({
   title: 'Claude Codex Adapter',
@@ -9,7 +9,6 @@ export default defineConfig({
   base: '/claude-codex/',
   lastUpdated: true,
   cleanUrls: true,
-  ignoreDeadLinks: true,
   head: [['meta', { name: 'theme-color', content: '#d97757' }]],
   themeConfig: {
     nav: [

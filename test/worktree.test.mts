@@ -30,7 +30,17 @@ test('auto worktree creates and then reuses an existing per-thread worktree', as
     execFileSync('git', ['add', 'README.md'], { cwd: repo })
     execFileSync(
       'git',
-      ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'],
+      [
+        '-c',
+        'user.name=Test',
+        '-c',
+        'user.email=test@example.com',
+        '-c',
+        'commit.gpgsign=false',
+        'commit',
+        '-m',
+        'init',
+      ],
       { cwd: repo, stdio: 'ignore' },
     )
 

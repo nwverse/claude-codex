@@ -36,8 +36,29 @@ versioning or publishing metadata.
 - A refused listener or another bad listener option ends the adapter with
   exit code 1 and the message alone, without a stack trace.
 
+### Isolated launcher
+
+- New `claude-codex-isolated` bin
+  (`node dist/src/isolated-launch.mjs --state-dir PATH [--port PORT]`) runs a
+  foreground adapter on a loopback `ws://` port. It keeps its own Codex home,
+  adapter state, logs and capability token (token auth is on by default), so a
+  chosen native `codex --remote` CLI can use Claude while Orca and other
+  `codex app-server` clients keep their native route. The SSH shim is
+  unchanged.
+
 ### Failures you can see and act on
 
+- A turn in a GPT chat (the `codex-proxy` route) now hands its prompt to
+  `codex exec` on stdin instead of as the last argument. A message that
+  starts with `-` or `--` no longer fails as an unknown `codex` flag, and a
+  prompt over 128 KiB (a pasted log, a large injected context) no longer fails
+  with `spawn E2BIG` on Linux.
+- A message sent to steer a running turn in an `agent-http` or `agentapi`
+  chat no longer jumps ahead of the turn's own prompt. A steer that arrived
+  while the turn was still starting was posted before the prompt, possibly to
+  the unmanaged base URL instead of the turn's bridge, and was reported as
+  delivered. It now waits until the prompt is posted and goes to the turn's
+  bridge. A steer for a chat with no running turn is no longer posted.
 - A turn that fails after the computer slept for a minute or more since
   Claude last made progress in it says so in its error: roughly how long the
   computer slept, that this broke Claude's connection to the model, and that a
@@ -111,6 +132,12 @@ versioning or publishing metadata.
   not found, a name, roots or metadata it refuses), whose text the App
   matches; a bad project cursor or an empty `idempotencyKey` is an invalid
   request.
+- `thread/turns/list`, `thread/turns/items/list`, `thread/items/list`,
+  `thread/timeline/list`, `thread/name/set`, `thread/archive`,
+  `thread/goal/get` and `turn/interrupt` refuse an unknown thread with
+  `unknown thread: <id>` (`-32600`) too. They used to answer an empty page,
+  `{goal: null}` or `{}`; a rename or archive still sent its notification,
+  and an interrupt left the caller subscribed to a thread that did not exist.
 - Model process profiles that fail to load fail with one line of at most 300
   characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
   what is wrong. The message used to carry the JSON parser's excerpt of the
@@ -118,6 +145,17 @@ versioning or publishing metadata.
   `defaultModel` value that was not valid. A model change from the menu or
   `turn/settings/update` that fails on them is now an invalid request
   (`-32600`) like one from `turn/start`, so the toast shows the reason.
+- A `CLAUDE_CODEX_MCP_SERVERS` value (or the file it names) that is not valid
+  JSON fails with a message that names the source and says what is wrong,
+  quoting none of its text. The `CLAUDE_CODEX_MCP_SERVERS` server status in
+  the App and the debug log used to carry the JSON parser's excerpt of it,
+  which could include a credential; JSON wrapped in quotes was echoed whole
+  as a file that was not found.
+- `claude-codex-mode logs agent-http|agentapi` and `tail agent-http|agentapi`
+  show the pooled bridge log written to most recently. They used to show the
+  oldest one, so the log a failed bridge start pointed you to was usually
+  another bridge's.
+  They also find pooled logs when `CLAUDE_CODEX_STATE_DIR` contains a space.
 - A workflow agent that fails (one that stalled on every attempt, or hit an
   API error) ends its thread's turn as failed, with the reason the workflow
   reported, and counts as a failed subagent of its parent. It used to show as
@@ -125,12 +163,76 @@ versioning or publishing metadata.
   workflow ran again after a stall ends as failed too, as soon as the next
   attempt starts, saying the workflow ran the agent again, instead of staying
   open. Claude Code's progress report does not keep that attempt's own error.
+- The `codex` shim no longer runs itself in an endless loop when its `PATH`
+  directory is a symlink, when it is on `PATH` twice (also as another version
+  of it), or when `CODEX_REAL` names a shim: it passes over every copy of
+  itself, runs the real Codex CLI later on `PATH`, or exits 127 and says to
+  set `CODEX_REAL`. `claude-codex-mode set` and `model` shell-quote the model
+  and bridge cwd they write to `runtime.env`, so `$`, quotes and backticks in
+  them are read back as written instead of being expanded or run each time
+  the shim sources the file, and a value with a line break is refused.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.
+- `claude-codex-mode` force-kills (SIGKILL) a pooled bridge or an app-server
+  that is still running 3 seconds after SIGTERM. It used to send SIGTERM a
+  second time, then drop the bridge's pidfile anyway, which left a bridge
+  holding its port that `status`, `stop-bridges` and `prune-bridges` could no
+  longer see, and `set` reported the app-server stopped while it still ran.
+- An unexpected error the adapter does not catch now ends it with exit code 1
+  and the stack on stderr, logged once in `debug.jsonl`, so whatever started
+  it can start it again. The adapter used to log and re-throw the same error
+  forever, so it kept running in whatever state the error left it in, busy
+  writing thousands of `adapter.uncaughtException` lines a second to
+  `debug.jsonl`. Errors from a peer that went away (`EPIPE`, `ECONNRESET`,
+  `EBADF`) are still logged and ignored.
 
 ### App-server and protocol compatibility
 
+- Untracked symlinks show in the turn diff as `new file mode 120000` entries
+  whose content is the link target, as `git diff` shows them. The adapter no
+  longer reads through a link, so a file outside the workspace no longer leaks
+  into the diff and a link to a device such as `/dev/zero` no longer hangs it;
+  a dangling or directory link, an embedded repository or an unreadable file
+  no longer empties the untracked part of the diff.
+- With the `codex` shim on `PATH`, `codex app-server generate-ts` and
+  `generate-json-schema` (and so `npm run generate:schema`) go to the real
+  Codex CLI (`CODEX_REAL`). They used to start an adapter app-server on stdio
+  that never wrote the bindings; without a real codex the shim now exits 127
+  and says to set `CODEX_REAL`.
+- `thread/list` now filters by `searchTerm` (thread name or preview) and
+  `excludedThreadIds`, and the exclusion applies before the page limit. A
+  malformed or oversized (more than 100) `excludedThreadIds` returns
+  `invalidRequest`, for `thread/search` too.
+- A symlink under `.claude/rules` or `.claude/agents` that points back up the
+  tree (such as `a -> .`) no longer stalls the adapter. Starting, resuming or
+  forking a Claude thread in such a project used to block every other request
+  for seconds and then fail with `Maximum call stack size exceeded`. Each
+  folder is now read once, by its real path, and its rules and agents load as
+  usual.
+- `fs/watch` follows Codex: it keeps the path the client sent instead of its
+  realpath, watches a file (such as `.git/HEAD`) through its directory so the
+  watch survives git's lock-file rename and reports the file's own path, accepts
+  a file that does not exist yet, coalesces each watch's events over 200 ms,
+  and refuses a `watchId` already in use on the same connection with
+  `watchId already exists: <id>`. Watch ids are per connection, and a closed
+  connection's watches are dropped.
+- A `command/exec` that hits `timeoutMs` now stops its whole process group
+  (SIGTERM, then SIGKILL after 1 s) and reports `exitCode` 124. The reply comes
+  when the command exits plus at most a 2 s output drain, so a backgrounded
+  child no longer holds it. `command/exec/terminate` stops the group too.
+- Streamed `command/exec` output (`streamStdoutStderr` or `tty`) now honors
+  `outputBytesCap`, including its 1,000,000-byte default, as Codex does: each
+  stream is cut at the cap, the delta that reaches it carries `capReached:
+  true`, and later data on that stream is dropped while the process keeps
+  running. `disableOutputCap` keeps streaming everything.
+- When a client disconnects from a `unix://` or `ws://` adapter, the
+  terminals (`process/spawn`) and `command/exec` processes it started are
+  stopped, as `codex app-server` does, and their handles are free again at
+  once; other clients keep theirs. They used to run on after every App
+  reconnect, holding their handles, and a terminal without a pty even outlived
+  the adapter. A stopping adapter now ends the terminals still open, and
+  `process/kill` follows up with SIGKILL when a process ignores SIGTERM.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the
@@ -210,12 +312,27 @@ versioning or publishing metadata.
   in progress in the App.
 - The adapter stops Claude CLI processes a previous adapter on the same state
   dir left running, matching pid, start time and command line before
-  signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off).
+  signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off). Start times
+  are read in UTC and the C locale, so two adapters with a different `TZ`
+  (an App launch and a shell) no longer drop a live sibling's record or miss
+  a killed adapter's Claude CLI.
+- On a busy machine, a `claude-p` turn that times out or is interrupted stops
+  the processes it started in their own process group too. Listing the
+  process tree (`ps`) gave up after 1 s, which a loaded Mac with a thousand
+  or more processes often needs, and the stop then reached only the
+  `claude-p` process; the list now runs without blocking the adapter and
+  gets 10 s.
 - A second adapter started on the same state dir (a startup probe, another
   window) no longer fails the turns a running adapter is still working on.
   Each turn records the process that wrote it, by pid and start time, and
   startup recovery fails only the turns of processes that are gone; turns
   written before this change are recovered as before.
+- Opening the state database no longer rewrites thread rows. The startup
+  repairs for pin state and legacy enum values rewrote every unsectioned
+  thread on each open and scanned the instruction text; they now check with
+  a read first and touch only rows that need fixing, so a clean store opens
+  without a write or the write lock (about 20 ms instead of 320-370 ms for
+  20,000 threads with large instructions).
 - `app-server --print-startup-config` (codex 0.164) prints its one JSON line
   (`appServerVersion` and `configRequirements`) and exits, and
   `app-server daemon version` reports the unix daemon listening on the control
@@ -230,6 +347,13 @@ versioning or publishing metadata.
   explicit `--listen unix://PATH` or `proxy --sock PATH` still wins. Both
   commands read it, so set it where both run. The daemon makes the socket's
   folder private to the user, so give the socket a folder of its own.
+- `app-server proxy` takes `--sock=PATH` as well as `--sock PATH`; a `--sock`
+  with no path is an error instead of quietly using the default socket. A
+  bad `--listen` (`tcp://...`, `ws://host:abc`, or `--listen` with no value)
+  now fails with one line before the state database opens, instead of a
+  stack trace after it, or a silent `stdio://`. The unix daemon no longer
+  refuses to start over a pid file that is empty, holds `0`, or names a
+  process that is not listening on the socket.
 - With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
   Code processes one at a time: a new session waits until the previous
   launch has sent its first SDK message, has ended, or has held the slot for
@@ -405,7 +529,7 @@ versioning or publishing metadata.
   with an `exitedReviewMode` item that carries Claude's answer, or Codex's
   fallback text when there is none, also when the review is interrupted,
   fails or is cut off by the adapter stopping, as Codex does.
-- The Claude Agent SDK is 0.3.304, which bundles Claude Code 2.1.304. The
+- The Claude Agent SDK is 0.3.322, which bundles Claude Code 2.1.322. The
   adapter always passes a permission mode, so the CLI's changed default for
   SDK sessions without one does not reach Claude threads.
 - Claude's Bash commands stream their output into the App's command item
@@ -589,9 +713,42 @@ versioning or publishing metadata.
   A thread that names no reviewer runs as before, except that a call Claude
   Code says only the user may answer now asks in every mode, Full access
   included, and "Allow for this session" covers only that call.
+- When Claude Code withdraws a pending approval or question mid-turn, its card
+  closes, the call is declined, and a late Cancel no longer interrupts the turn.
+- A turn that ends while an approval, question or MCP form waits now takes the
+  card down in every client that shows it (`serverRequest/resolved`), leaves
+  the thread idle instead of reporting it active again, and no longer leaves
+  the call Claude made hanging. A `turn/interrupt` naming a turn that already
+  ended, a background agent's earlier run included, is ignored instead of
+  stopping the turn or run that came after it.
+- A thread whose approval policy is `never` keeps a read-only sandbox
+  read-only: Read, Grep, Glob, LS and WebSearch run, and any other call is
+  refused without a card, with Claude told the sandbox is read-only. Before,
+  `never` approved every tool whatever the sandbox, so Bash and file edits ran
+  in a read-only thread. The `claude-p` backend no longer adds
+  `--dangerously-skip-permissions` there, so only the read tools it
+  pre-approves run. The summary `/compact` writes in place of compacting
+  Claude's session (on a Codex model, or when that compaction fails) now
+  declines any tool beyond its reads instead of approving it. `never` with
+  any other sandbox still runs every tool unasked: the adapter has no OS
+  sandbox to confine workspace-write.
 
 ### Trustworthy history and settings
 
+- A deleted chat stays deleted and a rename sticks when a `turn/start`
+  arrives at the same time, for example from a second window on the same
+  chat. `turn/start` re-reads the thread after waiting on a running turn
+  instead of writing back the copy it read first, and a `turn/start` that
+  lands while `thread/delete` is ending the chat's turn fails with
+  `unknown thread` and starts nothing.
+- Streaming no longer stalls the adapter on every text, reasoning or command
+  output delta. Each delta used to read the whole turn, write it back and
+  fsync the state database before the delta reached the App, a few
+  milliseconds each on a long turn. The store now keeps a streaming turn in
+  memory and writes it about every 50 ms, and before any other write or read
+  of the state. Reads of that turn, such as the status check before each
+  delta, come from the copy in memory, so history, completion, a restart and
+  other processes still see every delta.
 - A forked chat shows the turns it was forked with on every read, as a Codex
   fork does: `thread/resume`, `thread/read`, `thread/turns/list`,
   `thread/items/list`, `thread/turns/items/list`, `thread/timeline/list` and
@@ -634,6 +791,12 @@ versioning or publishing metadata.
   user, password, path (where a per-user server URL keeps its secret), query
   and fragment are replaced. Other values, such as a server's `command`, are
   still logged.
+- Writing a debug log line no longer creates the log's folder and reads the
+  file's size each time; the adapter logs every streaming notification, so
+  this was a mkdir and two stats on every delta. The folder is made once (and
+  again if it is removed), and the size is re-read at most once a second, so
+  rotation at `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` still notices lines other
+  adapter processes append.
 - Settings a Claude thread cannot honor are refused with `INVALID_REQUEST`
   instead of being saved and ignored, so the App shows "Couldn't update this
   setting": `model_verbosity`, a service tier other than the default, network
@@ -704,6 +867,12 @@ versioning or publishing metadata.
 
 ### Provider and multi-agent boundaries
 
+- Follow-up turns of a Codex (`gpt-*`) chat on the `codex-proxy` route run
+  in the thread's folder with its sandbox mode and extra writable roots
+  (`CLAUDE_CODEX_ADD_DIRS`) again. `codex exec resume` was run without `-C`,
+  `-s` and `--add-dir`, so from the second turn on Codex worked in the
+  adapter's own folder, dropped the extra roots and, in `read-only` and
+  `workspace-write` chats, used the sandbox of the user's Codex config.
 - `/workflows` runs turn workflows on with the CLI's `CLAUDE_CODE_WORKFLOWS`
   switch instead of `--settings`, which pinned launchers reject, and respect a
   user's `enableWorkflows: false`.
@@ -775,6 +944,11 @@ versioning or publishing metadata.
   turn completes as interrupted; stopping a turn no longer wakes the thread to
   acknowledge the background agents Claude Code stopped with it; and
   `/workflows` lists the workflows Claude ran on its own.
+- Archiving a chat stops what still runs in it, as in Codex: its running turn
+  and background agents end as interrupted and its Claude session closes, so
+  an archived chat no longer spends tokens or edits files. The subagent
+  threads it spawned are archived with it and come back when it is
+  unarchived; its forks stay as they are.
 - A turn that ends while its background agents or workflows still run no
   longer marks the chat unread in the Codex App or sends a desktop
   notification; the turn the work reports back in does. Background Bash shells
@@ -824,6 +998,14 @@ versioning or publishing metadata.
   chat"; a queued message or goal reports that and does not run. Profiles
   replace `CLAUDE_CODEX_MODELS` and `CLAUDE_CODEX_MODEL_ALIASES` and need
   the native runtime. Without a profiles file nothing changes.
+- `ANTHROPIC_CUSTOM_HEADERS` counts as a secret in model process profiles,
+  like a key whose name contains `TOKEN`, `KEY`, `SECRET`, `PASSWORD` or
+  `AUTH`. In a profile's `env` it must be a single `${VAR}` reference, and
+  its value is a placeholder in the profile fingerprint, so rotating a
+  gateway header credential keeps chats going. A profiles file with a
+  literal value there no longer loads (move the value to the 0600 env file
+  or a `${VAR}`). A chat that already had a conversation on a profile
+  setting it, before this change, needs a new chat once after updating.
 - Resuming a Claude session copies its transcript only into the config dir
   that turn's Claude Code runs from (a model profile's, else
   `CLAUDE_CONFIG_DIR` or `~/.claude`, or with `CLAUDE_CODEX_CLI` the
@@ -881,6 +1063,12 @@ versioning or publishing metadata.
   parent's turn with "FOREIGN KEY constraint failed" when the agent ends, or
   stops the adapter's shutdown halfway; the agent's end leaves nothing in
   the deleted thread.
+- A client that resumes a thread now follows all of its subagents and their
+  subagents. It used to follow only the first 50 children of each thread,
+  so a workflow with more agents left the rest without live updates there.
+  Finding a thread's subagents and the newest-first thread list use indexes
+  instead of reading every thread: with 20,000 threads a list page takes
+  about 1 ms instead of 25 ms.
 
 ### Rust-first protocol groundwork
 
@@ -919,9 +1107,20 @@ versioning or publishing metadata.
 
 ### Validation and release gates
 
-- Default CI runs Biome checks, TypeScript typechecking, the Node test suite,
-  Rust workspace tests, and the pinned Rust protocol fixture drift gate.
-- Documentation changes should run `npm run docs:build`.
+- Default CI runs Biome checks, TypeScript typechecking, the VitePress docs
+  build, the Node test suite, Rust workspace tests, and the pinned Rust protocol
+  fixture drift gate.
+- The docs build no longer ignores dead links, so a link to a page that does not
+  exist fails CI.
+- `npm test` passes in a developer's or Claude Code's shell as it does on CI:
+  `CLAUDE_CODE_WORKFLOWS=1`, `umask 077` and a global
+  `commit.gpgsign = true` no longer fail tests, the ~105 mock adapters the
+  suites on `test/support/adapter-harness.mts` start no longer get the shell's `ANTHROPIC_*`,
+  `CLAUDE*` or `CODEX_*` variables, and no suite writes to the real
+  `~/.codex` debug log. Daemon and fixture tests allow for a busy machine,
+  `npm run build` clears `dist/test` so a deleted suite stops running, and a
+  hung test fails after 2 minutes instead of holding `npm test` (CI jobs stop
+  after 20).
 - Credentialed smoke and acceptance checks remain opt-in and must use
   credentials already owned by the local user or organization on the host.
 - `npm run check:app-upgrade -- --app <bundle>` checks a new Codex App build
@@ -931,6 +1130,18 @@ versioning or publishing metadata.
   behaviors the adapter relies on are App rules in `src/app-compat.mts`, tagged
   in the code and kept in sync by `test/app-compat.test.mts`; an App build not
   yet checked gets a config warning. See `docs/reference/app-compat.md`.
+- `npm run doctor` checks the runtime the shim will run: it reads the
+  `runtime.env` that `claude-codex-mode set` writes, accepts `codex-proxy`
+  (and checks for the real `codex` CLI), and reports an unknown runtime type
+  as a failed check instead of crashing. It finds the adapter, shim and
+  `node_modules` from its own checkout whatever the working directory, checks
+  that the built adapter answers a startup probe, and names spawn errors such
+  as `ENOENT` instead of `exited null`. It reads quoted values, trailing
+  comments and a leading `~` in `runtime.env` as the shell does, fails the
+  runtime type check when a line it cannot evaluate sets the runtime, lists
+  the other lines it skipped, and says whether the type came from the file,
+  the environment or the default. It looks for the real `codex` as the shim
+  does for the native route and as the adapter does for `codex-proxy`.
 
 ### Still experimental or not yet included
 

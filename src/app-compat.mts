@@ -420,10 +420,11 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'settings-write-errors',
-    app: 'Writes Settings > Configuration (approval policy, sandbox mode, network access, web search, verbosity, reasoning summaries) with config/value/write, reads the values back from config/read, and shows "Couldn\'t update this setting" next to a setting whose write fails.',
+    app: 'Writes Settings > Configuration (approval policy, sandbox mode, network access, web search, verbosity, reasoning summaries) with config/value/write, reads the values back from config/read, and shows "Couldn\'t update this setting" next to a setting whose write fails. On the Skills page a skill switch sends skills/config/write and, when the write fails, puts the switch back and shows "Failed to update skill".',
     adapter:
-      'Refuses a write of a setting Claude threads have no counterpart for, such as model verbosity, a service tier or network access off, and reports in config/read what Claude threads do for it, except the network access the permission-presets rule keeps unset.',
-    verify: 'Picking a verbosity, or turning network access off, shows the error next to it.',
+      'Refuses a write of a setting Claude threads have no counterpart for, such as model verbosity, a service tier or network access off, and reports in config/read what Claude threads do for it, except the network access the permission-presets rule keeps unset. It also refuses skills/config/write turning a skill off, which Claude threads cannot do.',
+    verify:
+      'Picking a verbosity, or turning network access off, shows the error next to it; turning a Claude skill off on the Skills page shows "Failed to update skill" and the switch stays on.',
   },
   {
     id: 'permission-presets',

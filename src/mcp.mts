@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import {
   type AppPluginServer,
   appPluginRequest,
@@ -9,6 +9,7 @@ import {
 } from './app-plugin-mcp.mjs'
 import type { InheritedMcpServer } from './codex-config.mjs'
 import { inheritedMcpServers, type McpToolRules, mcpToolRules } from './inherited-config.mjs'
+import { jsonSyntaxReason } from './json-syntax.mjs'
 import { ownVariable, remoteCredential } from './mcp-credentials.mjs'
 import type { RuntimeMcpServerStatus } from './types.mjs'
 
@@ -110,6 +111,7 @@ export async function listMcpServerStatuses(
   const names = serverNames(snapshot.sdkValue)
   const plugins = pluginServers(names, scope)
   const key = JSON.stringify([
+    scope.cwd ?? null,
     snapshot.sdkValue ?? null,
     plugins.map((server) => [server.pluginId, server.name, server.cwd]),
   ])
@@ -119,7 +121,7 @@ export async function listMcpServerStatuses(
       key,
       at: Number.POSITIVE_INFINITY,
       data: Promise.all([
-        ...names.map((name) => enumerateServerStatus(name, snapshot.sdkValue)),
+        ...names.map((name) => enumerateServerStatus(name, snapshot.sdkValue, scope.cwd)),
         ...plugins.map((server) => pluginServerStatus(server)),
       ]),
     }
@@ -243,13 +245,14 @@ async function pluginServerStatus(server: AppPluginServer): Promise<Record<strin
 async function enumerateServerStatus(
   name: string,
   servers: unknown,
+  cwd?: string | null,
 ): Promise<Record<string, unknown>> {
   const status = listStatusEntry(name)
   let connection: McpConnection
   try {
     const config = configFrom(servers, name)
     status.httpOrigin = httpOrigin(config)
-    connection = await connectMcp(name, config)
+    connection = await connectMcp(name, config, cwd)
   } catch (error) {
     if (!(error instanceof OutOfReach)) status.toolsError = errorText(error)
     return status
@@ -427,7 +430,7 @@ async function runMcpRequest(
   params: unknown,
   scope: McpConfigScope,
 ): Promise<unknown> {
-  const connection = await connectMcp(serverName, getServerConfig(serverName, scope))
+  const connection = await connectMcp(serverName, getServerConfig(serverName, scope), scope.cwd)
   try {
     return await connection.request(method, params)
   } finally {
@@ -469,6 +472,7 @@ function mcpTimeoutMs(): number {
 async function connectMcp(
   serverName: string,
   config: Record<string, unknown>,
+  cwd?: string | null,
 ): Promise<McpConnection> {
   if (config.type === 'http') return connectHttp(config)
   if (config.type && config.type !== 'stdio') {
@@ -476,16 +480,28 @@ async function connectMcp(
       `direct MCP requests only support stdio and http servers; ${serverName} is ${config.type}`,
     )
   }
-  return connectStdio(serverName, config)
+  return connectStdio(serverName, config, cwd)
+}
+
+// The thread's folder when it is a folder; otherwise the server starts where
+// the adapter runs, as before.
+function serverCwd(cwd: string | null | undefined): string | undefined {
+  try {
+    return cwd && statSync(cwd).isDirectory() ? cwd : undefined
+  } catch {
+    return undefined
+  }
 }
 
 async function connectStdio(
   serverName: string,
   config: Record<string, unknown>,
+  cwd?: string | null,
 ): Promise<McpConnection> {
   const command = stringOr(config.command, '')
   if (!command) throw new Error(`MCP server ${serverName} has no command`)
   const child = spawn(command, Array.isArray(config.args) ? config.args.map(String) : [], {
+    cwd: serverCwd(cwd),
     env: { ...process.env, ...stringRecord(config.env) },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
@@ -532,11 +548,24 @@ async function connectStdio(
     while ((lineEnd = buffer.indexOf('\n')) >= 0) {
       const line = buffer.slice(0, lineEnd).trim()
       buffer = buffer.slice(lineEnd + 1)
-      if (!line || !line.startsWith('{')) continue
+      if (!line?.startsWith('{')) continue
       let message: Record<string, unknown>
       try {
         message = JSON.parse(line) as Record<string, unknown>
       } catch {
+        continue
+      }
+      if (typeof message.method === 'string') {
+        if (message.id === undefined || message.id === null) continue
+        const response =
+          message.method === 'ping'
+            ? { jsonrpc: '2.0', id: message.id, result: {} }
+            : {
+                jsonrpc: '2.0',
+                id: message.id,
+                error: { code: -32601, message: `Method not found: ${message.method}` },
+              }
+        child.stdin.write(`${JSON.stringify(response)}\n`)
         continue
       }
       const id = Number(message.id)
@@ -669,6 +698,7 @@ function jsonRpcReply(reply: { text: string; stream: boolean }, id: number): unk
       .join('\n')
     if (!data) continue
     const message = asRecord(JSON.parse(data))
+    if (typeof message.method === 'string') continue
     if (String(message.id) === String(id)) return message
     if ('result' in message || 'error' in message) last = message
   }
@@ -733,13 +763,31 @@ export function expandServerConfig(
   return out
 }
 
+// The value's failures reach the App and the debug log, so they quote none of
+// the JSON, which may hold a credential.
 function parseMcpValue(raw: string): unknown {
   const trimmed = raw.trim()
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    return JSON.parse(trimmed)
+    return parseMcpJson(trimmed, 'CLAUDE_CODEX_MCP_SERVERS')
   }
-  if (!existsSync(trimmed)) throw new Error(`MCP config file not found: ${trimmed}`)
-  return JSON.parse(readFileSync(trimmed, 'utf8'))
+  if (!existsSync(trimmed)) {
+    // JSON in quotes or otherwise mangled is no file path.
+    if (/[{}"]/.test(trimmed)) {
+      throw new Error(
+        'CLAUDE_CODEX_MCP_SERVERS is neither JSON (starting with { or [) nor a file path',
+      )
+    }
+    throw new Error(`MCP config file not found: ${trimmed}`)
+  }
+  return parseMcpJson(readFileSync(trimmed, 'utf8'), trimmed)
+}
+
+function parseMcpJson(text: string, source: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch (error) {
+    throw new Error(`invalid MCP config JSON in ${source}: ${jsonSyntaxReason(error)}`)
+  }
 }
 
 // The servers by name; a file may wrap them in "mcpServers" as Claude Code's

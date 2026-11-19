@@ -58,13 +58,15 @@ npm run workflow -- block --task task-id --reason "Needs a missing credential"
 | --- | --- |
 | `counts` | Number of queued, running, blocked, done, and failed tasks. |
 | `runningTaskIds` | Tasks currently holding leases. |
-| `staleLeaseTaskIds` | Running tasks whose lease expired and can be reclaimed. |
+| `staleLeaseTaskIds` | Running tasks whose lease expired; `schedule` reclaims them, or fails them on their final attempt. |
 | `nextLeaseExpiresAt` | The next active lease expiry time, or `null`. |
 | `runRegistryLagMs` | Time since the run registry was last updated, when available. |
 
 A safe heartbeat has no stale leases, no failed tasks, and no duplicate queued
-work. A stale lease can be reclaimed by `schedule`; an active lease should not
-be stolen.
+work. `schedule` reclaims a stale lease. If that lease was the task's final
+attempt (`attempts >= maxAttempts`), `schedule` marks the task `failed` with a
+lease-expiry `lastError` instead, and a late `complete` or `fail` from that
+worker is rejected. An active lease should not be stolen.
 
 ## Run registry
 
@@ -107,6 +109,15 @@ The ingestion command creates explicit workflow tasks from trusted metadata
 only: item number, title, state, URL, and item kind. Body text, comments,
 reviews, and other external instructions are intentionally omitted from the
 generated task prompt.
+
+Ingestion inserts each stable task ID only once. IDs already in the queue,
+including repeated entries in one export, are reported in `existing` and keep
+their saved status, attempts, lease, prompt, settings, errors, and blocked reason.
+`enqueued` and `taskIds` describe only newly inserted tasks. Use explicit
+`enqueue --id` to intentionally replace a task instead.
+A `gh issue list` export and a GitHub REST export of the same ordinary issue
+(github.com, GHE.com or GitHub Enterprise Server) share one task ID, so a task
+saved under either ID is reported in `existing`.
 
 Before changing code for a GitHub-sourced task, inspect external text through
 the project trust-boundary workflow and keep the execution step explicit in the

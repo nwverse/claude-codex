@@ -84,16 +84,40 @@ export function defaultSocketPath(): string {
   return join(tmpdir(), `ccx-${stableHash(preferred).slice(0, 16)}.sock`)
 }
 
+// Claude Code's signed 31-hash of a path's UTF-16 units in base 36: the
+// suffix the CLI appends to a project folder name it cuts at 200 characters.
+function pathHash(path: string): string {
+  let hash = 0
+  for (let index = 0; index < path.length; index++)
+    hash = ((hash << 5) - hash + path.charCodeAt(index)) | 0
+  return Math.abs(hash).toString(36)
+}
+
+function projectSlugFor(dir: string): string {
+  const slug = dir.replace(/[^a-zA-Z0-9]/g, '-')
+  return slug.length <= 200 ? slug : `${slug.slice(0, 200)}-${pathHash(dir)}`
+}
+
 // The folders a cwd's sessions may be in under a Claude Code config dir's
 // projects: named after the cwd, and after its real path when that differs.
+// The CLI's names (the first 200 characters plus `-` and the path hash) come
+// first, then the legacy uncut names older CLIs used, when they fit in a
+// 255-character directory entry.
 export function projectSlugs(cwd: string): string[] {
-  const slug = (dir: string) => dir.replace(/[^a-zA-Z0-9-]/g, '-')
-  const slugs = [slug(cwd)]
+  const directories = [cwd]
   try {
     const real = realpathSync(cwd)
-    if (real !== cwd) slugs.push(slug(real))
+    if (real !== cwd) directories.push(real)
   } catch {}
-  return slugs
+  return [
+    ...new Set([
+      ...directories.map(projectSlugFor),
+      // Longer legacy names cannot be filesystem directory entries.
+      ...directories
+        .map((dir) => dir.replace(/[^a-zA-Z0-9]/g, '-'))
+        .filter((slug) => slug.length <= 255),
+    ]),
+  ]
 }
 
 // `path` lies strictly below `root`; both are compared lexically.
@@ -106,22 +130,48 @@ export function ensureParent(path: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
 }
 
+// Per-log-file bookkeeping so a debugLog call costs one append, not a mkdir and
+// a stat as well: rpc.notify logs every streaming delta. `size` is the file's
+// size as last seen by stat plus what this process appended since.
+type DebugLogFile = { size: number; checkedAt: number }
+const debugLogFiles = new Map<string, DebugLogFile>()
+// Other adapter processes may append to the same file, so the tracked size is
+// re-read from disk at least this often (ms) rather than trusted forever.
+const DEBUG_LOG_RESTAT_MS = 1000
+
 export function debugLog(event: string, data: Record<string, unknown> = {}): void {
   if (process.env.CLAUDE_CODEX_DEBUG_LOG === '0' || process.env.CLAUDE_CODEX_DEBUG_LOG === 'false')
     return
   const path = resolve(process.env.CLAUDE_CODEX_DEBUG_LOG || join(adapterHome(), 'debug.jsonl'))
   try {
-    ensureParent(path)
-    rotateLogIfNeeded(path)
-    appendFileSync(
-      path,
+    const line =
       JSON.stringify({
         ts: new Date().toISOString(),
         pid: process.pid,
         event,
         ...(redact(data) as Record<string, unknown>),
-      }) + '\n',
-    )
+      }) + '\n'
+    let file = debugLogFiles.get(path)
+    if (!file) {
+      ensureParent(path)
+      file = { size: 0, checkedAt: Number.NEGATIVE_INFINITY }
+      debugLogFiles.set(path, file)
+    }
+    const maxBytes = debugLogMaxBytes()
+    const now = Date.now()
+    if (maxBytes > 0 && (file.size >= maxBytes || now - file.checkedAt >= DEBUG_LOG_RESTAT_MS)) {
+      file.size = rotateLog(path, maxBytes)
+      file.checkedAt = now
+    }
+    try {
+      appendFileSync(path, line)
+    } catch (error) {
+      // The log's folder was removed while we ran: recreate it once and retry.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      ensureParent(path)
+      appendFileSync(path, line)
+    }
+    file.size += Buffer.byteLength(line)
   } catch {}
 }
 
@@ -131,16 +181,26 @@ export function debugLog(event: string, data: Record<string, unknown> = {}): voi
 // dropping anything older. Sized envs override; failures swallow because the
 // debug log is best-effort and must never break the main flow.
 export function rotateLogIfNeeded(path: string): void {
-  const maxBytes = numericEnv('CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', 50 * 1024 * 1024)
+  const maxBytes = debugLogMaxBytes()
   if (maxBytes <= 0) return
-  const keep = Math.max(1, numericEnv('CLAUDE_CODEX_DEBUG_LOG_KEEP', 3))
+  rotateLog(path, maxBytes)
+}
+
+function debugLogMaxBytes(): number {
+  return numericEnv('CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', 50 * 1024 * 1024)
+}
+
+// Rotates `path` when it has reached `maxBytes`; returns the active log's size
+// afterwards (0 when it was rotated away or does not exist yet).
+function rotateLog(path: string, maxBytes: number): number {
   let size = 0
   try {
     size = statSync(path).size
   } catch {
-    return // file does not exist yet — nothing to rotate
+    return 0 // file does not exist yet — nothing to rotate
   }
-  if (size < maxBytes) return
+  if (size < maxBytes) return size
+  const keep = Math.max(1, numericEnv('CLAUDE_CODEX_DEBUG_LOG_KEEP', 3))
   // Drop the oldest slot if it would push us past `keep`.
   const oldest = `${path}.${keep}`
   try {
@@ -155,7 +215,10 @@ export function rotateLogIfNeeded(path: string): void {
   // Move the active log to `.1`. The next appendFileSync recreates it.
   try {
     renameSync(path, `${path}.1`)
-  } catch {}
+  } catch {
+    return size
+  }
+  return 0
 }
 
 function numericEnv(name: string, fallback: number): number {
@@ -847,7 +910,7 @@ export function codexProxyModelOptions(): Array<{
   }
   const env = process.env.CLAUDE_CODEX_CODEX_MODELS
   let ids: string[] = []
-  if (env && env.trim()) {
+  if (env?.trim()) {
     ids = env
       .split(',')
       .map((s) => s.trim())
@@ -885,7 +948,7 @@ export function codexProxyModelOptions(): Array<{
 // our shim is also called `codex`). Returns null when nothing usable found.
 export function resolveCodexBinary(): string | null {
   const explicit = process.env.CODEX_REAL
-  if (explicit && explicit.trim()) return explicit.trim()
+  if (explicit?.trim()) return explicit.trim()
   const knownCandidates = [
     join(
       homedir(),
