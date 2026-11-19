@@ -14,12 +14,7 @@ import {
   renewWorkflowLease,
   scheduleNextWorkflowTask,
 } from './workflow-scheduler.mjs'
-import {
-  WORKFLOW_STATE_VERSION,
-  type WorkflowState,
-  WorkflowStateStore,
-  type WorkflowTask,
-} from './workflow-state.mjs'
+import { type WorkflowState, WorkflowStateStore, type WorkflowTask } from './workflow-state.mjs'
 
 export interface WorkflowCliIo {
   readonly stdout: Pick<NodeJS.WriteStream, 'write'>
@@ -37,103 +32,116 @@ export async function runWorkflowCli(
     return 0
   }
   const store = new WorkflowStateStore(statePath(parsed))
-  const state = (await store.read()) ?? emptyState()
-  const now = new Date(stringOption(parsed, 'now') ?? Date.now())
+  const clock = () => new Date(stringOption(parsed, 'now') ?? Date.now())
+  const updateTask = (edit: (state: WorkflowState, now: Date) => WorkflowState) =>
+    store.transact((state) => ({ state: edit(state, clock()), value: null }))
 
   switch (command) {
     case 'enqueue': {
-      const task = taskFromArgs(parsed, now)
-      const nextState = upsertTask(state, task)
-      await store.write(nextState)
+      const task = await store.transact((state) => {
+        const enqueued = taskFromArgs(parsed, clock())
+        return { state: upsertTask(state, enqueued), value: enqueued }
+      })
       writeJson(io.stdout, { status: 'enqueued', statePath: store.path, task })
       return 0
     }
     case 'schedule': {
-      const decision = scheduleNextWorkflowTask(state, {
-        now,
-        workerId: stringOption(parsed, 'worker') ?? `worker-${process.pid}`,
-        leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000,
+      const decision = await store.transact((state) => {
+        const next = scheduleNextWorkflowTask(state, {
+          now: clock(),
+          workerId: stringOption(parsed, 'worker') ?? `worker-${process.pid}`,
+          leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000,
+        })
+        return { state: next.state, value: next }
       })
-      await store.write(decision.state)
       writeJson(io.stdout, { ...decision, statePath: store.path })
       return 0
     }
     case 'heartbeat': {
       const taskId = requiredOption(parsed, 'task')
-      const nextState = renewWorkflowLease(state, taskId, {
-        now,
-        workerId: requiredOption(parsed, 'worker'),
-        leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000,
-      })
-      await store.write(nextState)
+      await updateTask((state, now) =>
+        renewWorkflowLease(state, taskId, {
+          now,
+          workerId: requiredOption(parsed, 'worker'),
+          leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000,
+        }),
+      )
       writeJson(io.stdout, { status: 'heartbeat', statePath: store.path, taskId })
       return 0
     }
     case 'complete': {
       const taskId = requiredOption(parsed, 'task')
-      const nextState = completeWorkflowTask(state, taskId, now)
-      await store.write(nextState)
+      await updateTask((state, now) => completeWorkflowTask(state, taskId, now))
       writeJson(io.stdout, { status: 'completed', statePath: store.path, taskId })
       return 0
     }
     case 'fail': {
       const taskId = requiredOption(parsed, 'task')
-      const nextState = failWorkflowTask(state, taskId, requiredOption(parsed, 'error'), now)
-      await store.write(nextState)
+      await updateTask((state, now) =>
+        failWorkflowTask(state, taskId, requiredOption(parsed, 'error'), now),
+      )
       writeJson(io.stdout, { status: 'failed-or-requeued', statePath: store.path, taskId })
       return 0
     }
     case 'block': {
       const taskId = requiredOption(parsed, 'task')
-      const nextState = blockWorkflowTask(state, taskId, requiredOption(parsed, 'reason'), now)
-      await store.write(nextState)
+      await updateTask((state, now) =>
+        blockWorkflowTask(state, taskId, requiredOption(parsed, 'reason'), now),
+      )
       writeJson(io.stdout, { status: 'blocked', statePath: store.path, taskId })
       return 0
     }
     case 'status': {
+      const state = await store.readOrEmpty()
       writeJson(io.stdout, { status: 'ok', statePath: store.path, state })
       return 0
     }
     case 'health': {
+      const state = await store.readOrEmpty()
       const runLog = stringOption(parsed, 'run-log') ?? runRegistryPath()
       const runLogUpdatedAt = runLog ? await fileUpdatedAt(runLog) : null
       writeJson(io.stdout, {
         status: 'ok',
         statePath: store.path,
         runLog,
-        health: workflowHealth({ state, now, runLogUpdatedAt }),
+        health: workflowHealth({ state, now: clock(), runLogUpdatedAt }),
       })
       return 0
     }
     case 'ingest-github': {
       const source = requiredOption(parsed, 'github-json')
-      const result = parseGitHubQueueJson(
-        await readFile(source, 'utf8'),
-        now,
-        state.tasks.map((task) => task.id),
-      )
-      const knownTaskIds = new Set(state.tasks.map((task) => task.id))
-      const existing: string[] = [...result.existing]
-      const newTasks = result.tasks.filter((task) => {
-        if (knownTaskIds.has(task.id)) {
-          existing.push(task.id)
-          return false
+      const text = await readFile(source, 'utf8')
+      const result = await store.transact((state) => {
+        const ingested = parseGitHubQueueJson(
+          text,
+          clock(),
+          state.tasks.map((task) => task.id),
+        )
+        const knownTaskIds = new Set(state.tasks.map((task) => task.id))
+        const existing = [...ingested.existing]
+        const newTasks = ingested.tasks.filter((task) => {
+          if (knownTaskIds.has(task.id)) {
+            existing.push(task.id)
+            return false
+          }
+          knownTaskIds.add(task.id)
+          return true
+        })
+        // A duplicate-only import leaves the saved state file untouched.
+        return {
+          state:
+            newTasks.length > 0 || existing.length === 0
+              ? { ...state, tasks: [...state.tasks, ...newTasks] }
+              : null,
+          value: {
+            enqueued: newTasks.length,
+            existing,
+            skipped: ingested.skipped,
+            taskIds: newTasks.map((task) => task.id),
+          },
         }
-        knownTaskIds.add(task.id)
-        return true
       })
-      const nextState = { ...state, tasks: [...state.tasks, ...newTasks] }
-      // A duplicate-only import leaves the saved state file untouched.
-      if (newTasks.length > 0 || existing.length === 0) await store.write(nextState)
-      writeJson(io.stdout, {
-        status: 'ingested',
-        statePath: store.path,
-        source,
-        enqueued: newTasks.length,
-        existing,
-        skipped: result.skipped,
-        taskIds: newTasks.map((task) => task.id),
-      })
+      writeJson(io.stdout, { status: 'ingested', statePath: store.path, source, ...result })
       return 0
     }
     default:
@@ -175,10 +183,6 @@ function upsertTask(state: WorkflowState, task: WorkflowTask): WorkflowState {
     ...state,
     tasks: state.tasks.map((candidate) => (candidate.id === task.id ? task : candidate)),
   }
-}
-
-function emptyState(): WorkflowState {
-  return { version: WORKFLOW_STATE_VERSION, tasks: [] }
 }
 
 interface ParsedArgs {

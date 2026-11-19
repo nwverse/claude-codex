@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
+import { once } from 'node:events'
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
+import { Worker } from 'node:worker_threads'
 
 export const WORKFLOW_STATE_VERSION = 1
 export const WORKFLOW_TASK_STATUSES = ['queued', 'running', 'blocked', 'done', 'failed'] as const
@@ -63,6 +65,38 @@ export class WorkflowStateStore {
     } catch (error) {
       if (hasErrorCode(error, 'ENOENT')) return null
       throw error
+    }
+  }
+
+  async readOrEmpty(): Promise<WorkflowState> {
+    return (await this.read()) ?? { version: WORKFLOW_STATE_VERSION, tasks: [] }
+  }
+
+  async transact<T>(
+    edit: (state: WorkflowState) => { state: WorkflowState | null; value: T },
+  ): Promise<T> {
+    await mkdir(dirname(this.path), { recursive: true, mode: 0o700 })
+    // The waiting connection lives off the event loop so another caller in
+    // this process can finish its async JSON write while this one waits.
+    const holder = new Worker(new URL('./workflow-write-lock.mjs', import.meta.url), {
+      workerData: `${this.path}.lock.sqlite`,
+      // Older supported Node 24 releases mark node:sqlite experimental.
+      execArgv: ['--disable-warning=ExperimentalWarning'],
+    })
+    const exited = once(holder, 'exit')
+    try {
+      await Promise.race([
+        once(holder, 'message'),
+        exited.then(() => {
+          throw new Error(`workflow write lock exited before acquiring ${this.path}`)
+        }),
+      ])
+      const next = edit(await this.readOrEmpty())
+      if (next.state) await this.write(next.state)
+      return next.value
+    } finally {
+      holder.postMessage('release')
+      await exited
     }
   }
 

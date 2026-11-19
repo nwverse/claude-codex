@@ -7,6 +7,14 @@ versioning or publishing metadata.
 
 ## Unreleased
 
+### Native Codex chats
+
+- With `CLAUDE_CODEX_NATIVE_CODEX=on`, a new Codex chat runs in a `codex
+  app-server` child for its provider. The model menu also offers configured
+  AsterGate models. Native chats retain their provider, approvals and history
+  across adapter restarts. Existing `codex exec` chats keep their route. See
+  [Harnesses](docs/guide/backends.md#harnesses) for configuration and helper chats.
+
 ### `ws://` listener authentication
 
 - **Breaking:** `--listen ws://` on a non-loopback address (`0.0.0.0`, `::`,

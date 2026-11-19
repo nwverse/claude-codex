@@ -47,6 +47,11 @@ import {
 } from './claude-models.mjs'
 import { configRequirements } from './cli-probes.mjs'
 import { asTable, codexAutoCompactLimit } from './codex-config.mjs'
+import {
+  CodexNativeBridge,
+  isNativeConversationMethod,
+  NOT_ROUTED,
+} from './codex-native-bridge.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
 import { parseCommandActions } from './command-actions.mjs'
 import { appendCommandOutput } from './command-output.mjs'
@@ -71,6 +76,15 @@ import {
   isGoalStatus,
   MODEL_GOAL_STATUSES,
 } from './goal-prompts.mjs'
+import {
+  catalogModel,
+  codexModelEfforts,
+  HARNESS_LABELS,
+  harnessDisplayName,
+  harnessLabelsEnabled,
+  isAgModel,
+  nativeCodexEnabled,
+} from './harness-models.mjs'
 import {
   accountUsage,
   asInvalidRequest,
@@ -675,6 +689,7 @@ function unknownThread(threadId: string): RpcError {
 }
 
 export interface ServerOptions {
+  configOverrides?: readonly string[]
   sleepMonitor?: SleepMonitor
   // Where the adapter runs, for advice that names an App setting.
   platform?: NodeJS.Platform
@@ -810,10 +825,18 @@ export class CodexClaudeAppServer {
   private readonly turnNotices: TurnNoticeLog
   // Keeps the Mac from idle-sleeping while anything runs, when turned on.
   private readonly idleSleep: IdleSleepGuard
+  // Codex threads on the native harness, run by real `codex app-server`
+  // children; null when turned off.
+  private readonly codexBridge: CodexNativeBridge | null
+  // The App's clientInfo, which the Codex children are started with.
+  private lastClientInfo: Record<string, unknown> = { name: 'codex_desktop', version: '0.0.0' }
 
   constructor(store: SessionStore, runtime: ClaudeRuntime, options: ServerOptions = {}) {
     this.store = store
     this.runtime = runtime
+    this.codexBridge = nativeCodexEnabled()
+      ? this.createCodexBridge(options.configOverrides ?? [])
+      : null
     this.sleepMonitor = options.sleepMonitor ?? new SleepTracker()
     this.sleepMonitor.start?.()
     this.platform = options.platform ?? process.platform
@@ -908,6 +931,7 @@ export class CodexClaudeAppServer {
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
+    const nativeStopped = this.codexBridge?.stop()
     // command/exec runs in its own process group, out of reach of a signal to
     // the adapter's group (launchd job stop, Ctrl-C), and a terminal has no
     // timeout: end what is still running.
@@ -937,7 +961,11 @@ export class CodexClaudeAppServer {
       try {
         await this.runtime.stop()
       } finally {
-        this.store.close()
+        try {
+          await nativeStopped
+        } finally {
+          this.store.close()
+        }
       }
     }
   }
@@ -946,6 +974,7 @@ export class CodexClaudeAppServer {
   // every turn has settled; the daemon must not idle-exit underneath them.
   hasActiveTurns(): boolean {
     if (this.activeTurnByThread.size > 0) return true
+    if (this.codexBridge?.busy()) return true
     for (const entry of this.backgroundSubagents.values()) if (entry.running) return true
     return this.runtime.hasBackgroundWork?.() === true
   }
@@ -994,10 +1023,22 @@ export class CodexClaudeAppServer {
   }
 
   private async dispatch(peer: RpcPeer, method: string, params: unknown): Promise<unknown> {
+    if (this.codexBridge) {
+      const routed = await this.codexBridge.route(peer, method, params)
+      if (routed !== NOT_ROUTED) return routed
+    } else if (isNativeConversationMethod(method)) {
+      const threadId = stringOr(asRecord(params).threadId, '')
+      if (threadId && this.store.getThread(threadId)?.nativeCodexProvider) {
+        throw invalidRequest(
+          'enable CLAUDE_CODEX_NATIVE_CODEX to open or change this native Codex chat',
+        )
+      }
+    }
     switch (method) {
       case 'initialize': {
         const initParams = asRecord(params)
         const clientInfo = asRecord(initParams.clientInfo)
+        if (typeof clientInfo.name === 'string') this.lastClientInfo = clientInfo
         const capabilities = asRecord(initParams.capabilities)
         const declaredActivityKinds = Array.isArray(capabilities.subAgentActivityKinds)
           ? capabilities.subAgentActivityKinds
@@ -1481,8 +1522,12 @@ export class CodexClaudeAppServer {
     // The App names its own OpenAI model for titles and other helper threads,
     // and accepts another one; with Codex routing off they run on Claude.
     // App rule: helper-thread-model
+    // The native Codex harness would spend the ChatGPT login on them, so they
+    // run on Claude there too.
     const model =
-      isTitleOrHelper && codexRoutingDisabled && isCodexOpenAiModel(requestedModel)
+      isTitleOrHelper &&
+      (codexRoutingDisabled || this.codexBridge !== null) &&
+      isCodexOpenAiModel(requestedModel)
         ? claudeHelperModel(requestedModel)
         : requestedModel
     // Any other thread on a Codex model has nowhere to run, and the picker
@@ -1788,7 +1833,7 @@ export class CodexClaudeAppServer {
       params.ephemeral === true &&
       parent.runtimeBackend === 'claude' &&
       isCodexOpenAiModel(requestedModel) &&
-      (resolveClaudeModelProfile(parent.model) || this.codexRoutingDisabled())
+      (resolveClaudeModelProfile(parent.model) || this.codexRoutingDisabled() || this.codexBridge)
         ? parent.model
         : requestedModel
     // Fork: model may flip backend (forking from claude-thread with a
@@ -1887,6 +1932,7 @@ export class CodexClaudeAppServer {
           : parent.personality,
       runtimeBackend,
       codexSessionId: null,
+      nativeCodexProvider: null,
       gitInfo: cwd === parent.cwd ? (parent.gitInfo ?? null) : null,
     }
     this.store.upsertThread(thread)
@@ -4311,7 +4357,7 @@ export class CodexClaudeAppServer {
       thread.ephemeral &&
       thread.runtimeBackend === 'claude' &&
       isCodexOpenAiModel(requestedModel) &&
-      this.codexRoutingDisabled()
+      (this.codexRoutingDisabled() || this.codexBridge)
         ? claudeHelperModel(requestedModel)
         : null
     const model = summaryTurn ? null : (helperModel ?? requestedModel)
@@ -8737,6 +8783,18 @@ export class CodexClaudeAppServer {
         }
         if (codexModel && this.codexRoutingDisabled()) throw codexRoutingDisabledError(model)
         runtimeBackend = codexModel ? 'codex' : 'claude'
+      } else if (
+        runtimeBackend === 'codex' &&
+        (thread.nativeCodexProvider || (this.codexBridge && !thread.codexSessionId)) &&
+        (isAgModel(model) !== isAgModel(thread.model) ||
+          (thread.nativeCodexProvider && !isCodexOpenAiModel(model))) &&
+        this.threadHasConversation(thread)
+      ) {
+        // A Codex conversation lives with its model provider: Codex will not
+        // go on with a ChatGPT chat on AsterGate, or the other way round.
+        throw new Error(
+          `cannot move this chat from ${harnessLabelOf(thread.model)} to ${harnessLabelOf(model)} for ${model}; start a new thread`,
+        )
       } else if (runtimeBackend === 'claude' && this.threadHasConversation(thread)) {
         const unbound = threadModelProfileBindingError(thread)
         if (unbound) throw unbound
@@ -8938,6 +8996,14 @@ export class CodexClaudeAppServer {
       const reported = reportedClaudeModel(option.sdkModel)
       return {
         ...option,
+        displayName: harnessLabelsEnabled()
+          ? harnessDisplayName(
+              'claude',
+              option.displayName === option.id
+                ? (catalogModel(option.id)?.displayName ?? option.displayName)
+                : option.displayName,
+            )
+          : option.displayName,
         description:
           option.description === GENERIC_MODEL_DESCRIPTION && reported?.description
             ? reported.description
@@ -8951,9 +9017,10 @@ export class CodexClaudeAppServer {
     // without any reconnect or shell flip. Picking gpt-* flips the thread
     // to runtimeBackend='codex' which the runtime router dispatches to
     // CodexProxyRuntime (shells out to `codex exec --json`).
+    // The native harness offers the efforts the Codex model catalog lists.
     const codexOptions = codexProxyModelOptions().map((option) => ({
       ...option,
-      efforts: DEFAULT_EFFORTS,
+      efforts: (nativeCodexEnabled() ? codexModelEfforts(option.id) : null) ?? DEFAULT_EFFORTS,
     }))
     const options = [...claudeOptions, ...codexOptions]
     const hasConfiguredDefault = options.some((option) => option.id === defaultModel)
@@ -10364,11 +10431,64 @@ export class CodexClaudeAppServer {
     this.idleSleep.check()
   }
 
-  // An aborted `signal` drops the request and rejects; the caller's
-  // serverRequest/resolved then takes the App's card down. The request goes to
-  // every peer following the thread, as Codex's app-server sends it to every
-  // connection subscribed to the thread; the first answer wins, and the
-  // caller's serverRequest/resolved takes the other cards down.
+  // Withdraws a request whose answer is no longer wanted (the Codex child
+  // resolved it itself).
+  private dropServerRequest(id: string): void {
+    const pending = this.pendingServerRequests.get(id)
+    if (!pending) return
+    this.pendingServerRequests.delete(id)
+    pending.reject(new Error(`${pending.method} was resolved`))
+  }
+
+  private createCodexBridge(configOverrides: readonly string[]): CodexNativeBridge {
+    return new CodexNativeBridge({
+      store: this.store,
+      detachedPeer: DETACHED_PEER,
+      subscribe: (threadId, peer) => this.subscribe(threadId, peer),
+      notifyThread: (threadId, notification) => {
+        for (const follower of this.targetsForParams(DETACHED_PEER, { threadId })) {
+          if (this.peerTakesNotification(follower, notification))
+            this.sendNotification(follower, notification)
+        }
+      },
+      sidebarMetadata: (thread) => ({
+        sessionId: thread.sessionId,
+        forkedFromId: thread.forkedFromId,
+        projectId: thread.projectId ?? null,
+        section: thread.sectionId ? this.store.getSection(thread.sectionId) : null,
+        sectionEnteredAt: thread.sectionEnteredAt ?? null,
+        isPinned: thread.isPinned === true,
+        name: thread.name,
+      }),
+      notifyAll: (notification) => this.notifyAll(notification),
+      sendServerRequest: (peer, method, id, params) =>
+        this.sendServerRequest(peer, method, id, params),
+      dropServerRequest: (id) => this.dropServerRequest(id),
+      applyModel: (thread, params, persist) => {
+        const model = this.requestedModelChange(thread, params)
+        if (!model) return
+        this.setThreadModel(thread, model)
+        if (persist) this.store.upsertThread(thread)
+      },
+      clientInfo: () => this.lastClientInfo,
+      configOverrides: () => configOverrides,
+      finishMirror: (peer, method, params) => {
+        switch (method) {
+          case 'thread/name/set':
+            return this.threadNameSet(params)
+          case 'thread/archive':
+            return this.threadArchive(peer, params)
+          case 'thread/delete':
+            return this.threadDelete(peer, params)
+          default:
+            return this.threadUnarchive(params)
+        }
+      },
+      checkIdle: () => this.checkIdle(),
+    })
+  }
+
+  // An abort drops the request. Every follower receives it and the first answer wins.
   private sendServerRequest(
     peer: RpcPeer,
     method: string,
@@ -10904,4 +11024,8 @@ export class CodexClaudeAppServer {
       rmSync(temp, { force: true })
     }
   }
+}
+
+function harnessLabelOf(model: string): string {
+  return isAgModel(model) ? HARNESS_LABELS['codex-ag'] : HARNESS_LABELS.codex
 }

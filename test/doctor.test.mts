@@ -294,3 +294,48 @@ test('doctor prints no text of a skipped line and needs export for the adapter',
     )
   })
 })
+
+test('doctor waits for a framed Codex initialize reply and reaps the probe', async () => {
+  await withTempDir(async (dir) => {
+    const program = join(dir, 'native.cjs')
+    const pidFile = join(dir, 'probe.pid')
+    await writeFile(
+      program,
+      `
+      const fs = require('node:fs')
+      const helper = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {stdio:'ignore'})
+      fs.writeFileSync(process.env.PROBE_PID, JSON.stringify([process.pid,helper.pid]))
+      process.on('SIGTERM', () => {})
+      setInterval(() => {}, 1000)
+      process.stdin.once('data', () => {
+        console.log(JSON.stringify({id:2,result:{}}))
+        console.log(JSON.stringify({id:1,method:'some/request'}))
+        const line = process.env.PROBE_ERROR
+          ? '{ "error": {"code": -32000}, "id": 1 }\\n'
+          : '{ "result": {}, "jsonrpc": "2.0", "id": 1 }\\n'
+        process.stdout.write(line.slice(0,5))
+        setTimeout(() => process.stdout.write(line.slice(5)), 25)
+      })
+    `,
+    )
+    const codex = await fakeCodex(dir, 'codex', `exec "${process.execPath}" "${program}" "$@"`)
+    for (const reject of [false, true]) {
+      const result = await runDoctor(dir, {
+        CLAUDE_CODEX_NATIVE_CODEX: 'on',
+        CLAUDE_CODEX_MOCK: '1',
+        CODEX_REAL: codex,
+        PROBE_PID: pidFile,
+        PROBE_ERROR: reject ? '1' : '',
+      })
+      assert.equal(result.code, reject ? 1 : 0, result.stdout + result.stderr)
+      assert.match(
+        result.stdout,
+        reject
+          ? /fail - real codex app-server answers.*initialize failed \(-32000\)/
+          : /ok - real codex app-server answers/,
+      )
+      const pids: number[] = JSON.parse(await readFile(pidFile, 'utf8'))
+      for (const pid of pids) assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
+    }
+  })
+})

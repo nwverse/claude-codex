@@ -14,6 +14,7 @@ import { MockRuntime } from '../src/mock-runtime.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type { RpcPeer, WireMessage } from '../src/types.mjs'
+import { nativeCodexTestEnv } from './support/native-codex-fixture.mjs'
 
 // Several clients following one thread: two App windows on one chat, or the
 // App and another app-server client on the same daemon.
@@ -501,7 +502,10 @@ interface Client {
   close(): void
 }
 
-async function withDaemon(body: (connect: () => Promise<Client>) => Promise<void>): Promise<void> {
+async function withDaemon(
+  body: (connect: () => Promise<Client>) => Promise<void>,
+  configure?: (home: string) => NodeJS.ProcessEnv,
+): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
@@ -513,6 +517,7 @@ async function withDaemon(body: (connect: () => Promise<Client>) => Promise<void
       CLAUDE_CODEX_MOCK: '1',
       CLAUDE_CODEX_IDLE_EXIT_MS: '0',
       NODE_NO_WARNINGS: '1',
+      ...configure?.(home),
     },
   })
   const sockets: WebSocket[] = []
@@ -737,3 +742,30 @@ async function waitForListening(proc: ChildProcess): Promise<void> {
     proc.once('exit', () => reject(new Error(`daemon exited: ${output}`)))
   })
 }
+
+test('both followers receive native turn events and the same approval resolves once', async () => {
+  await withDaemon(async (connect) => {
+    const a = await connect()
+    const b = await connect()
+    const threadId = (await a.request('thread/start', { model: 'gpt-6.1-sol' })).result.thread.id
+    await b.request('thread/resume', { threadId })
+    await a.request('turn/start', { threadId, input: textInput('hello') })
+    const isApproval = (message: any) => message.method === 'item/commandExecution/requestApproval'
+    const approval = (await a.until(isApproval)).at(-1)
+    assert.equal((await b.until(isApproval)).at(-1).id, approval.id)
+    await b.respond(approval.id, { decision: 'decline' })
+    for (const peer of [a, b]) {
+      const stream = await peer.until((message) => message.method === 'turn/completed')
+      assert.deepEqual(
+        stream
+          .filter((message) => message.method === 'serverRequest/resolved')
+          .map((message) => message.params.requestId),
+        [approval.id],
+      )
+      assert.equal(
+        stream.find((message) => message.method === 'item/agentMessage/delta').params.threadId,
+        threadId,
+      )
+    }
+  }, nativeCodexTestEnv)
+})

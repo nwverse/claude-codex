@@ -19,6 +19,11 @@ takes `--run-log PATH` for the run registry, and each command prints the
 `statePath` it used. Check `statePath` when the daemon runs with a different
 `CODEX_HOME` or `CLAUDE_CODEX_HOME` than the shell you run the CLI from.
 
+Queue writers serialize changes with SQLite's writer lock in
+`<statePath>.lock.sqlite` beside the JSON file. Keep this sidecar in place
+while workers are active. The operating system releases the lock if a worker
+exits. `status` and `health` read the JSON directly.
+
 ## Core loop
 
 Start each heartbeat by reading the state through the CLI:

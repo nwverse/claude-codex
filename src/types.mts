@@ -91,6 +91,8 @@ export interface ThreadRecord {
   // `codex exec resume <id>` so the conversation history survives. Only
   // populated for runtimeBackend='codex' threads.
   codexSessionId: string | null
+  // The provider that owns a native app-server rollout. Legacy exec chats have none.
+  nativeCodexProvider?: string | null
   source: string
   createdAt: number
   updatedAt: number

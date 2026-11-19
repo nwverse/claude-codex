@@ -130,7 +130,8 @@ async function main(): Promise<void> {
   })
   // The App passes -c settings for the Codex config, the plugin servers it
   // wants among them.
-  setAppPluginConfigOverrides(configArgs(args))
+  const configOverrides = configArgs(args)
+  setAppPluginConfigOverrides(configOverrides)
   const isUnixDaemon = listen.startsWith('unix://')
   let pidFile: string | null = null
   if (isUnixDaemon) {
@@ -166,7 +167,7 @@ async function main(): Promise<void> {
     process.stderr.write(`[claude-codex-adapter] ${hooksWarning}\n`)
   }
   const runtime = createRuntime()
-  const server = new CodexClaudeAppServer(store, runtime)
+  const server = new CodexClaudeAppServer(store, runtime, { configOverrides })
   let transport: RunningTransport | null = null
   let shuttingDown = false
   const shutdown = async (reason: string) => {

@@ -276,6 +276,7 @@ export class SessionStore {
     // Real Codex session id for runtime_backend='codex' threads (returned
     // by `codex exec` as thread.started.thread_id). NULL until first turn.
     this.ensureColumn('threads', 'codex_session_id', 'TEXT')
+    this.ensureColumn('threads', 'native_codex_provider', 'TEXT')
     // Claude transcript checkpoints for thread/rollback, thread/revert and
     // thread/fork: see setTurnCheckpoint and rewindClaudeSession.
     this.ensureColumn('threads', 'claude_resume_at', 'TEXT')
@@ -445,10 +446,10 @@ export class SessionStore {
           source, created_at, updated_at, status_json,
           approval_policy, sandbox_mode, permission_profile_id, ephemeral, thread_source, agent_role, agent_nickname,
           base_instructions, developer_instructions, personality, runtime_backend, codex_session_id,
-          memory_mode, collaboration_mode, approvals_reviewer
+          memory_mode, collaboration_mode, approvals_reviewer, native_codex_provider
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
@@ -482,7 +483,8 @@ export class SessionStore {
           runtime_backend=excluded.runtime_backend,
           codex_session_id=excluded.codex_session_id,
           collaboration_mode=excluded.collaboration_mode,
-          approvals_reviewer=excluded.approvals_reviewer
+          approvals_reviewer=excluded.approvals_reviewer,
+          native_codex_provider=excluded.native_codex_provider
       `)
       .run(
         thread.id,
@@ -520,6 +522,7 @@ export class SessionStore {
         thread.memoryMode ?? null,
         thread.collaborationMode ?? null,
         thread.approvalsReviewer ?? null,
+        thread.nativeCodexProvider ?? null,
       )
   }
 
@@ -1245,6 +1248,20 @@ export class SessionStore {
       days: days.map((row) => String(row.day)),
       longestTurnMs: longest?.longest == null ? null : Number(longest.longest),
     }
+  }
+
+  bindNativeCodexThread(thread: ThreadRecord, provider: string, childId: string): boolean {
+    const result = this.db
+      .prepare(`UPDATE threads SET codex_session_id = ?, native_codex_provider = ?
+      WHERE id = ? AND model = ? AND runtime_backend = 'codex' AND archived = 0 AND codex_session_id IS NULL`)
+      .run(childId, provider, thread.id, thread.model)
+    return result.changes === 1
+  }
+
+  rememberNativePreview(threadId: string, preview: string): void {
+    this.db
+      .prepare("UPDATE threads SET preview = ? WHERE id = ? AND preview = ''")
+      .run(preview, threadId)
   }
 
   updateThreadStatus(threadId: string, status: ThreadStatus): void {
@@ -2258,6 +2275,8 @@ export class SessionStore {
       personality: row.personality == null ? null : String(row.personality),
       runtimeBackend: row.runtime_backend === 'codex' ? 'codex' : 'claude',
       codexSessionId: row.codex_session_id == null ? null : String(row.codex_session_id),
+      nativeCodexProvider:
+        row.native_codex_provider == null ? null : String(row.native_codex_provider),
       memoryMode:
         row.memory_mode === 'enabled' || row.memory_mode === 'disabled' ? row.memory_mode : null,
       projectId: row.project_id == null ? null : String(row.project_id),

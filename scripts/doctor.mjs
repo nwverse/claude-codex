@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import {
   accessSync,
   closeSync,
@@ -13,6 +13,7 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
+import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 
 // Paths come from this script's location, so the doctor checks this checkout
@@ -40,7 +41,7 @@ const adapterPath = env.CLAUDE_CODEX_ADAPTER || join(repoRoot, 'dist', 'src', 'a
 const checks = []
 let runtimeType = null
 
-check('runtime type', () => {
+await check('runtime type', () => {
   // A line the doctor cannot evaluate may set the runtime differently in the
   // shim, so a guess from the rest would be a false ok.
   const unread = runtimeEnv.skipped.filter((item) =>
@@ -60,14 +61,14 @@ check('runtime type', () => {
 })
 
 if (runtimeEnv.skipped.length > 0)
-  check('runtime env file', () => {
+  await check('runtime env file', () => {
     // Not a failure: the shim may read them fine. The checks below use the
     // environment's values for these keys instead.
     const lines = runtimeEnv.skipped.map(skippedLine)
     return `skipped lines the doctor cannot evaluate: ${lines.join(', ')}`
   })
 
-check('node >= 24 with stable node:sqlite', () => {
+await check('node >= 24 with stable node:sqlite', () => {
   // node:sqlite ships flag-gated on Node 22 and stable on Node 24+. The adapter
   // imports it without --experimental-sqlite, so anything older than 24 will
   // crash at runtime even if it advertises a sqlite module.
@@ -76,7 +77,7 @@ check('node >= 24 with stable node:sqlite', () => {
   requireModule('node:sqlite')
 })
 
-check('built adapter starts', () => {
+await check('built adapter starts', () => {
   if (!existsSync(adapterPath)) throw new Error(`${adapterPath} does not exist; run npm run build`)
   // The shim answers the plain startup probe itself; one with client info
   // goes to the adapter, which answers it without opening its state.
@@ -96,14 +97,21 @@ check('built adapter starts', () => {
   return `appServerVersion ${version}`
 })
 
-check('shim version probe', () => {
+await check('shim version probe', () => {
   const result = run(shimPath, ['--version'], { CLAUDE_CODEX_ADAPTER: adapterPath })
   if (!/codex-cli/.test(result.stdout))
     throw new Error(`unexpected version output: ${result.stdout}`)
 })
 
+// The native Codex harness runs Codex threads in a real `codex app-server`.
+const nativeCodex = ['on', '1', 'true'].includes(
+  (env.CLAUDE_CODEX_NATIVE_CODEX ?? '').trim().toLowerCase(),
+)
+if (nativeCodex)
+  await check('real codex app-server answers (native Codex harness)', probeNativeCodex)
+
 if (runtimeType === 'agent-sdk-sidecar')
-  check('@anthropic-ai/claude-agent-sdk installed', () => {
+  await check('@anthropic-ai/claude-agent-sdk installed', () => {
     // The native TS runtime imports the SDK dynamically; verify it resolves
     // from this package's node_modules.
     const pkgPath = join(repoRoot, 'node_modules/@anthropic-ai/claude-agent-sdk/package.json')
@@ -113,7 +121,7 @@ if (runtimeType === 'agent-sdk-sidecar')
   })
 
 if (runtimeType === 'agent-http' || runtimeType === 'agentapi')
-  check(`${runtimeType} HTTP endpoint`, () => {
+  await check(`${runtimeType} HTTP endpoint`, () => {
     const url = new URL('/status', httpBaseUrl())
     const result = run(process.execPath, [
       '-e',
@@ -124,13 +132,13 @@ if (runtimeType === 'agent-http' || runtimeType === 'agentapi')
   })
 
 if (runtimeType === 'claude-p')
-  check('claude-p command', () => {
+  await check('claude-p command', () => {
     const command = env.CLAUDE_CODEX_CLAUDE_P_COMMAND || env.CLAUDE_P || 'claude-p'
     run(command, ['--version'])
   })
 
 if (runtimeType === 'codex' || runtimeType === 'codex-proxy')
-  check(
+  await check(
     runtimeType === 'codex' ? 'real Codex passthrough' : 'real Codex CLI for codex-proxy',
     () => {
       // The shim runs the real Codex in the native mode; the adapter runs
@@ -142,7 +150,7 @@ if (runtimeType === 'codex' || runtimeType === 'codex-proxy')
   )
 
 if (runtimeType === 'agent-sdk-sidecar')
-  check('Claude auth surface for real smoke', () => {
+  await check('Claude auth surface for real smoke', () => {
     if (env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_USE_BEDROCK || env.CLAUDE_CODE_USE_VERTEX) return
     run(resolveClaudeCommand(), ['--version'])
   })
@@ -155,9 +163,9 @@ for (const item of checks) {
 if (checks.some((item) => !item.ok)) process.exit(1)
 
 // A check passes unless it throws; a string it returns is shown after the name.
-function check(name, fn) {
+async function check(name, fn) {
   try {
-    const message = fn()
+    const message = await fn()
     checks.push({ name, ok: true, message: typeof message === 'string' ? message : undefined })
   } catch (error) {
     checks.push({
@@ -165,6 +173,79 @@ function check(name, fn) {
       ok: false,
       message: error instanceof Error ? error.message : String(error),
     })
+  }
+}
+
+// Hold stdin open until a framed initialize response arrives, then reap the
+// process even when it errors, stops answering, or ignores SIGTERM.
+async function probeNativeCodex() {
+  const command = adapterRealCodex()
+  if (!command) throw new Error('set CODEX_REAL to the real codex binary')
+  const group = process.platform !== 'win32'
+  const proc = spawn(command, ['app-server', '--listen', 'stdio://'], {
+    env,
+    detached: group,
+    stdio: ['pipe', 'pipe', 'ignore'],
+  })
+  const closed = new Promise((resolve) => proc.once('close', resolve))
+  const lines = createInterface({ input: proc.stdout, crlfDelay: Infinity })
+  function signal(sig) {
+    if (!proc.pid) return
+    try {
+      if (group) process.kill(-proc.pid, sig)
+      else proc.kill(sig)
+    } catch {
+      /* the process already exited */
+    }
+  }
+  const interrupt = () => {
+    signal('SIGKILL')
+    process.exit(130)
+  }
+  const terminate = () => {
+    signal('SIGKILL')
+    process.exit(143)
+  }
+  process.once('SIGINT', interrupt)
+  process.once('SIGTERM', terminate)
+  let timeout
+  try {
+    await new Promise((resolve, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error('timed out waiting for the Codex initialize response')),
+        25_000,
+      )
+      proc.once('error', reject)
+      proc.once('close', () => reject(new Error('Codex exited before answering initialize')))
+      proc.stdin.once('error', reject)
+      lines.on('line', (line) => {
+        let reply
+        try {
+          reply = JSON.parse(line)
+        } catch {
+          return
+        }
+        if (reply?.id !== 1 || reply.method != null) return
+        if (reply.error)
+          reject(new Error(`Codex initialize failed (${reply.error.code ?? 'unknown error'})`))
+        else if (Object.hasOwn(reply, 'result')) resolve()
+      })
+      proc.stdin.write(
+        `${JSON.stringify({ id: 1, method: 'initialize', params: { clientInfo: { name: 'claude-codex-doctor', version: '0' } } })}\n`,
+      )
+    })
+  } finally {
+    clearTimeout(timeout)
+    lines.close()
+    proc.stdin.end()
+    signal('SIGTERM')
+    const kill = setTimeout(() => signal('SIGKILL'), 1000)
+    await closed
+    clearTimeout(kill)
+    // An app-server may have spawned a child that has closed its stdio.
+    if (group) signal('SIGKILL')
+    process.removeListener('SIGINT', interrupt)
+    process.removeListener('SIGTERM', terminate)
   }
 }
 

@@ -25,6 +25,34 @@ mode saved there) takes Claude Code's WebSearch tool away on the SDK route and
 WebSearch there whatever the web search setting says, as Claude Code's own
 setting decides [memories](/guide/gui#memories) there.
 
+## Harnesses
+
+With `CLAUDE_CODEX_NATIVE_CODEX=on`, each chat picks one of three harnesses from
+the Codex App's model menu:
+
+| Menu label | Model ids | Runs on |
+| --- | --- | --- |
+| Claude Code · … | Claude (and gateway) ids, as before | Claude Code through the Agent SDK |
+| Codex · … | `gpt-*` | a real `codex app-server` on the `openai` provider (ChatGPT login) |
+| Codex+AsterGate · … | `codex-ag:<model>` | a real `codex app-server` on `CLAUDE_CODEX_CODEX_AG_PROVIDER` |
+
+The adapter keeps a native chat’s sidebar entry, project and section. Codex
+stores its conversation and handles approvals, streamed items, forks and
+history. The adapter starts one child process per provider on demand and stops
+idle children after `CLAUDE_CODEX_NATIVE_IDLE_MS`.
+
+The first turn of a new chat selects its harness. Later turns and forks can
+switch models within the same harness. Each native chat stores its original
+provider, including across restarts and changes to the provider setting.
+Existing `codex exec` conversations continue on their original route. Turning
+native mode off keeps native sidebar entries. Re-enable it to reopen them.
+
+Fresh title helpers run on Claude. A description fork of a native chat uses
+its parent’s provider and rollout, so that provider processes the description.
+Search within a native chat reads its Codex history. Global sidebar search
+covers its name and preview. The child receives App dynamic tools when
+`CLAUDE_CODEX_DYNAMIC_TOOLS=1`.
+
 ## Switching routes
 
 Install the host helper next to the shim:
