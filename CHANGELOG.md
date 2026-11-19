@@ -145,6 +145,13 @@ versioning or publishing metadata.
   `excludedThreadIds`, and the exclusion applies before the page limit. A
   malformed or oversized (more than 100) `excludedThreadIds` returns
   `invalidRequest`, for `thread/search` too.
+- `fs/watch` follows Codex: it keeps the path the client sent instead of its
+  realpath, watches a file (such as `.git/HEAD`) through its directory so the
+  watch survives git's lock-file rename and reports the file's own path, accepts
+  a file that does not exist yet, coalesces each watch's events over 200 ms,
+  and refuses a `watchId` already in use on the same connection with
+  `watchId already exists: <id>`. Watch ids are per connection, and a closed
+  connection's watches are dropped.
 - A `command/exec` that hits `timeoutMs` now stops its whole process group
   (SIGTERM, then SIGKILL after 1 s) and reports `exitCode` 124. The reply comes
   when the command exits plus at most a 2 s output drain, so a backgrounded
