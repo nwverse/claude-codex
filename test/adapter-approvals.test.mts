@@ -869,3 +869,83 @@ test('a Read Claude asks about asks on the command card, with a session allow fo
   assert.equal(item?.status, 'completed')
   assert.equal(item?.aggregatedOutput, '127.0.0.1 localhost')
 })
+
+test('a thread/start naming no policy, or only a custom profile, gets the config/read defaults', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'config/read', params: {} }))
+    const config = (await reader.nextResponse(1)).result.config
+    assert.equal(config.approval_policy, 'on-request')
+    assert.equal(config.sandbox_mode, 'workspace-write')
+
+    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const plain = (await reader.nextResponse(2)).result
+    assert.equal(plain.approvalPolicy, 'on-request')
+    assert.equal(plain.sandbox.type, 'workspaceWrite')
+    assert.deepEqual(plain.activePermissionProfile, { id: ':workspace', extends: null })
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), permissions: 'my-profile' },
+      }),
+    )
+    const custom = (await reader.nextResponse(3)).result
+    assert.equal(custom.approvalPolicy, 'on-request')
+    assert.equal(custom.sandbox.type, 'workspaceWrite')
+    assert.deepEqual(custom.activePermissionProfile, { id: 'my-profile', extends: null })
+
+    // Tools on either thread ask the App before they run.
+    for (const [id, threadId] of [
+      [4, plain.thread.id],
+      [5, custom.thread.id],
+    ]) {
+      sendTurn(proc, id, threadId, 'please run approval bash')
+      const asked = await awaitMessage(
+        reader,
+        (message) =>
+          message.method === 'item/commandExecution/requestApproval' ||
+          message.method === 'turn/completed',
+      )
+      assert.equal(asked.method, 'item/commandExecution/requestApproval')
+      assert.equal(asked.params.threadId, threadId)
+      proc.stdin.write(json({ id: asked.id, result: { decision: 'decline' } }))
+      await awaitMessage(reader, (message) => message.method === 'turn/completed')
+    }
+
+    // A policy the adapter cannot read leaves the thread asking, and it says so.
+    proc.stdin.write(
+      json({
+        id: 6,
+        method: 'thread/resume',
+        params: { threadId: plain.thread.id, approvalPolicy: 'granular' },
+      }),
+    )
+    assert.equal((await reader.nextResponse(6)).result.approvalPolicy, 'on-request')
+
+    // Defaults the user set still apply, Full Access included.
+    proc.stdin.write(
+      json({
+        id: 7,
+        method: 'config/batchWrite',
+        params: {
+          edits: [
+            { keyPath: 'approval_policy', value: 'never', mergeStrategy: 'upsert' },
+            { keyPath: 'sandbox_mode', value: 'danger-full-access', mergeStrategy: 'upsert' },
+          ],
+        },
+      }),
+    )
+    await reader.nextResponse(7)
+    proc.stdin.write(json({ id: 8, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const configured = (await reader.nextResponse(8)).result
+    assert.equal(configured.approvalPolicy, 'never')
+    assert.equal(configured.sandbox.type, 'dangerFullAccess')
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})

@@ -47,6 +47,16 @@ an inline visualization that the App renders inside the reply, as it does for
 Codex. The request was in Chinese, so are the labels. See
 **[Inline visualizations](/guide/gui#inline-visualizations)**.
 
+<details>
+<summary>Show the animated recreation</summary>
+
+![A pointer highlights June and May in the signup charts](/images/inline-visualization.webp)
+
+In this recreation, the June tooltip shows 204 signups (+27.5%) and the May
+tooltip shows 160 (−6.4%). It uses the same synthetic data as the screenshot.
+
+</details>
+
 ## What it does
 
 The adapter implements the Codex `app-server` v2 protocol (stdio, WebSocket,

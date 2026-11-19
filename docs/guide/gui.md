@@ -413,6 +413,16 @@ this as a chart", "draw the flow") or let Claude offer one where it helps.
 highlighted and the trend summed up below. The request was in Chinese, so are
 the labels.*
 
+<details>
+<summary>Show the animated recreation</summary>
+
+![A pointer highlights June and May in the signup charts](/images/inline-visualization.webp)
+
+In this recreation, the June tooltip shows 204 signups (+27.5%) and the May
+tooltip shows 160 (−6.4%). It uses the same synthetic data as the screenshot.
+
+</details>
+
 **How Claude finds the skill.** Each time it starts, the App installs its
 bundled plugins with `plugin/install`. The adapter remembers the `visualize`
 plugin (in `config.json` under its state folder, so it survives restarts) and

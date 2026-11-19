@@ -1,5 +1,7 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import {
+  accessSync,
+  constants,
   existsSync,
   lstatSync,
   readFileSync,
@@ -857,7 +859,7 @@ export class CodexClaudeAppServer {
     // Startup also drops legacy overrides, including private desktop MCP
     // settings. Keep the server available if the settings file is unreadable.
     try {
-      this.store.transaction(() => this.loadPersistedConfig(true))
+      this.loadPersistedConfig(true)
     } catch (error) {
       debugLog('config.load.failed', {
         path: this.configPath,
@@ -1547,14 +1549,19 @@ export class CodexClaudeAppServer {
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
+      // A start that names no policy, or only a profile the adapter cannot
+      // resolve, gets what config/read reports, as Codex does: never Full
+      // Access by default.
       approvalPolicy:
         permissionProfile?.approvalPolicy ??
         normalizeApprovalPolicy(params.approvalPolicy) ??
-        'never',
+        normalizeApprovalPolicy(this.configOverrides.approval_policy) ??
+        'on-request',
       sandboxMode:
         permissionProfile?.sandboxMode ??
         normalizeSandboxMode(params.sandbox) ??
-        'danger-full-access',
+        normalizeSandboxMode(this.configOverrides.sandbox_mode) ??
+        'workspace-write',
       permissionProfileId: permissionProfile?.id ?? null,
       // Helper threads never ask the user anything.
       // App rule: auto-review
@@ -1626,9 +1633,9 @@ export class CodexClaudeAppServer {
       cwd: options.cwd,
       model: options.model,
       effort: leader.reasoningEffort,
-      // A leader without a policy asks before tools run. thread/start reads
-      // a missing one as never and full access, so pass the asking pair that
-      // runs the same: a started chat gets no more than its leader.
+      // A leader without a policy asks before tools run. Pass the leader's
+      // own policy, or the asking pair that runs the same, rather than the
+      // configured defaults: a started chat gets no more than its leader.
       approvalPolicy: leader.approvalPolicy ?? 'on-request',
       sandbox: leader.sandboxMode ?? 'workspace-write',
       permissions: leader.permissionProfileId,
@@ -9930,7 +9937,8 @@ export class CodexClaudeAppServer {
       runtimeWorkspaceRoots: [thread.cwd],
       instructionSources:
         thread.runtimeBackend === 'codex' ? [] : projectInstructions(thread.cwd).sources,
-      approvalPolicy: thread.approvalPolicy ?? 'never',
+      // A thread stored without a policy asks before tools run.
+      approvalPolicy: thread.approvalPolicy ?? 'on-request',
       // App rule: auto-review
       approvalsReviewer: thread.approvalsReviewer ?? 'user',
       sandbox: sandboxEnvelope(thread.sandboxMode, thread.cwd),
@@ -10720,8 +10728,15 @@ export class CodexClaudeAppServer {
       : []
     // A model missing from this adapter's picker can be valid for a different
     // adapter. Keep its on-disk selection until an explicit model edit.
-    if (repairLegacyOverrides && pruned)
-      this.persistConfig(saved, { overrides: this.configOverrides })
+    if (repairLegacyOverrides && pruned) {
+      // A clean startup only reads. Recheck inside the writer lock before
+      // migrating, in case another process saved since the initial read.
+      this.store.transaction(() => {
+        const current = this.loadPersistedConfig()
+        if (asTable(current?.overrides))
+          this.persistConfig(current, { overrides: this.configOverrides })
+      })
+    }
     return saved
   }
 
@@ -10740,7 +10755,7 @@ export class CodexClaudeAppServer {
     edits: Record<string, unknown>,
   ): void {
     // Initialize missing or malformed files in the established format. On a
-    // valid file, merge only this request's edits, including unknown keys.
+    // valid file, preserve every key outside this request's edits.
     const config = {
       ...(saved ?? {
         model: this.configModel,
@@ -10761,10 +10776,13 @@ export class CodexClaudeAppServer {
       links.add(target)
       target = resolve(dirname(target), readlinkSync(target))
     }
+    // Renaming can replace a read-only file in a writable directory. Honor
+    // the file permissions that a direct config write would enforce.
+    if (existsSync(target)) accessSync(target, constants.W_OK)
     const temp = `${target}.${newId()}.tmp`
     try {
       ensureParent(target)
-      writeFileSync(temp, JSON.stringify(config, null, 2) + '\n', { mode: 0o600, flag: 'wx' })
+      writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: 'wx' })
       renameSync(temp, target)
     } finally {
       rmSync(temp, { force: true })

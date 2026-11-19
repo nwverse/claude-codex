@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { promisify } from 'node:util'
 
@@ -10,15 +10,15 @@ const execFileAsync = promisify(execFile)
 const modeScript = resolve('scripts/claude-codex-mode')
 
 async function runMode(stateDir: string, ...args: string[]) {
-  const { stdout } = await execFileAsync('bash', [modeScript, ...args], {
-    env: {
-      ...process.env,
-      CLAUDE_CODEX_STATE_DIR: stateDir,
-      // Never read the developer's real runtime.env.
-      CLAUDE_CODEX_RUNTIME_ENV: join(stateDir, 'runtime.env'),
-    },
-    timeout: 20_000,
-  })
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    CLAUDE_CODEX_STATE_DIR: stateDir,
+    // Never read the developer's real runtime.env.
+    CLAUDE_CODEX_RUNTIME_ENV: join(stateDir, 'runtime.env'),
+  }
+  // Nor the developer's adapter home.
+  for (const key of ['CLAUDE_CODEX_DEBUG_LOG', 'CLAUDE_CODEX_HOME', 'CODEX_HOME']) delete env[key]
+  const { stdout } = await execFileAsync('bash', [modeScript, ...args], { env, timeout: 20_000 })
   return stdout
 }
 
@@ -61,6 +61,41 @@ test('logs <bridge> falls back to the legacy log without pooled bridges', async 
     await writeFile(join(stateDir, 'agentapi.log'), 'legacy\n')
 
     assert.equal(await runMode(stateDir, 'logs', 'agentapi', '5'), 'legacy\n')
+  } finally {
+    await rm(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('logs adapter reads debug.jsonl in the adapter home runtime.env names', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'claude-codex-mode logs-'))
+  try {
+    const writeLog = async (path: string, text: string) => {
+      await mkdir(dirname(path), { recursive: true })
+      await writeFile(path, `${text}\n`)
+    }
+    const codexHome = join(stateDir, 'codex home')
+    const adapterHome = join(stateDir, 'adapter home')
+    const explicit = join(stateDir, 'explicit', 'debug.jsonl')
+    await writeLog(join(codexHome, 'claude-codex-adapter', 'debug.jsonl'), 'codex home')
+    await writeLog(join(adapterHome, 'debug.jsonl'), 'adapter home')
+    await writeLog(explicit, 'explicit')
+    const runtimeEnv = async (...lines: string[]) =>
+      writeFile(join(stateDir, 'runtime.env'), `${lines.join('\n')}\n`)
+
+    await runtimeEnv(`export CODEX_HOME='${codexHome}'`)
+    assert.equal(await runMode(stateDir, 'logs', 'adapter', '5'), 'codex home\n')
+
+    await runtimeEnv(
+      `export CODEX_HOME='${codexHome}'`,
+      `export CLAUDE_CODEX_HOME='${adapterHome}'`,
+    )
+    assert.equal(await runMode(stateDir, 'logs', 'adapter', '5'), 'adapter home\n')
+
+    await runtimeEnv(
+      `export CLAUDE_CODEX_HOME='${adapterHome}'`,
+      `export CLAUDE_CODEX_DEBUG_LOG='${explicit}'`,
+    )
+    assert.equal(await runMode(stateDir, 'logs', 'adapter', '5'), 'explicit\n')
   } finally {
     await rm(stateDir, { recursive: true, force: true })
   }

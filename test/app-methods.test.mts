@@ -18,6 +18,8 @@ import { delimiter, join, resolve } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { isDeepStrictEqual } from 'node:util'
+import { CodexClaudeAppServer } from '../src/server.mjs'
+import { SessionStore } from '../src/store.mjs'
 import { searchPattern } from '../src/thread-history.mjs'
 import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
@@ -311,6 +313,15 @@ test(
       const file = join(directory, 'config.json')
       await server.request('config/value/write', { keyPath: 'model', value: 'sonnet' })
       const before = await readFile(file, 'utf8')
+      await chmod(file, 0o400)
+      try {
+        await assert.rejects(
+          server.request('config/value/write', { keyPath: 'model', value: 'opus' }),
+          /EACCES|EPERM/,
+        )
+      } finally {
+        await chmod(file, 0o600)
+      }
       await chmod(directory, 0o500)
       try {
         await assert.rejects(
@@ -325,6 +336,26 @@ test(
     })
   },
 )
+
+test('opening clean settings takes no database writer lock', async (t) => {
+  await withInProcessApp(
+    scriptedRuntime(async () => {}),
+    async ({ home, request }) => {
+      await request('config/value/write', { keyPath: 'model', value: 'opus' })
+      const secondStore = new SessionStore(join(home, 'state.sqlite'))
+      const transaction = t.mock.method(secondStore, 'transaction')
+      const second = new CodexClaudeAppServer(
+        secondStore,
+        scriptedRuntime(async () => {}),
+      )
+      try {
+        assert.equal(transaction.mock.callCount(), 0)
+      } finally {
+        await second.stop()
+      }
+    },
+  )
+})
 
 test('another model catalog and simultaneous writers preserve unrelated settings', async () => {
   await withServer(

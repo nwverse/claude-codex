@@ -56,8 +56,36 @@ bridge (`claude-codex-mode model <alias>`).
 In `CLAUDE_CODEX_RUNTIME_TYPE=codex` the shim launches the real Codex
 app-server, so the adapter is not in the process and cannot switch back from
 in-App controls. Use `claude-codex-mode set codex` / `set agent-sdk-sidecar` on
-the host and reconnect.
+the host and reconnect. The adapter itself refuses this value.
 :::
+
+### Shim and mode helper variables
+
+The `codex` shim and `claude-codex-mode` read a few variables of their own:
+
+- `CLAUDE_CODEX_RUNTIME_ENV`: the env file both source, and `npm run doctor`
+  reads. The shim and the doctor default to `~/.claude-codex/runtime.env`, the
+  helper to `runtime.env` in `CLAUDE_CODEX_STATE_DIR`, the same file unless
+  that is set.
+- `CLAUDE_CODEX_STATE_DIR`: the helper's state, legacy bridge logs and bridge
+  pool (default `~/.claude-codex`). Set it in the environment, not in
+  `runtime.env`, which the helper finds through it.
+- `CLAUDE_CODEX_AGENTAPI_COMMAND`: the `agentapi` the helper starts for
+  `agentapi` bridges (default `agentapi`). Both bridge kinds start the Claude
+  Code that `CLAUDE_CODEX_CLI` names (default `claude`).
+- `CLAUDE_CODEX_BRIDGE_PORT_START` / `CLAUDE_CODEX_BRIDGE_PORT_END`: the ports
+  pooled bridges take (default 3284-3384).
+- `CLAUDE_CODEX_ROUTE`: shim only. When set, it decides instead of
+  `CLAUDE_CODEX_RUNTIME_TYPE` whether the shim runs the real Codex app-server
+  (`codex`, `native-codex`, `real-codex`, `native` or `real`) or the adapter,
+  and `claude-codex-mode set` does not change it. `claude-codex-mode show`
+  reports only `CLAUDE_CODEX_RUNTIME_TYPE`, so unset `CLAUDE_CODEX_ROUTE` if
+  `show` and the route the shim takes disagree.
+
+`claude-codex-mode logs adapter` and `tail adapter` read `debug.jsonl` in the
+adapter home (`CLAUDE_CODEX_HOME`, else `claude-codex-adapter` under
+`CODEX_HOME`), or the file `CLAUDE_CODEX_DEBUG_LOG` names, from the environment
+or `runtime.env`.
 
 ## agent-http / Channels
 
@@ -141,7 +169,7 @@ export CLAUDE_CODEX_CLAUDE_P_STOP_TIMEOUT_RETRIES="1"
 
 # Always pass --dangerously-skip-permissions (off by default), so Claude runs
 # every tool without asking whatever the thread's approval policy. Without it
-# the flag is passed only for turns with approval policy "never" or the
-# danger-full-access sandbox.
+# the flag is passed only for turns with approval policy "never" outside a
+# read-only sandbox, or with the danger-full-access sandbox.
 # export CLAUDE_CODEX_CLAUDE_P_SKIP_PERMISSIONS=1
 ```
