@@ -1,7 +1,9 @@
 # Deployment
 
-Choose an isolated foreground listener on a workstation shared with Orca/native
-Codex, or the existing SSH shim on a dedicated remote host.
+The Codex App connects through the SSH shim on a remote host
+([Install the shim](#install-the-shim)). On a workstation shared with Orca or
+native Codex app-server clients, a native Codex CLI can instead connect to an
+isolated foreground listener.
 
 ## Alongside Orca and native Codex
 
@@ -41,11 +43,12 @@ Within the chosen directory, the launcher sets a private Codex home in `codex/`
 and adapter state in `adapter/` (database, recovery records, MCP files, logs and
 the generated `ws-token`). These override inherited `CODEX_HOME`,
 `CLAUDE_CODEX_HOME`, `CLAUDE_CODEX_SOCKET_PATH`, `CLAUDE_CODEX_DEBUG_LOG` and
-`CLAUDE_CODEX_RUN_LOG` in the child only. Native Codex configuration and auth are
-not copied into that home. Claude credentials/configuration and the other
-adapter/runtime options still come from the launcher's environment; the shim's
-runtime env file is not sourced. Automatic shared HTTP bridge management is
-disabled, so this launcher never invokes the global mode helper.
+`CLAUDE_CODEX_RUN_LOG` (a `0`/`false` log opt-out is kept) in the child only.
+Native Codex configuration and auth are not copied into that home. Claude
+credentials/configuration and the other adapter/runtime options still come from
+the launcher's environment; the shim's runtime env file is not sourced.
+Automatic shared HTTP bridge management is disabled, so this launcher never
+invokes the global mode helper.
 
 Capability-token auth is on by default, using the existing WebSocket auth
 implementation. The generated token is private and reused with the state
@@ -53,6 +56,8 @@ directory. Existing WebSocket token-source environment variables and the
 `--ws-*` options remain available; if you configure an external token source,
 use that source in the client command instead. See
 [WebSocket listener](/guide/configuration#websocket-listener).
+`<state-dir>/adapter/ws-token` and the state database are private; keep the
+state directory out of version control (`.claude-codex/` is already gitignored).
 
 ### Foreground lifecycle
 

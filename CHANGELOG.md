@@ -36,6 +36,16 @@ versioning or publishing metadata.
 - A refused listener or another bad listener option ends the adapter with
   exit code 1 and the message alone, without a stack trace.
 
+### Isolated launcher
+
+- New `claude-codex-isolated` bin
+  (`node dist/src/isolated-launch.mjs --state-dir PATH [--port PORT]`) runs a
+  foreground adapter on a loopback `ws://` port. It keeps its own Codex home,
+  adapter state, logs and capability token (token auth is on by default), so a
+  chosen native `codex --remote` CLI can use Claude while Orca and other
+  `codex app-server` clients keep their native route. The SSH shim is
+  unchanged.
+
 ### Failures you can see and act on
 
 - A turn that fails after the computer slept for a minute or more since

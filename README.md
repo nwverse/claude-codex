@@ -36,6 +36,9 @@ npm run doctor       # environment self-check
 
 ### Alongside Orca and native Codex
 
+This route serves a native Codex CLI started with `--remote`; the Codex App
+connects only through the SSH shim below.
+
 Start an isolated foreground adapter from this checkout, using your usual
 Claude Code login or credentials supplied through your shell:
 
@@ -82,8 +85,9 @@ export ANTHROPIC_API_KEY="<your-anthropic-api-key>" # or authenticate with `clau
 
 The shim redirects **every** first-argument `codex app-server` invocation that
 reaches it, including Orca structured chats. `CODEX_REAL` forwards other commands;
-it does not exempt app-server calls in adapter mode. Use the isolated route
-above on a shared workstation. The legacy `claude-codex-mode` switch/restart
+it does not exempt app-server calls in adapter mode. On a workstation shared
+with Orca or native Codex, connect a native Codex CLI through the isolated route
+above instead of installing the shim. The legacy `claude-codex-mode` switch/restart
 helper matches host-wide app-server processes; keep it out of the isolated
 workflow and use the foreground launcher's own lifecycle instead.
 

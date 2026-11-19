@@ -58,14 +58,17 @@ async function main(): Promise<number> {
   try {
     const adapterHome = join(stateDir, 'adapter')
     const args = ['app-server', '--listen', `ws://127.0.0.1:${port}`]
-    args.push(
-      '--ws-auth',
-      values['ws-auth'] ?? process.env.CLAUDE_CODEX_WS_AUTH ?? 'capability-token',
-    )
+    const wsAuth = values['ws-auth'] ?? (process.env.CLAUDE_CODEX_WS_AUTH || 'capability-token')
+    args.push('--ws-auth', wsAuth)
+    if (wsAuth === 'none')
+      process.stderr.write(
+        '[claude-codex-isolated] warning: websocket auth is off; any local process can connect\n',
+      )
     for (const option of ['ws-token-file', 'ws-token-sha256', 'ws-allowed-origins'] as const) {
       const value = values[option]
       if (value !== undefined) args.push(`--${option}`, value)
     }
+    const keepOff = (value?: string) => value === '0' || value === 'false'
     // A fresh child loads every adapter module with the isolated environment.
     // In particular, recovery and orphan reaping must never see another home.
     const child = spawn(
@@ -81,8 +84,12 @@ async function main(): Promise<number> {
           CODEX_HOME: join(stateDir, 'codex'),
           CLAUDE_CODEX_HOME: adapterHome,
           CLAUDE_CODEX_SOCKET_PATH: join(stateDir, 'control.sock'),
-          CLAUDE_CODEX_DEBUG_LOG: join(adapterHome, 'debug.jsonl'),
-          CLAUDE_CODEX_RUN_LOG: join(adapterHome, 'runs.jsonl'),
+          CLAUDE_CODEX_DEBUG_LOG: keepOff(process.env.CLAUDE_CODEX_DEBUG_LOG)
+            ? '0'
+            : join(adapterHome, 'debug.jsonl'),
+          CLAUDE_CODEX_RUN_LOG: keepOff(process.env.CLAUDE_CODEX_RUN_LOG)
+            ? '0'
+            : join(adapterHome, 'runs.jsonl'),
           // The legacy helper manages shared host processes, not this instance.
           CLAUDE_CODEX_HTTP_MANAGE_BRIDGE: '0',
         },
