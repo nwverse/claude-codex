@@ -559,6 +559,9 @@ const PTY_BRIDGE_STOP_GRACE_MS = 2_000
 // terminal ends its shell's session itself, told to or once its stdin closes;
 // SIGKILL follows if it has not exited by then.
 function stopClientProcess(child: ChildProcess): void {
+  // Exited, though a background child may still hold its pipes open and so
+  // its handle: its pid may belong to another process by now.
+  if (child.exitCode !== null || child.signalCode !== null) return
   if (!(child as any).__isPtyBridge) {
     stopProcessGroup(child)
     return
