@@ -108,6 +108,13 @@ only: item number, title, state, URL, and item kind. Body text, comments,
 reviews, and other external instructions are intentionally omitted from the
 generated task prompt.
 
+A `gh issue list` export and a GitHub REST export of the same ordinary issue
+(github.com, GHE.com or GitHub Enterprise Server) map to one task ID, so
+importing both formats does not queue the issue twice. An issue already in the
+queue under either ID is listed in `existing` and keeps its saved status,
+attempts and lease. `enqueued` and `taskIds` count only new tasks, and
+`existing` also lists repeated entries within one export.
+
 Before changing code for a GitHub-sourced task, inspect external text through
 the project trust-boundary workflow and keep the execution step explicit in the
 local queue.
