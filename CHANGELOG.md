@@ -36,6 +36,16 @@ versioning or publishing metadata.
 - A refused listener or another bad listener option ends the adapter with
   exit code 1 and the message alone, without a stack trace.
 
+### Isolated launcher
+
+- New `claude-codex-isolated` bin
+  (`node dist/src/isolated-launch.mjs --state-dir PATH [--port PORT]`) runs a
+  foreground adapter on a loopback `ws://` port. It keeps its own Codex home,
+  adapter state, logs and capability token (token auth is on by default), so a
+  chosen native `codex --remote` CLI can use Claude while Orca and other
+  `codex app-server` clients keep their native route. The SSH shim is
+  unchanged.
+
 ### Failures you can see and act on
 
 - A turn that fails after the computer slept for a minute or more since
@@ -135,6 +145,11 @@ versioning or publishing metadata.
   (SIGTERM, then SIGKILL after 1 s) and reports `exitCode` 124. The reply comes
   when the command exits plus at most a 2 s output drain, so a backgrounded
   child no longer holds it. `command/exec/terminate` stops the group too.
+- Streamed `command/exec` output (`streamStdoutStderr` or `tty`) now honors
+  `outputBytesCap`, including its 1,000,000-byte default, as Codex does: each
+  stream is cut at the cap, the delta that reaches it carries `capReached:
+  true`, and later data on that stream is dropped while the process keeps
+  running. `disableOutputCap` keeps streaming everything.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the
@@ -220,6 +235,12 @@ versioning or publishing metadata.
   Each turn records the process that wrote it, by pid and start time, and
   startup recovery fails only the turns of processes that are gone; turns
   written before this change are recovered as before.
+- Opening the state database no longer rewrites thread rows. The startup
+  repairs for pin state and legacy enum values rewrote every unsectioned
+  thread on each open and scanned the instruction text; they now check with
+  a read first and touch only rows that need fixing, so a clean store opens
+  without a write or the write lock (about 20 ms instead of 320-370 ms for
+  20,000 threads with large instructions).
 - `app-server --print-startup-config` (codex 0.164) prints its one JSON line
   (`appServerVersion` and `configRequirements`) and exits, and
   `app-server daemon version` reports the unix daemon listening on the control
@@ -593,6 +614,8 @@ versioning or publishing metadata.
   A thread that names no reviewer runs as before, except that a call Claude
   Code says only the user may answer now asks in every mode, Full access
   included, and "Allow for this session" covers only that call.
+- When Claude Code withdraws a pending approval or question mid-turn, its card
+  closes, the call is declined, and a late Cancel no longer interrupts the turn.
 
 ### Trustworthy history and settings
 
