@@ -112,6 +112,29 @@ test('gitInfoFor reads HEAD, its branch and origin, and caches per directory', a
   }
 })
 
+// Even the healthy fixture can lose its one-second process budget on a busy
+// runner. Retry that timeout alone, and require a new (uncached) lookup on
+// every attempt, including the first one after the injected failure.
+async function readRecoveredGitInfo(cwd: string, rejected: ReturnType<typeof gitInfoFor>) {
+  for (let attempt = 1; ; attempt++) {
+    const lookup = gitInfoFor(cwd)
+    assert.notEqual(lookup, rejected, 'a failed Git lookup must be evicted')
+    try {
+      return await lookup
+    } catch (error) {
+      const execError = error as { code?: unknown; killed?: boolean; signal?: string }
+      if (
+        attempt === 3 ||
+        execError.code !== null ||
+        execError.killed !== true ||
+        execError.signal !== 'SIGTERM'
+      )
+        throw error
+      rejected = lookup
+    }
+  }
+}
+
 for (const failure of ['timeout', 'signal', 'spawn']) {
   test(`gitInfoFor rejects ${failure} and retries without a cached partial result`, async () => {
     const root = await mkdtemp(join(tmpdir(), 'claude-codex-git-failure-'))
@@ -134,7 +157,8 @@ esac
           { mode: 0o755 },
         )
       }
-      await assert.rejects(gitInfoFor(root), (error: unknown) => {
+      const rejected = gitInfoFor(root)
+      await assert.rejects(rejected, (error: unknown) => {
         const err = error as { killed?: boolean; signal?: string; code?: string }
         if (failure === 'spawn') assert.equal(err.code, 'ENOENT')
         else if (failure === 'timeout') assert.equal(err.killed, true)
@@ -142,8 +166,7 @@ esac
         return true
       })
       await writeFile(executable, healthy, { mode: 0o755 })
-      // No fresh option: failure must have evicted the rejected promise.
-      assert.deepEqual(await gitInfoFor(root), {
+      assert.deepEqual(await readRecoveredGitInfo(root, rejected), {
         sha: 'abc123',
         branch: 'feature/recovered',
         originUrl: 'https://example.com/repo.git',
