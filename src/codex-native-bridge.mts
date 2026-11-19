@@ -6,7 +6,7 @@ import {
   isAgModel,
 } from './harness-models.mjs'
 import { invalidRequest, RpcError, SERVER_ERROR } from './host-methods.mjs'
-import { permissionProfilePolicy } from './server-helpers.mjs'
+import { permissionProfileIdFromParams, permissionProfilePolicy } from './server-helpers.mjs'
 import type { SessionStore } from './store.mjs'
 import type { RpcPeer, ThreadRecord } from './types.mjs'
 import { debugLog, isCodexOpenAiModel } from './util.mjs'
@@ -276,6 +276,13 @@ export class CodexNativeBridge {
     if (method !== 'thread/resume') await this.ensureLoaded(child, thread)
     if (method === 'turn/start' && !thread.preview) this.rememberPreview(thread, params)
     const outgoing = asRecord(this.inbound(params, thread.id, childId, provider))
+    const profile = permissionProfilePolicy(permissionProfileIdFromParams(params))
+    if (profile && !profile.sandboxMode) {
+      // The adapter displays unknown profile ids with its concrete policy.
+      // Preserve that policy (and any explicit sandbox/approval settings).
+      delete outgoing.permissions
+      delete outgoing.activePermissionProfile
+    }
     if (method === 'thread/resume' || method === 'thread/fork') {
       // Both fields override threadId in Codex. An adapter id names a single
       // persisted rollout and the provider that created it.
@@ -330,7 +337,7 @@ export class CodexNativeBridge {
         modelProvider: provider,
         cwd: thread.cwd,
         approvalPolicy: thread.approvalPolicy,
-        ...(permissionProfilePolicy(thread.permissionProfileId)
+        ...(permissionProfilePolicy(thread.permissionProfileId)?.sandboxMode
           ? { permissions: thread.permissionProfileId }
           : { sandbox: thread.sandboxMode }),
         ...(thread.approvalsReviewer ? { approvalsReviewer: thread.approvalsReviewer } : {}),

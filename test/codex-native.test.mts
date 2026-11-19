@@ -515,3 +515,37 @@ test('a single child write with a reply and a completed turn keeps wire order an
     await app.stop()
   }
 })
+
+test('a native user shell can begin the conversation with the configured adapter policy', async () => {
+  const app = startAdapter()
+  try {
+    await initialize(app)
+    const started = await app.request('thread/start', {
+      model: 'gpt-6.1-sol',
+      cwd: app.home,
+      permissions: 'custom-profile',
+    })
+    const threadId = started.result.thread.id
+    assert.deepEqual(
+      (await app.request('thread/shellCommand', { threadId, command: 'printf fixture' })).result,
+      {},
+    )
+    await runTurn(app, threadId, 'decline')
+    const initial = app.childLog().filter((entry) => entry.method === 'thread/start')
+    assert.equal(initial.length, 1)
+    assert.equal(initial[0].params.approvalPolicy, 'on-request')
+    assert.equal(initial[0].params.sandbox, 'workspace-write')
+    assert.ok(!('permissions' in initial[0].params))
+    await app.request('thread/resume', { threadId, permissions: 'custom-profile' })
+    assert.ok(
+      !('permissions' in app.childLog().find((entry) => entry.method === 'thread/resume').params),
+    )
+    const shell = app.childLog().find((entry) => entry.method === 'thread/shellCommand')
+    assert.equal(
+      shell.params.threadId,
+      app.childLog().find((entry) => entry.method === 'turn/start').params.threadId,
+    )
+  } finally {
+    await app.stop()
+  }
+})
