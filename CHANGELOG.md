@@ -163,7 +163,7 @@ versioning or publishing metadata.
   adapter's `debug.jsonl` in its home as the adapter does, under
   `CLAUDE_CODEX_HOME` when that is set, and read `CLAUDE_CODEX_DEBUG_LOG`,
   `CLAUDE_CODEX_HOME`, `CODEX_HOME` and the bridge port range from
-  `runtime.env` too.
+  `runtime.env` too. (#304)
 - A workflow agent that fails (one that stalled on every attempt, or hit an
   API error) ends its thread's turn as failed, with the reason the workflow
   reported, and counts as a failed subagent of its parent. It used to show as
@@ -201,7 +201,7 @@ versioning or publishing metadata.
   `real-codex`) is the `codex` shim's native passthrough, which never starts
   the adapter. An adapter started with it directly still refuses it, but says
   so and to unset it or choose an adapter route, instead of
-  `unknown CLAUDE_CODEX_RUNTIME_TYPE`.
+  `unknown CLAUDE_CODEX_RUNTIME_TYPE`. (#304)
 
 ### App-server and protocol compatibility
 
@@ -1265,7 +1265,7 @@ versioning or publishing metadata.
   `CLAUDE_CODEX_PERMISSION_MODE`, `CLAUDE_CODEX_CLI`, `CLAUDE_CODEX_RUN_LOG`,
   `CLAUDE_CODEX_SESSION_CHANGES` and the summary model, the backends guide
   the shim's and `claude-codex-mode`'s own variables, and the worktree docs
-  say that `CLAUDE_CODEX_AUTO_WORKTREE=1` turns isolation on.
+  say that `CLAUDE_CODEX_AUTO_WORKTREE=1` turns isolation on. (#304)
 
 ### Validation and release gates
 
