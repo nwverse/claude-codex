@@ -6,6 +6,9 @@ import test from 'node:test'
 import { sdkResumeSessionId } from '../src/native-runtime.mjs'
 import { projectSlugs } from '../src/util.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 test('project slugs follow the 200 UTF-16 unit boundary and signed path hash', () => {
   assert.deepEqual(projectSlugs('/' + 'a'.repeat(199)), ['-' + 'a'.repeat(199)])
   assert.deepEqual(projectSlugs('/' + 'a'.repeat(200)), [

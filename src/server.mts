@@ -129,7 +129,6 @@ import { recordRunEvent } from './run-registry.mjs'
 import { normalizeRuntimeType } from './runtime-config.mjs'
 import {
   acceptsAmendment,
-  addedFileDiff,
   addTokenBreakdowns,
   allSelectableModelOptions,
   approvalSessionKey,
@@ -138,14 +137,12 @@ import {
   autoReviewAction,
   buildSystemPromptAddendum,
   type CodexTurnError,
-  coerceStructuredValue,
   collaborationModeEnvelope,
   collaborationModeFromParams,
   collaborationModeSettings,
   commandArray,
   commandEnv,
   compactSummary,
-  conciseStructuredString,
   configEdits,
   configLayerMetadata,
   defaultSelectableModelId,
@@ -153,10 +150,7 @@ import {
   fallbackStructuredText,
   fileChangeFromTool,
   gitDiff,
-  gitUntrackedDiff,
   hasLegacyPermissionParams,
-  isGitWorkTree,
-  isNotAGitRepo,
   isSubagentToolName,
   listFiles,
   modelFromParams,
@@ -176,13 +170,11 @@ import {
   permissionProfileIdFromParams,
   permissionProfileList,
   permissionProfilePolicy,
-  personalityPromptCue,
   plainTurnError,
   projectMetadata,
   projectName,
   projectRoots,
   REVIEW_FALLBACK,
-  readConfigReasoningEffort,
   reasoningEffortFromParams,
   reasoningSummariesVisible,
   retryTurnError,
@@ -190,7 +182,6 @@ import {
   reviewPrompt,
   sandboxEnvelope,
   sandboxFromTurnParams,
-  simpleDiff,
   stringListFromEnv,
   stringOr,
   subagentEffortFromInput,
@@ -242,6 +233,7 @@ import {
   failedImageRead,
   imageReadPath,
   isExploreTool,
+  readsOnly,
   splitMcpToolName,
 } from './tool-items.mjs'
 import {
@@ -263,7 +255,6 @@ import type {
   DynamicToolCallResponse,
   ElicitationRequest,
   ElicitationResponse,
-  FileUpdateChange,
   GoalToolHandlers,
   ImageInput,
   JsonRpcId,
@@ -560,6 +551,40 @@ function stopProcessGroup(child: ChildProcess): void {
   kill.unref()
 }
 
+// The pty bridge's own stop takes up to about 1.2 s: SIGTERM to its shell's
+// group, SIGKILL after 0.2 s, then at most 1 s draining the last output.
+const PTY_BRIDGE_STOP_GRACE_MS = 2_000
+
+// Stops a command/exec or process/spawn process. The pty bridge behind a
+// terminal ends its shell's session itself, told to or once its stdin closes;
+// SIGKILL follows if it has not exited by then.
+function stopClientProcess(child: ChildProcess): void {
+  // Exited, though a background child may still hold its pipes open and so
+  // its handle: its pid may belong to another process by now.
+  if (child.exitCode !== null || child.signalCode !== null) return
+  if (!(child as any).__isPtyBridge) {
+    stopProcessGroup(child)
+    return
+  }
+  if (child.stdin?.writable) {
+    // A bridge that has just exited fails the write.
+    child.stdin.on('error', () => {})
+    child.stdin.end(`${JSON.stringify({ action: 'kill' })}\n`)
+  }
+  const kill = setTimeout(() => child.kill('SIGKILL'), PTY_BRIDGE_STOP_GRACE_MS)
+  kill.unref()
+}
+
+// Drops a process's own entry only: a client that disconnected freed its id,
+// and a new process may have taken it since.
+function forgetProcess(
+  processes: Map<string, ChildProcess>,
+  id: string,
+  child: ChildProcess,
+): void {
+  if (processes.get(id) === child) processes.delete(id)
+}
+
 function isUsageLimitError(error: unknown): boolean {
   const message = typeof asRecord(error).message === 'string' ? String(asRecord(error).message) : ''
   return /usage limit|rate limit|quota|\b429\b/i.test(message)
@@ -680,6 +705,11 @@ export class CodexClaudeAppServer {
   private subscribersByThread = new Map<string, Map<string, RpcPeer>>()
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
+  // Threads a thread/delete is removing. It waits for their turns to end
+  // first; a turn/start in that gap, on one of them or on a subagent thread
+  // below one, is refused rather than starting a turn on a thread that is
+  // about to go.
+  private deletingThreads = new Set<string>()
   private readonly startingTurnByThread = new Map<string, Promise<void>>()
   // Turns whose runtime run is scheduled or has not returned yet. A turn outside this
   // set has nothing left that would ever end it.
@@ -716,6 +746,9 @@ export class CodexClaudeAppServer {
   private sessionApprovals = new Map<string, Set<string>>()
   private commandProcesses = new Map<string, ChildProcess>()
   private processHandles = new Map<string, ChildProcess>()
+  // The connection that started each command/exec and process/spawn process:
+  // as in Codex, they end with it. thread/shellCommand's belong to the thread.
+  private processOwners = new WeakMap<ChildProcess, string>()
   // A watch belongs to the connection that made it: ids are unique per connection.
   private fsWatchers = new WeakMap<RpcPeer, Map<string, PathWatch>>()
   // Goal state lives in the store. These track the hidden continuation turns
@@ -865,14 +898,24 @@ export class CodexClaudeAppServer {
     for (const pending of this.pendingServerRequests.values()) pending.targets.delete(peer.id)
     for (const watch of this.fsWatchers.get(peer)?.values() ?? []) watch.close()
     this.fsWatchers.delete(peer)
+    // Its command/exec and process/spawn processes end with it. Their ids are
+    // freed at once, so a process slow to exit does not keep them taken.
+    for (const processes of [this.commandProcesses, this.processHandles])
+      for (const [id, child] of processes)
+        if (this.processOwners.get(child) === peer.id) {
+          processes.delete(id)
+          stopClientProcess(child)
+        }
   }
 
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
     // command/exec runs in its own process group, out of reach of a signal to
-    // the adapter's group (launchd job stop, Ctrl-C): end what is still running.
+    // the adapter's group (launchd job stop, Ctrl-C), and a terminal has no
+    // timeout: end what is still running.
     for (const child of this.commandProcesses.values()) signalProcessGroup(child, 'SIGTERM')
+    for (const child of this.processHandles.values()) stopClientProcess(child)
     this.stopCommandsListener()
     this.sleepMonitor.stop?.()
     this.idleSleep.stop()
@@ -1049,7 +1092,7 @@ export class CodexClaudeAppServer {
       case 'thread/name/set':
         return this.threadNameSet(asRecord(params))
       case 'thread/archive':
-        return this.threadArchive(asRecord(params), true)
+        return this.threadArchive(peer, asRecord(params))
       case 'thread/unsubscribe':
         return this.threadUnsubscribe(peer, asRecord(params))
       case 'thread/increment_elicitation':
@@ -1115,7 +1158,7 @@ export class CodexClaudeAppServer {
       case 'memory/status':
         return memoryStatus(asRecord(params))
       case 'thread/unarchive':
-        return this.historyForPeer(peer, this.threadArchive(asRecord(params), false))
+        return this.historyForPeer(peer, this.threadUnarchive(asRecord(params)))
       case 'thread/compact/start':
         return this.threadCompactStart(peer, asRecord(params))
       case 'thread/shellCommand':
@@ -2234,7 +2277,7 @@ export class CodexClaudeAppServer {
   // The App pages a long thread from its newest turn, and loads a search
   // match by reading both ways from the match's turn.
   private threadTurnsList(params: Record<string, unknown>): unknown {
-    const threadId = stringOr(params.threadId, '')
+    const threadId = this.knownThreadId(params)
     const itemsView = turnItemsView(params.itemsView)
     const page = pageTurns(this.store.historyTurns(threadId), {
       cursor: params.cursor,
@@ -2245,7 +2288,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadItemsList(params: Record<string, unknown>): unknown {
-    return pageItems(this.store.historyTurns(stringOr(params.threadId, '')), {
+    return pageItems(this.store.historyTurns(this.knownThreadId(params)), {
       turnId: stringOr(params.turnId, '') || null,
       cursor: params.cursor,
       limit: pageLimit(params.limit),
@@ -2254,7 +2297,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadTimelineList(params: Record<string, unknown>): unknown {
-    return pageTimeline(this.store.historyTurns(stringOr(params.threadId, '')), {
+    return pageTimeline(this.store.historyTurns(this.knownThreadId(params)), {
       cursor: params.cursor,
       limit: pageLimit(params.limit),
     })
@@ -2360,6 +2403,7 @@ export class CodexClaudeAppServer {
   private threadTurnItemsList(params: Record<string, unknown>): unknown {
     const turnId = stringOr(params.turnId, '')
     const threadId = stringOr(params.threadId, '')
+    if (threadId && !this.store.getThread(threadId)) throw unknownThread(threadId)
     // A fork's inherited turns keep their ids, so the thread names which copy.
     const turn = threadId ? this.store.historyTurn(threadId, turnId) : this.store.getTurn(turnId)
     return {
@@ -2370,7 +2414,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadNameSet(params: Record<string, unknown>): unknown {
-    const threadId = stringOr(params.threadId, '')
+    const threadId = this.knownThreadId(params)
     const name = params.name == null ? null : String(params.name)
     this.store.updateThreadName(threadId, name)
     this.notifyThread(threadId, {
@@ -2380,20 +2424,32 @@ export class CodexClaudeAppServer {
     return {}
   }
 
-  private threadArchive(params: Record<string, unknown>, archived: boolean): unknown {
-    const threadId = stringOr(params.threadId, '')
-    this.store.setArchived(threadId, archived)
-    this.notifyThread(threadId, {
-      method: archived ? 'thread/archived' : 'thread/unarchived',
-      params: { threadId },
-    })
-    if (!archived) {
-      const thread = this.store.getThread(threadId)
-      if (!thread) throw unknownThread(threadId)
-      return { thread: this.toThread(thread, this.store.historyTurns(threadId)) }
+  // Like Codex, archiving a chat ends what still runs in it (its turn and
+  // background agents) and archives the subagent threads it spawned with it.
+  private async threadArchive(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
+    const threadId = this.knownThreadId(params)
+    await this.stopThreadWork(peer, threadId)
+    for (const id of this.store.subagentTreeIds(threadId)) {
+      this.store.setArchived(id, true)
+      // Its Claude session closes, scheduled jobs included; a later turn
+      // resumes it.
+      this.runtime.resetSession?.(id)
+      this.pendingAutonomousTurns.delete(id)
+      this.notifyThread(id, { method: 'thread/archived', params: { threadId: id } })
+      this.clearThreadState(id)
     }
-    this.clearThreadState(threadId)
     return {}
+  }
+
+  private threadUnarchive(params: Record<string, unknown>): unknown {
+    const threadId = this.knownThreadId(params)
+    for (const id of this.store.subagentTreeIds(threadId)) {
+      this.store.setArchived(id, false)
+      this.notifyThread(id, { method: 'thread/unarchived', params: { threadId: id } })
+    }
+    const thread = this.store.getThread(threadId)
+    if (!thread) throw unknownThread(threadId)
+    return { thread: this.toThread(thread, this.store.historyTurns(threadId)) }
   }
 
   // Drops per-thread in-memory state (session-scoped approvals, token
@@ -2431,10 +2487,12 @@ export class CodexClaudeAppServer {
 
   private threadLoadedList(params: Record<string, unknown>): unknown {
     const loaded = Array.from(this.subscribersByThread.keys())
-    const limit = numberOr(params.limit, loaded.length || 50)
+    const offset = offsetCursor(params.cursor, 'loaded thread')
+    const limit = pageLimit(params.limit) ?? (loaded.length || 50)
+    const end = offset + limit
     return {
-      data: loaded.slice(0, limit),
-      nextCursor: loaded.length > limit ? String(limit) : null,
+      data: loaded.slice(offset, end),
+      nextCursor: end < loaded.length ? String(end) : null,
     }
   }
 
@@ -2514,7 +2572,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadGoalGet(params: Record<string, unknown>): unknown {
-    return { goal: this.store.getGoal(stringOr(params.threadId, '')) }
+    return { goal: this.store.getGoal(this.knownThreadId(params)) }
   }
 
   private threadGoalClear(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -2527,6 +2585,14 @@ export class CodexClaudeAppServer {
     if (cleared)
       this.notifyThread(threadId, { method: 'thread/goal/cleared', params: { threadId } })
     return { cleared }
+  }
+
+  // The request's threadId, refused the way Codex refuses a thread it does
+  // not have, before a handler writes, notifies or answers an empty page.
+  private knownThreadId(params: Record<string, unknown>): string {
+    const threadId = stringOr(params.threadId, '')
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
+    return threadId
   }
 
   private goalThread(threadId: string): ThreadRecord {
@@ -3310,19 +3376,17 @@ export class CodexClaudeAppServer {
       if (params.missingRolloutRecovery === true) return {}
       throw new Error(`no rollout found for thread id ${threadId}`)
     }
-    if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
-    // Background agents go with the thread that launched them (or that they
-    // are, or that they hang off): their turns end before their threads do.
-    for (const entry of [...this.backgroundSubagents.values()]) {
-      if (!entry.running) continue
-      if (
-        entry.parentThreadId !== threadId &&
-        entry.context.childThreadId !== threadId &&
-        !this.isSubagentDescendant(entry.context.childThreadId, threadId)
-      )
-        continue
-      await this.stopBackgroundSubagent(entry)
+    this.deletingThreads.add(threadId)
+    try {
+      await this.removeThread(peer, threadId)
+    } finally {
+      this.deletingThreads.delete(threadId)
     }
+    return {}
+  }
+
+  private async removeThread(peer: RpcPeer, threadId: string): Promise<void> {
+    await this.stopThreadWork(peer, threadId)
     for (const id of this.store.deleteThread(threadId)) {
       this.runtime.resetSession?.(id)
       this.clearThreadState(id)
@@ -3338,7 +3402,23 @@ export class CodexClaudeAppServer {
       for (const target of targets.values())
         this.sendNotification(target, { method: 'thread/deleted', params: { threadId: id } })
     }
-    return {}
+  }
+
+  // Ends a thread's running turn and the background agents that go with it
+  // (that it launched, that it is, or that hang off it), before thread/delete
+  // or thread/archive ends their threads.
+  private async stopThreadWork(peer: RpcPeer, threadId: string): Promise<void> {
+    if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
+    for (const entry of [...this.backgroundSubagents.values()]) {
+      if (!entry.running) continue
+      if (
+        entry.parentThreadId !== threadId &&
+        entry.context.childThreadId !== threadId &&
+        !this.isSubagentDescendant(entry.context.childThreadId, threadId)
+      )
+        continue
+      await this.stopBackgroundSubagent(entry)
+    }
   }
 
   private threadShellCommand(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -4005,7 +4085,7 @@ export class CodexClaudeAppServer {
         addDirs: [],
         enableFileCheckpointing: false,
         outputFormat: null,
-        approvalPolicy: 'never',
+        approvalPolicy: 'on-request',
         sandboxMode: 'read-only',
         systemPromptAddendum: null,
         planMode: false,
@@ -4015,7 +4095,7 @@ export class CodexClaudeAppServer {
         onEvent: async (event) => {
           if (event.type === 'text_delta' && event.delta && active()) {
             collected += event.delta
-            this.store.updateItem(turnId, agentItemId, (item) =>
+            this.store.streamItem(turnId, agentItemId, (item) =>
               item.type === 'agentMessage' ? { ...item, text: item.text + event.delta } : item,
             )
             this.notify(peer, {
@@ -4028,8 +4108,10 @@ export class CodexClaudeAppServer {
             throw new Error(event.result ?? 'compaction turn failed')
           }
         },
-        // Compaction never asks for approvals — it's read-only summarisation.
-        onPermissionRequest: async () => ({ decision: 'accept' }),
+        // The summary needs no tool beyond the reads allowed up front;
+        // anything else is refused, never approved. A decline, not a cancel,
+        // so Claude goes on writing the summary.
+        onPermissionRequest: async () => ({ decision: 'decline' }),
         // Compaction shouldn't ever invoke AskUserQuestion; if it does, return
         // an empty answer so the model proceeds with its summary.
         onUserInputRequest: async (event) => ({
@@ -4065,8 +4147,7 @@ export class CodexClaudeAppServer {
 
   private async startClaimedTurn(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
-    const thread = this.store.getThread(threadId)
-    if (!thread) throw unknownThread(threadId)
+    let thread = this.startableThread(threadId)
     this.checkModelProfileBinding(thread)
     // Follow-up turns the adapter starts itself have no requesting peer.
     if (peer !== DETACHED_PEER) this.subscribe(threadId, peer)
@@ -4116,6 +4197,9 @@ export class CodexClaudeAppServer {
         workflowCommand?.type === 'list',
       )
       if (joined) return { turn: this.toLifecycleTurn(joined) }
+      // Other requests ran while the input waited: take the thread as they
+      // left it, so this turn's write keeps a rename and a delete holds.
+      thread = this.startableThread(threadId)
     }
     // A structured summary or title turn runs its model, mapped to the
     // summary model, for that turn alone; it never rebinds the thread's.
@@ -4275,6 +4359,19 @@ export class CodexClaudeAppServer {
       })
     })
     return { turn: publicTurn }
+  }
+
+  private startableThread(threadId: string): ThreadRecord {
+    const thread = this.store.getThread(threadId)
+    if (!thread || this.isBeingDeleted(threadId)) throw unknownThread(threadId)
+    return thread
+  }
+
+  // store.deleteThread takes a thread's subagent threads with it.
+  private isBeingDeleted(threadId: string): boolean {
+    for (const id of this.deletingThreads)
+      if (id === threadId || this.isSubagentDescendant(threadId, id)) return true
+    return false
   }
 
   // Steers input into the thread's running turn. Returns null when there is
@@ -5622,7 +5719,7 @@ export class CodexClaudeAppServer {
             // thread/tokenUsage/updated notification on the CHILD thread
             // (App's status bar reads from this) and roll the totals into
             // the parent thread so subagent costs aren't invisible.
-            if (parsed.usage && parsed.usage.totalTokens) {
+            if (parsed.usage?.totalTokens) {
               const breakdown: TokenUsageBreakdown = {
                 totalTokens: parsed.usage.totalTokens,
                 inputTokens: 0,
@@ -5723,7 +5820,7 @@ export class CodexClaudeAppServer {
             completeReasoningItem()
             hasTextOutput = true
             const itemId = ensureAgentItem()
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type === 'agentMessage') return { ...item, text: item.text + event.delta }
               return item
             })
@@ -5737,7 +5834,7 @@ export class CodexClaudeAppServer {
             if (event.delta.length === 0) return
             completeAgentItem('commentary')
             const itemId = ensureReasoningItem()
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type !== 'reasoning') return item
               return reasoningVisible
                 ? { ...item, summary: [(item.summary[0] ?? '') + event.delta] }
@@ -5833,7 +5930,7 @@ export class CodexClaudeAppServer {
             // Output that comes after the result is not the item's any more.
             if (!itemId || !openToolItems.has(itemId)) return
             commandOutputSeen.add(itemId)
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
                 return {
                   ...item,
@@ -5861,7 +5958,7 @@ export class CodexClaudeAppServer {
               const started = itemStartedAtMs.get(itemId)
               return started == null ? null : Math.max(0, nowMillis() - started)
             })()
-            const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
+            const parsedExitCode = event.isError ? (parseExitCodeFromResult(event.content) ?? 1) : 0
             const output = exploreItemIds.has(itemId) ? capOutput(resultText) : resultText
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
@@ -7164,7 +7261,7 @@ export class CodexClaudeAppServer {
     const at = this.commandItems.get(event.toolUseId)
     if (!at || at.threadId !== threadId || !event.delta) return
     let found = false
-    this.store.updateItem(at.turnId, at.itemId, (item) => {
+    this.store.streamItem(at.turnId, at.itemId, (item) => {
       if (item.type !== 'commandExecution') return item
       found = true
       return { ...item, aggregatedOutput: appendCommandOutput(item.aggregatedOutput, event.delta) }
@@ -7596,6 +7693,7 @@ export class CodexClaudeAppServer {
     const thread = this.store.getThread(threadId)
     if (
       !thread ||
+      thread.archived ||
       this.activeTurnByThread.has(threadId) ||
       this.runtime.hasPendingContinuation?.(threadId) !== true
     ) {
@@ -7818,6 +7916,10 @@ export class CodexClaudeAppServer {
       thread &&
       (thread.approvalPolicy === 'never' || thread.sandboxMode === 'danger-full-access')
     ) {
+      // A read-only sandbox that never asks runs reads alone and refuses the
+      // rest: nothing would confine another call to reading.
+      if (thread.sandboxMode === 'read-only' && !readsOnly(event.toolName))
+        return { decision: 'decline' }
       return { decision: 'accept' }
     }
     // App rule: mcp-tool-approval
@@ -7924,7 +8026,9 @@ export class CodexClaudeAppServer {
       throw error
     } finally {
       this.notify(peer, { method: 'serverRequest/resolved', params: { threadId, requestId } })
-      this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
+      // A card its turn took down leaves the thread idle.
+      if (this.activeTurnByThread.get(threadId) === turnId)
+        this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     }
     const decision = normalizeDecision(response)
     if (decision === 'acceptForSession' && userOnly) return { decision: 'accept' }
@@ -8167,23 +8271,34 @@ export class CodexClaudeAppServer {
       )
     } finally {
       this.notify(peer, { method: 'serverRequest/resolved', params: { threadId, requestId } })
-      this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
+      // A form or card its turn took down leaves the thread idle.
+      if (this.activeTurnByThread.get(threadId) === params.turnId)
+        this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     }
   }
 
   private async turnInterrupt(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const requestedTurnId = stringOr(params.turnId, '')
+    // Subagent threads are stored too, so this check covers them.
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     this.subscribe(threadId, peer)
     // A background child has no runtime turn of its own; stop its task.
     const background = this.backgroundSubagents.get(threadId)
     if (background?.running) {
+      // A Stop for a run that already reported must not stop the run a
+      // later message resumed.
+      if (requestedTurnId && requestedTurnId !== background.context.childTurnId) return {}
       await this.stopBackgroundSubagent(background)
       return {}
     }
     // Neither does a foreground child: it runs inside its parent's turn.
     if (await this.stopForegroundSubagent(peer, threadId)) return {}
     const activeTurnId = this.activeTurnByThread.get(threadId)
+    // A Stop sent for a turn that has since ended must not stop the turn
+    // that replaced it: a queued message, a goal continuation or Claude's
+    // own follow-up starts within a tick of the last turn ending.
+    if (activeTurnId && requestedTurnId && requestedTurnId !== activeTurnId) return {}
     this.settleInterruptedTurn(peer, threadId, activeTurnId || requestedTurnId)
     // Persist the terminal state before asking the SDK to abort. A few SDK
     // versions deliver one or two buffered tool events during interrupt; the
@@ -8981,6 +9096,7 @@ export class CodexClaudeAppServer {
       detached: process.platform !== 'win32',
     })
     this.commandProcesses.set(processId, child)
+    this.processOwners.set(child, peer.id)
 
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
@@ -9052,7 +9168,7 @@ export class CodexClaudeAppServer {
           code: (error as NodeJS.ErrnoException).code,
         })
         if (timeout) clearTimeout(timeout)
-        this.commandProcesses.delete(processId)
+        forgetProcess(this.commandProcesses, processId, child)
         if (settled) return
         settled = true
         reject(error)
@@ -9062,7 +9178,7 @@ export class CodexClaudeAppServer {
       // the request's lifetime.
       child.once('exit', (code, signal) => {
         if (timeout) clearTimeout(timeout)
-        this.commandProcesses.delete(processId)
+        forgetProcess(this.commandProcesses, processId, child)
         // A child forked as the group was signalled can have missed it.
         if (timedOut) signalProcessGroup(child, 'SIGKILL')
         const finish = () => {
@@ -9166,6 +9282,7 @@ export class CodexClaudeAppServer {
       })
     }
     this.processHandles.set(processHandle, child)
+    this.processOwners.set(child, peer.id)
 
     const capture = (target: Buffer[], chunk: Buffer, currentBytes: number): [number, boolean] => {
       if (currentBytes >= cap) return [currentBytes, true]
@@ -9249,7 +9366,7 @@ export class CodexClaudeAppServer {
       if (exited) return
       exited = true
       if (timeout) clearTimeout(timeout)
-      this.processHandles.delete(processHandle)
+      forgetProcess(this.processHandles, processHandle, child)
       setImmediate(() =>
         this.notify(peer, {
           method: 'process/exited',
@@ -9278,7 +9395,7 @@ export class CodexClaudeAppServer {
         stderrCapReached,
       })
       if (timeout) clearTimeout(timeout)
-      this.processHandles.delete(processHandle)
+      forgetProcess(this.processHandles, processHandle, child)
       this.notify(peer, {
         method: 'process/exited',
         params: {
@@ -9325,10 +9442,7 @@ export class CodexClaudeAppServer {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
     if (!child) throw invalidRequest(`unknown process handle: ${processHandle}`)
-    if ((child as any).__isPtyBridge) {
-      child.stdin?.write(JSON.stringify({ action: 'kill' }) + '\n')
-    }
-    child.kill('SIGTERM')
+    stopClientProcess(child)
     return {}
   }
 
@@ -9878,7 +9992,7 @@ export class CodexClaudeAppServer {
     while (ancestorId && !seen.has(ancestorId)) {
       seen.add(ancestorId)
       const ancestor = this.store.getThread(ancestorId)
-      if (!ancestor || ancestor.threadSource !== 'subagent') break
+      if (ancestor?.threadSource !== 'subagent') break
       depth += 1
       ancestorId = ancestor.forkedFromId
     }
@@ -10208,6 +10322,9 @@ export class CodexClaudeAppServer {
         continue
       this.pendingServerRequests.delete(id)
       debugLog('rpc.serverRequest.dropped', { threadId, turnId, id, method: pending.method })
+      // No answer: the caller declines, sends serverRequest/resolved so every
+      // follower takes its card down, and the runtime's call returns.
+      pending.resolve(null)
     }
   }
 
@@ -10227,7 +10344,7 @@ export class CodexClaudeAppServer {
   private finalizeActiveSubagentsForShutdown(message: string): void {
     for (const [turnId, state] of this.subagentStateByTurn.entries()) {
       const turn = this.store.getTurn(turnId)
-      if (!turn || turn.status !== 'inProgress') {
+      if (turn?.status !== 'inProgress') {
         this.subagentStateByTurn.delete(turnId)
         continue
       }
@@ -10541,22 +10658,7 @@ export class CodexClaudeAppServer {
   }
 
   private bindPeerToDescendants(peer: RpcPeer, rootThreadId: string): void {
-    const queue = [rootThreadId]
-    const seen = new Set<string>()
-    while (queue.length > 0) {
-      const parentId = queue.shift()
-      if (!parentId || seen.has(parentId)) continue
-      seen.add(parentId)
-      for (const child of this.store.listThreads({
-        includeEphemeral: true,
-        parentThreadId: parentId,
-        sortKey: 'created_at',
-        sortDirection: 'asc',
-      })) {
-        this.subscribe(child.id, peer)
-        queue.push(child.id)
-      }
-    }
+    for (const id of this.store.descendantThreadIds(rootThreadId)) this.subscribe(id, peer)
   }
 
   private loadPersistedConfig(): void {

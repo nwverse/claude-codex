@@ -1,62 +1,36 @@
-import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
+import { execFile, spawn } from 'node:child_process'
+import { constants } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { promisify } from 'node:util'
 import type { ConfigEdit } from './app-settings.mjs'
 import type { AppSkill } from './claude-capabilities.mjs'
-import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
 import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
-import type { SessionStore } from './store.mjs'
 import { type AppToolNoteOptions, appToolAvailabilityNote } from './turn-context.mjs'
 import type {
   ApprovalsReviewer,
-  ClaudeRuntime,
   CollaborationModeKind,
   FileUpdateChange,
-  ImageInput,
-  JsonRpcId,
-  JsonRpcRequest,
-  JsonRpcResponse,
   PermissionDecision,
-  RpcPeer,
   RuntimeEvent,
   RuntimeFailure,
   ThreadItem,
   ThreadRecord,
-  ThreadTokenUsage,
   TokenUsageBreakdown,
   TurnRecord,
-  UserInput,
   UserInputAnswers,
   UserInputQuestion,
-  WireMessage,
 } from './types.mjs'
 import {
-  adapterHome,
   claudeModelOptions,
-  claudeOutputFormat,
-  codexCliVersion,
   codexHome,
   codexProxyModelOptions,
-  codexUserAgent,
   debugLog,
-  defaultAllowedTools,
-  ensureParent,
-  extractImageInputs,
-  isCodexOpenAiModel,
-  newId,
   normalizeCodexReasoningEffort,
-  nowMillis,
   nowSeconds,
-  platformFamily,
-  platformOs,
-  resolveClaudeEffort,
-  resolveClaudeModel,
   textFromInput,
   toolOutputInput,
 } from './util.mjs'
-import { maybeCreateThreadWorktree } from './worktree.mjs'
 
 const execFileAsync = promisify(execFile)
 
@@ -1274,11 +1248,6 @@ function unwrapSubagentHandback(text: string): string {
     .replace(/\s+$/, '')
 }
 
-// Best-effort parse of a Claude Bash tool_result for the real shell exit
-// code. Claude's tool result content is usually plain stdout/stderr, but in
-// some failure modes (and via custom wrappers / Codex CLI shims) the SDK
-// suffixes a `Exit code: N` / `exit status N` marker. Returning null lets
-// the caller fall back to 0/1 from event.isError.
 // Map Claude's TodoWrite input to Codex v2 TurnPlanStep[]. Claude todos carry
 // { content, status, activeForm } with status pending|in_progress|completed;
 // the wire TurnPlanStepStatus is camelCase pending|inProgress|completed.
@@ -1305,6 +1274,11 @@ export function todoWriteToPlanSteps(
   })
 }
 
+// Best-effort parse of a failed Claude Bash tool_result for the real shell
+// exit code. Claude Code starts a failed result with `Exit code N` (no colon)
+// followed by the command output; wrappers and the codex proxy may instead end
+// it with `Exit code: N` / `exit status: N`. Callers parse only error results
+// and fall back to 1 when this returns null.
 export function parseExitCodeFromResult(content: unknown): number | null {
   const text =
     typeof content === 'string'
@@ -1315,7 +1289,9 @@ export function parseExitCodeFromResult(content: unknown): number | null {
             .join('')
         : ''
   if (!text) return null
-  const match = text.match(/(?:Exit code|exit status|exit code):\s*(-?\d+)/i)
+  const match =
+    text.match(/^(?:Exit code|exit status):?[ \t]*(-?\d+)[ \t]*(?:\r?\n|$)/i) ??
+    text.match(/(?:^|\n)(?:Exit code|exit status):?[ \t]*(-?\d+)\s*$/i)
   if (!match) return null
   const code = Number(match[1])
   return Number.isFinite(code) ? code : null
@@ -1323,7 +1299,7 @@ export function parseExitCodeFromResult(content: unknown): number | null {
 
 // Maps the raw Anthropic usage block carried on the Claude Agent SDK
 // ResultMessage onto the Codex `TokenUsageBreakdown` shape. Cache-creation
-// tokens count as input; Claude does not separate reasoning output tokens.
+// tokens count as input. Other runtimes may also report reasoning output, a subset of output.
 export function tokenBreakdownFromClaudeUsage(usage: Record<string, unknown>): TokenUsageBreakdown {
   const num = (value: unknown): number =>
     typeof value === 'number' && Number.isFinite(value) ? value : 0
@@ -1331,11 +1307,12 @@ export function tokenBreakdownFromClaudeUsage(usage: Record<string, unknown>): T
   const cacheCreation = num(usage.cache_creation_input_tokens)
   const inputTokens = num(usage.input_tokens) + cacheCreation
   const outputTokens = num(usage.output_tokens)
+  const reasoningOutputTokens = num(usage.reasoning_output_tokens)
   return {
     inputTokens,
     cachedInputTokens: cacheRead,
     outputTokens,
-    reasoningOutputTokens: 0,
+    reasoningOutputTokens,
     totalTokens: inputTokens + cacheRead + outputTokens,
   }
 }
@@ -1492,19 +1469,20 @@ export function fileChangeFromTool(
   ]
 }
 
+function splitDiffLines(text: string): string[] {
+  if (!text) return []
+  const lines = text.split('\n')
+  if (lines[lines.length - 1] === '') lines.pop()
+  return lines
+}
+
 export function simpleDiff(path: string, oldText: string, newText: string): string {
   return [
     `--- a/${path}`,
     `+++ b/${path}`,
     '@@',
-    ...oldText
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => `-${line}`),
-    ...newText
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => `+${line}`),
+    ...splitDiffLines(oldText).map((line) => `-${line}`),
+    ...splitDiffLines(newText).map((line) => `+${line}`),
     '',
   ].join('\n')
 }
@@ -1564,7 +1542,7 @@ export async function gitDiff(cwd: string): Promise<string> {
 
 export async function gitUntrackedDiff(cwd: string): Promise<string> {
   try {
-    const { readFile } = await import('node:fs/promises')
+    const { lstat, open, readlink } = await import('node:fs/promises')
     const { stdout } = await execFileAsync(
       'git',
       ['ls-files', '--others', '--exclude-standard', '-z'],
@@ -1577,9 +1555,30 @@ export async function gitUntrackedDiff(cwd: string): Promise<string> {
     const paths = stdout.split('\0').filter(Boolean).slice(0, 50)
     const diffs: string[] = []
     for (const path of paths) {
-      const bytes = await readFile(`${cwd}/${path}`)
-      if (bytes.includes(0)) continue
-      diffs.push(addedFileDiff(path, bytes.toString('utf8')))
+      try {
+        const fullPath = join(cwd, path)
+        const stats = await lstat(fullPath)
+        if (stats.isSymbolicLink()) {
+          diffs.push(addedFileDiff(path, await readlink(fullPath), '120000'))
+        } else if (stats.isFile()) {
+          // Refuse a link swapped in after lstat, and never block on a FIFO.
+          const file = await open(
+            fullPath,
+            constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+          )
+          try {
+            if (!(await file.stat()).isFile()) continue
+            const bytes = await file.readFile()
+            if (bytes.includes(0)) continue
+            diffs.push(addedFileDiff(path, bytes.toString('utf8')))
+          } finally {
+            await file.close()
+          }
+        }
+      } catch (error) {
+        // A disappearing or unreadable path must not hide the other new files.
+        debugLog('git.untrackedDiff.fileFailed', { cwd, path, error: String(error) })
+      }
     }
     return diffs.join('\n')
   } catch (error) {
@@ -1592,16 +1591,20 @@ export async function gitUntrackedDiff(cwd: string): Promise<string> {
   }
 }
 
-export function addedFileDiff(path: string, text: string): string {
+export function addedFileDiff(path: string, text: string, mode = '100644'): string {
   const lines = text.length === 0 ? [] : text.replace(/\n$/, '').split('\n')
+  // A link target never ends in a newline; git marks that so `git apply` keeps the link intact.
+  const noNewline =
+    mode === '120000' && text !== '' && !text.endsWith('\n') ? ['\\ No newline at end of file'] : []
   return [
     `diff --git a/${path} b/${path}`,
-    'new file mode 100644',
+    `new file mode ${mode}`,
     'index 0000000..0000000',
     '--- /dev/null',
     `+++ b/${path}`,
     `@@ -0,0 +1,${lines.length} @@`,
     ...lines.map((line) => `+${line}`),
+    ...noNewline,
     '',
   ].join('\n')
 }

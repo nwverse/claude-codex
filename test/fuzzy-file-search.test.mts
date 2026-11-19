@@ -6,6 +6,9 @@ import test from 'node:test'
 import { listFiles } from '../src/server-helpers.mjs'
 import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
+// Keep debug.jsonl out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
+
 async function withRg(script: string, run: (root: string) => Promise<void>): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), 'fuzzy-files-'))
   const bin = join(directory, 'bin')

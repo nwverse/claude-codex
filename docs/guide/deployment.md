@@ -106,10 +106,12 @@ resolved secrets, or private infrastructure URLs.
 Codex App keeps using its native SSH flow: it probes `codex --version`, starts
 `codex app-server --listen unix://`, then connects via `codex app-server proxy`.
 The shim routes every first-argument `app-server` call that reaches it to the
-adapter, regardless of the calling client. `CODEX_REAL` is the fallback for
-other commands; it does not protect an Orca/native app-server invocation from
-this routing in adapter mode. Prefer the isolated launcher above on a shared
-workstation. The SSH integration remains available for dedicated remote hosts.
+adapter, regardless of the calling client, except the schema generators
+(`codex app-server generate-ts` and `generate-json-schema`), which go to the
+real codex. `CODEX_REAL` is the fallback for other commands; it does not
+protect an Orca/native app-server invocation from this routing in adapter mode.
+Prefer the isolated launcher above on a shared workstation. The SSH integration
+remains available for dedicated remote hosts.
 
 ::: tip Custom Anthropic endpoints
 If your organization uses a supported custom Anthropic endpoint, configure
@@ -132,7 +134,7 @@ mkdir -p ~/.local/npm-global
 ~/.local/npm-global/bin/claude /login        # interactive: claude.ai OAuth
 
 # 3. Adapter checkout + build.
-git clone https://github.com/fuergaosi233/claude-codex ~/claude-codex && cd ~/claude-codex
+git clone https://github.com/nwverse/claude-codex ~/claude-codex && cd ~/claude-codex
 npm install && npm run build
 
 # 4. Persist PATH + adapter pointers for non-interactive SSH.

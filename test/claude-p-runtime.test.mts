@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import test from 'node:test'
 import { ClaudePTranscriptRuntime } from '../src/claude-p-runtime.mjs'
 import type { RuntimeHandlers, RuntimeTurnContext } from '../src/types.mjs'
@@ -82,10 +82,17 @@ async function waitForFile(path: string, timeoutMs = 10000): Promise<void> {
 }
 
 async function waitForPidFile(pidFile: string, timeoutMs = 10000): Promise<number> {
-  await waitForFile(pidFile, timeoutMs)
-  const pid = Number((await readFile(pidFile, 'utf8')).trim())
-  if (!Number.isFinite(pid) || pid <= 0) throw new Error(`bad pid in ${pidFile}`)
-  return pid
+  // The stub creates the file before it writes the pid: an empty read only
+  // means it has not written yet.
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const text = existsSync(pidFile) ? (await readFile(pidFile, 'utf8')).trim() : ''
+    const pid = Number(text)
+    if (text !== '' && Number.isInteger(pid) && pid > 0) return pid
+    if (text !== '') throw new Error(`bad pid in ${pidFile}: ${text}`)
+    await sleep(25)
+  }
+  throw new Error(`pid file never filled: ${pidFile}`)
 }
 
 function turnContext(overrides: Partial<RuntimeTurnContext> = {}): RuntimeTurnContext {
@@ -244,6 +251,58 @@ test('interrupt follow-up SIGTERM reaches descendants after the leader exits', a
     signals,
     /SIGTERM/,
     'interrupt follow-up SIGTERM must reach the descendant even though claude-p exited on SIGINT',
+  )
+})
+
+test('interrupt reaches descendants even when listing processes is slow', async (t) => {
+  if (process.platform === 'win32') return t.skip('POSIX process trees only')
+  const dir = await mkdtemp(join(tmpdir(), 'claude-p-runtime-slow-ps-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  // A `ps` that answers after 1.5 s, as it does on a loaded Mac with a
+  // thousand-plus processes; the runtime used to give up on it after 1 s.
+  const shimDir = join(dir, 'bin')
+  await mkdir(shimDir)
+  const originalPath = process.env.PATH ?? ''
+  const quotedPath = `'${originalPath.replaceAll("'", "'\\''")}'`
+  await writeFile(
+    join(shimDir, 'ps'),
+    `#!/bin/sh\nsleep 1.5\nPATH=${quotedPath}\nexport PATH\nexec ps "$@"\n`,
+    { mode: 0o755 },
+  )
+  process.env.PATH = `${shimDir}${delimiter}${originalPath}`
+  t.after(() => {
+    process.env.PATH = originalPath
+  })
+  const { runtime, turn, paths } = await startStubTurn(dir, '0', 30000)
+  const settled = turn.then(
+    () => 'resolved',
+    (error: unknown) => `rejected: ${error instanceof Error ? error.message : String(error)}`,
+  )
+  const grandchildPid = await waitForPidFile(paths.pidFile)
+  t.after(() => killLeftover(grandchildPid))
+  await waitForFile(paths.readyFile)
+  let ticks = 0
+  const ticker = setInterval(() => {
+    ticks += 1
+  }, 50)
+  const interruptedAt = Date.now()
+  try {
+    await runtime.interrupt('thread-263')
+  } finally {
+    clearInterval(ticker)
+  }
+  assert.ok(ticks > 0, 'listing processes must not block the event loop')
+  assert.equal(await Promise.race([settled, sleep(5000).then(() => 'unsettled')]), 'resolved')
+  let signals = ''
+  while (Date.now() <= interruptedAt + 10000) {
+    signals = existsSync(paths.markerFile) ? await readFile(paths.markerFile, 'utf8') : ''
+    if (/SIGTERM/.test(signals)) break
+    await sleep(100)
+  }
+  assert.match(
+    signals,
+    /SIGTERM/,
+    'the interrupt follow-up must reach the descendant though ps took longer than 1 s',
   )
 })
 

@@ -9,7 +9,8 @@ plain `.mjs` / shell.
 - `codex-shim` — the `PATH` shim Codex App invokes. Routes `codex app-server`
   into the adapter (`CLAUDE_CODEX_ADAPTER`), answering the plain
   `--print-startup-config` and `daemon version` probes itself without starting
-  node; forwards everything else to the real Codex CLI (`CODEX_REAL`). Keep it
+  node; forwards the `app-server generate-*` schema generators and everything
+  else to the real Codex CLI (`CODEX_REAL`). Keep it
   dependency-free and POSIX-sh portable.
 - `claude-codex-mode` — host helper to switch runtime backends, restart bridges,
   and read status/logs. Writes `~/.claude-codex/runtime.env`.
@@ -19,9 +20,19 @@ plain `.mjs` / shell.
   internal error so it never wedges a session.
 - `doctor.mjs` — environment self-check (`npm run doctor`).
 - `smoke-real-claude.mjs` — round-trips a real Claude turn (`npm run smoke:real`).
-- `acceptance-*.mjs` — end-to-end checks (local-remote, gui-ssh-localhost,
-  ssh-runtime-matrix); transcripts land under git-ignored `.claude-codex/`.
-- `probe-*.mjs` — capability / codex-cli-remote probes.
+- `acceptance-*.mjs` — end-to-end checks (`acceptance-local-remote.mjs`,
+  `acceptance-gui-ssh-localhost.mjs`, `acceptance-ssh-runtime-matrix.mjs`);
+  transcripts land under git-ignored `.claude-codex/`.
+- `probe-*.mjs` — capability / codex-cli-remote probes
+  (`probe-capabilities.mjs`, `probe-codex-cli-remote.mjs`).
+- `pty-bridge.py` — PTY wrapper `server.mts` spawns for interactive TTY
+  commands (e.g. the App's built-in terminal); resolved from the checkout or
+  `~/.local/share/claude-codex/scripts/`.
+- `check-rust-protocol-fixtures.mjs` — drift check for the JSON-RPC fixtures
+  under `crates/claude-codex-protocol/fixtures/`: validates their shape and
+  checks their methods against the TypeScript schema the real Codex CLI
+  generates (`npm run check:rust-protocol-fixtures`). Needs the real `codex`
+  binary, not the shim: `CODEX_REAL` (as CI sets it) or a real `codex` on PATH.
 - `check-app-upgrade.mjs` — checks a new Codex App bundle (or its `app.asar`,
   or an extracted copy) against `app-baseline.json` (the last verified build)
   and lists the App rules to re-check (`npm run check:app-upgrade`). The
