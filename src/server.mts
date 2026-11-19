@@ -551,6 +551,40 @@ function stopProcessGroup(child: ChildProcess): void {
   kill.unref()
 }
 
+// The pty bridge's own stop takes up to about 1.2 s: SIGTERM to its shell's
+// group, SIGKILL after 0.2 s, then at most 1 s draining the last output.
+const PTY_BRIDGE_STOP_GRACE_MS = 2_000
+
+// Stops a command/exec or process/spawn process. The pty bridge behind a
+// terminal ends its shell's session itself, told to or once its stdin closes;
+// SIGKILL follows if it has not exited by then.
+function stopClientProcess(child: ChildProcess): void {
+  // Exited, though a background child may still hold its pipes open and so
+  // its handle: its pid may belong to another process by now.
+  if (child.exitCode !== null || child.signalCode !== null) return
+  if (!(child as any).__isPtyBridge) {
+    stopProcessGroup(child)
+    return
+  }
+  if (child.stdin?.writable) {
+    // A bridge that has just exited fails the write.
+    child.stdin.on('error', () => {})
+    child.stdin.end(`${JSON.stringify({ action: 'kill' })}\n`)
+  }
+  const kill = setTimeout(() => child.kill('SIGKILL'), PTY_BRIDGE_STOP_GRACE_MS)
+  kill.unref()
+}
+
+// Drops a process's own entry only: a client that disconnected freed its id,
+// and a new process may have taken it since.
+function forgetProcess(
+  processes: Map<string, ChildProcess>,
+  id: string,
+  child: ChildProcess,
+): void {
+  if (processes.get(id) === child) processes.delete(id)
+}
+
 function isUsageLimitError(error: unknown): boolean {
   const message = typeof asRecord(error).message === 'string' ? String(asRecord(error).message) : ''
   return /usage limit|rate limit|quota|\b429\b/i.test(message)
@@ -712,6 +746,9 @@ export class CodexClaudeAppServer {
   private sessionApprovals = new Map<string, Set<string>>()
   private commandProcesses = new Map<string, ChildProcess>()
   private processHandles = new Map<string, ChildProcess>()
+  // The connection that started each command/exec and process/spawn process:
+  // as in Codex, they end with it. thread/shellCommand's belong to the thread.
+  private processOwners = new WeakMap<ChildProcess, string>()
   // A watch belongs to the connection that made it: ids are unique per connection.
   private fsWatchers = new WeakMap<RpcPeer, Map<string, PathWatch>>()
   // Goal state lives in the store. These track the hidden continuation turns
@@ -861,14 +898,24 @@ export class CodexClaudeAppServer {
     for (const pending of this.pendingServerRequests.values()) pending.targets.delete(peer.id)
     for (const watch of this.fsWatchers.get(peer)?.values() ?? []) watch.close()
     this.fsWatchers.delete(peer)
+    // Its command/exec and process/spawn processes end with it. Their ids are
+    // freed at once, so a process slow to exit does not keep them taken.
+    for (const processes of [this.commandProcesses, this.processHandles])
+      for (const [id, child] of processes)
+        if (this.processOwners.get(child) === peer.id) {
+          processes.delete(id)
+          stopClientProcess(child)
+        }
   }
 
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
     // command/exec runs in its own process group, out of reach of a signal to
-    // the adapter's group (launchd job stop, Ctrl-C): end what is still running.
+    // the adapter's group (launchd job stop, Ctrl-C), and a terminal has no
+    // timeout: end what is still running.
     for (const child of this.commandProcesses.values()) signalProcessGroup(child, 'SIGTERM')
+    for (const child of this.processHandles.values()) stopClientProcess(child)
     this.stopCommandsListener()
     this.sleepMonitor.stop?.()
     this.idleSleep.stop()
@@ -9044,6 +9091,7 @@ export class CodexClaudeAppServer {
       detached: process.platform !== 'win32',
     })
     this.commandProcesses.set(processId, child)
+    this.processOwners.set(child, peer.id)
 
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
@@ -9115,7 +9163,7 @@ export class CodexClaudeAppServer {
           code: (error as NodeJS.ErrnoException).code,
         })
         if (timeout) clearTimeout(timeout)
-        this.commandProcesses.delete(processId)
+        forgetProcess(this.commandProcesses, processId, child)
         if (settled) return
         settled = true
         reject(error)
@@ -9125,7 +9173,7 @@ export class CodexClaudeAppServer {
       // the request's lifetime.
       child.once('exit', (code, signal) => {
         if (timeout) clearTimeout(timeout)
-        this.commandProcesses.delete(processId)
+        forgetProcess(this.commandProcesses, processId, child)
         // A child forked as the group was signalled can have missed it.
         if (timedOut) signalProcessGroup(child, 'SIGKILL')
         const finish = () => {
@@ -9229,6 +9277,7 @@ export class CodexClaudeAppServer {
       })
     }
     this.processHandles.set(processHandle, child)
+    this.processOwners.set(child, peer.id)
 
     const capture = (target: Buffer[], chunk: Buffer, currentBytes: number): [number, boolean] => {
       if (currentBytes >= cap) return [currentBytes, true]
@@ -9312,7 +9361,7 @@ export class CodexClaudeAppServer {
       if (exited) return
       exited = true
       if (timeout) clearTimeout(timeout)
-      this.processHandles.delete(processHandle)
+      forgetProcess(this.processHandles, processHandle, child)
       setImmediate(() =>
         this.notify(peer, {
           method: 'process/exited',
@@ -9341,7 +9390,7 @@ export class CodexClaudeAppServer {
         stderrCapReached,
       })
       if (timeout) clearTimeout(timeout)
-      this.processHandles.delete(processHandle)
+      forgetProcess(this.processHandles, processHandle, child)
       this.notify(peer, {
         method: 'process/exited',
         params: {
@@ -9388,10 +9437,7 @@ export class CodexClaudeAppServer {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
     if (!child) throw invalidRequest(`unknown process handle: ${processHandle}`)
-    if ((child as any).__isPtyBridge) {
-      child.stdin?.write(JSON.stringify({ action: 'kill' }) + '\n')
-    }
-    child.kill('SIGTERM')
+    stopClientProcess(child)
     return {}
   }
 

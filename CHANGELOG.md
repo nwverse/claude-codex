@@ -226,6 +226,13 @@ versioning or publishing metadata.
   stream is cut at the cap, the delta that reaches it carries `capReached:
   true`, and later data on that stream is dropped while the process keeps
   running. `disableOutputCap` keeps streaming everything.
+- When a client disconnects from a `unix://` or `ws://` adapter, the
+  terminals (`process/spawn`) and `command/exec` processes it started are
+  stopped, as `codex app-server` does, and their handles are free again at
+  once; other clients keep theirs. They used to run on after every App
+  reconnect, holding their handles, and a terminal without a pty even outlived
+  the adapter. A stopping adapter now ends the terminals still open, and
+  `process/kill` follows up with SIGKILL when a process ignores SIGTERM.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the

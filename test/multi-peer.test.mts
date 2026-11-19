@@ -8,6 +8,7 @@ import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import WebSocket from 'ws'
 import { MockRuntime } from '../src/mock-runtime.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
@@ -425,6 +426,72 @@ test('unsubscribing stops one follower only', { timeout: 20_000 }, async () => {
   })
 })
 
+test('a client that disconnects takes its terminals and command/exec processes with it', {
+  timeout: 30_000,
+}, async () => {
+  await withDaemon(async (connect) => {
+    const a = await connect()
+    const b = await connect()
+    // A shell that prints its pid, then waits as an open terminal does.
+    const shell = ['sh', '-c', 'echo $$; exec sleep 300']
+    const terminal = (processHandle: string, extra: Record<string, unknown> = {}) => ({
+      processHandle,
+      command: shell,
+      cwd: process.cwd(),
+      streamStdoutStderr: true,
+      streamStdin: true,
+      ...extra,
+    })
+    const pids: number[] = []
+    const pidOf = async (peer: Client, key: string, id: string) => {
+      pids.push(await printedPid(peer, key, id))
+      return pids.at(-1) as number
+    }
+    try {
+      // The App's terminal (a pty), a streamed process and a command/exec:
+      // none of them has a timeout.
+      await a.request('process/spawn', terminal('a-tty', { tty: true }))
+      const aTty = await pidOf(a, 'processHandle', 'a-tty')
+      await a.request('process/spawn', terminal('a-term'))
+      const aTerm = await pidOf(a, 'processHandle', 'a-term')
+      // command/exec answers when its process ends, which a closed client never hears.
+      a.request('command/exec', {
+        processId: 'a-exec',
+        command: shell,
+        cwd: process.cwd(),
+        streamStdoutStderr: true,
+        disableTimeout: true,
+      }).catch(() => {})
+      const aExec = await pidOf(a, 'processId', 'a-exec')
+      // One that ignores SIGTERM.
+      await a.request('process/spawn', {
+        ...terminal('a-stubborn'),
+        command: ['sh', '-c', 'trap "" TERM; echo $$; while :; do sleep 0.1; done'],
+      })
+      const aStubborn = await pidOf(a, 'processHandle', 'a-stubborn')
+      await b.request('process/spawn', terminal('b-term'))
+      const bTerm = await pidOf(b, 'processHandle', 'b-term')
+
+      a.close()
+      for (const pid of [aTty, aTerm, aExec])
+        assert.ok(await exits(pid, 5_000), `process ${pid} of the closed client still runs`)
+      assert.equal(isAlive(bTerm), true, 'the other client keeps its terminal')
+      // A's handles are free at once, even one whose process has yet to exit.
+      await b.request('process/spawn', terminal('a-stubborn'))
+      const reused = await pidOf(b, 'processHandle', 'a-stubborn')
+      assert.ok(await exits(aStubborn, 5_000), 'SIGKILL follows a SIGTERM that is ignored')
+      // The old process's late exit leaves the handle to the new one.
+      await delay(300)
+      await b.request('process/kill', { processHandle: 'a-stubborn' })
+      assert.ok(await exits(reused, 5_000), 'the reused handle names the new process')
+      await b.request('process/kill', { processHandle: 'b-term' })
+      assert.ok(await exits(bTerm, 5_000), 'process/kill ends the terminal')
+    } finally {
+      for (const pid of pids) if (isAlive(pid)) process.kill(pid, 'SIGKILL')
+    }
+  })
+})
+
 interface Client {
   readonly received: any[]
   receive(message: any): void
@@ -620,6 +687,39 @@ function userMessages(messages: any[]): any[] {
       (message.method === 'item/started' || message.method === 'item/completed') &&
       message.params.item?.type === 'userMessage',
   )
+}
+
+// The pid a process printed first, from the output it streamed to `peer`.
+async function printedPid(peer: Client, key: string, id: string): Promise<number> {
+  const end = Date.now() + 10_000
+  while (Date.now() < end) {
+    const printed = peer.received
+      .filter((message) => message.params?.[key] === id && message.params.deltaBase64)
+      .map((message) => Buffer.from(message.params.deltaBase64, 'base64').toString('utf8'))
+      .join('')
+    const pid = /^\s*(\d+)\s/.exec(printed)?.[1]
+    if (pid) return Number(pid)
+    await delay(20)
+  }
+  throw new Error(`${id} printed no pid`)
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function exits(pid: number, timeoutMs: number): Promise<boolean> {
+  const end = Date.now() + timeoutMs
+  while (isAlive(pid)) {
+    if (Date.now() > end) return false
+    await delay(50)
+  }
+  return true
 }
 
 async function waitForListening(proc: ChildProcess): Promise<void> {
