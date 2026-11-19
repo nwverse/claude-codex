@@ -23,7 +23,7 @@ test('mcpServerStatus/list and startup notifications use conformant Codex v2 sha
       CLAUDE_CODEX_MOCK: '1',
       NODE_NO_WARNINGS: '1',
       CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
-        github: { type: 'stdio', command: 'github-mcp' },
+        github: { type: 'stdio', command: join(home, 'github-mcp') },
       }),
     },
   })
