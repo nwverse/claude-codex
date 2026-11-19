@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { chmodSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { APP_PLUGIN_SERVER_ENV, setAppPluginConfigOverrides } from './app-plugin-mcp.mjs'
 import { sweepCliMcpConfigs } from './cli-mcp-config.mjs'
@@ -15,6 +15,7 @@ import {
   parseProxySockArg,
   prepareWebSocketAuth,
   type RunningTransport,
+  removeStaleSocket,
   runProxy,
   startStdioTransport,
   startWebSocketTransport,
@@ -330,11 +331,8 @@ async function ensureSingleUnixDaemon(listen: string): Promise<string> {
     )
     process.exit(0)
   }
-  // Anything else is a stale file: empty or truncated by a crash, or a pid
-  // the system has since handed to another process. This daemon replaces it.
-  try {
-    if (existsSync(socketPath)) unlinkSync(socketPath)
-  } catch {}
+  // The pid file may be stale. Only a socket can be reclaimed at the listen path.
+  checkOptions(() => removeStaleSocket(socketPath))
   writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o600 })
   try {
     chmodSync(dirname(socketPath), 0o700)

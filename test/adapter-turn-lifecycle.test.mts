@@ -1364,6 +1364,10 @@ test('workflow watchdog disarms when the original Workflow tool result arrives',
 async function runWatchdogScript(windowMs: number, body: string): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   try {
+    // Completing a turn inspects the thread's workspace for changes. Keep the
+    // real checkout (and its git diff latency) out of the watchdog deadline.
+    const workspace = join(home, 'workspace')
+    await mkdir(workspace)
     execFileSync(
       process.execPath,
       [
@@ -1378,6 +1382,7 @@ async function runWatchdogScript(windowMs: number, body: string): Promise<void> 
       import { SessionStore } from './dist/src/store.mjs'
 
       process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      process.env.GIT_CEILING_DIRECTORIES = ${JSON.stringify(home)}
       process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS = '${windowMs}'
       process.env.CLAUDE_CODEX_GOAL_TOOLS = '0'
       const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
@@ -1418,7 +1423,7 @@ async function runWatchdogScript(windowMs: number, body: string): Promise<void> 
         await server.handle(peer, {
           id: 1,
           method: 'thread/start',
-          params: { cwd: process.cwd(), persistExtendedHistory: false },
+          params: { cwd: ${JSON.stringify(workspace)}, persistExtendedHistory: false },
         })
         const threadId = response(1).result.thread.id
         await server.handle(peer, {

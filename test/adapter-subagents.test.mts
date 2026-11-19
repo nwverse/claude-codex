@@ -2129,7 +2129,7 @@ test('a foreground agent finishing beside a background one leaves the background
   try {
     proc.stdin.write(json(codex930Initialize(0)))
     await reader.nextResponse(0)
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: home } }))
     const threadId = (await reader.nextResponse(1)).result.thread.id
     proc.stdin.write(
       json({
@@ -2137,7 +2137,7 @@ test('a foreground agent finishing beside a background one leaves the background
         method: 'turn/start',
         params: {
           threadId,
-          input: [{ type: 'text', text: 'mixed agents check delay=400', text_elements: [] }],
+          input: [{ type: 'text', text: 'mixed agents check delay=0', text_elements: [] }],
         },
       }),
     )
@@ -2160,14 +2160,15 @@ test('a foreground agent finishing beside a background one leaves the background
     assert.deepEqual(wait.receiverThreadIds, [fgChild])
     assert.equal(wait.agentsStates[fgChild].status, 'completed')
     assert.equal(wait.status, 'failed', 'a completed wait would end the background agent too')
-    assert.equal(launch.some(turnCompleted(bgChild)), false)
+    const throughWait = launch.slice(0, waitEnd + 1)
+    assert.equal(throughWait.some(turnCompleted(bgChild)), false)
 
-    const roster = appRoster(liveItems(launch.slice(0, waitEnd + 1), threadId), true)
+    const roster = appRoster(liveItems(throughWait, threadId), true)
     assert.equal(roster.get(fgChild), 'done')
     assert.equal(roster.get(bgChild), 'working')
 
-    const report = await readUntil(reader, turnCompleted(threadId))
-    const childDone = report.find(turnCompleted(bgChild))
+    const isChildDone = turnCompleted(bgChild)
+    const childDone = launch.find(isChildDone) ?? (await readUntil(reader, isChildDone)).at(-1)
     assert.equal(childDone?.params.turn.status, 'completed')
   } finally {
     proc.kill()

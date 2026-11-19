@@ -1295,7 +1295,7 @@ export class MockRuntime implements ClaudeRuntime {
     if (/mixed agents check/i.test(context.prompt)) {
       // One message launches a background agent and a foreground one. The
       // foreground agent finishes inside the turn; the background one reports
-      // after it.
+      // after the foreground result.
       const bgId = `task-bg-${Date.now()}`
       const fgId = `task-fg-${Date.now()}`
       const agentId = MOCK_BACKGROUND_AGENT_ID
@@ -1318,6 +1318,12 @@ export class MockRuntime implements ClaudeRuntime {
         content: `Async agent launched successfully.\nagentId: ${agentId}`,
         structured: { isAsync: true, status: 'async_launched', agentId, prompt },
       })
+      await sleep(50)
+      await handlers.onEvent({ type: 'tool_result', toolUseId: fgId, content: 'foreground report' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'foreground done, background running' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'mixed' })
+      // The foreground wait has been published. The background report may
+      // arrive on either side of the parent turn's final bookkeeping.
       this.scheduleBackgroundReport(
         context.threadId,
         agentId,
@@ -1325,10 +1331,6 @@ export class MockRuntime implements ClaudeRuntime {
         'mixed background report',
         backgroundDelayMs(context.prompt),
       )
-      await sleep(50)
-      await handlers.onEvent({ type: 'tool_result', toolUseId: fgId, content: 'foreground report' })
-      await handlers.onEvent({ type: 'text_delta', delta: 'foreground done, background running' })
-      await handlers.onEvent({ type: 'completed', success: true, result: 'mixed' })
       return
     }
 

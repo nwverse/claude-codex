@@ -165,6 +165,38 @@ test('startup repairs each legacy condition on its own', async (t) => {
   }
 })
 
+test('another adapter can finish a column migration between the probe and the write', async (t) => {
+  const { home, path } = await cleanStore()
+  const other = new DatabaseSync(path)
+  try {
+    other.exec('ALTER TABLE threads DROP COLUMN approval_policy')
+    const alter = 'ALTER TABLE threads ADD COLUMN approval_policy TEXT'
+    const exec = DatabaseSync.prototype.exec
+    let interleaved = false
+    t.mock.method(
+      DatabaseSync.prototype,
+      'exec',
+      function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+        if (!interleaved && (sql === 'BEGIN IMMEDIATE' || sql === alter)) {
+          interleaved = true
+          exec.call(other, alter)
+        }
+        return exec.call(this, sql)
+      },
+    )
+    new SessionStore(path).close()
+    assert.ok(interleaved)
+    assert.ok(
+      other
+        .prepare("SELECT 1 FROM pragma_table_info('threads') WHERE name = 'approval_policy'")
+        .all().length,
+    )
+  } finally {
+    other.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('a clean store opens while another connection holds the write lock', async () => {
   const { home, path } = await cleanStore()
   try {

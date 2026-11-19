@@ -49,6 +49,7 @@ class AppServer {
   >()
   private nextId = 1
   private buffer = ''
+  private failure: Error | null = null
 
   // env adds to or, with undefined values, removes from the adapter's
   // environment.
@@ -64,15 +65,27 @@ class AppServer {
         ...env,
       },
     })
-    this.proc.stderr.resume()
+    let stderr = ''
+    this.proc.stderr.setEncoding('utf8')
+    this.proc.stderr.on('data', (chunk: string) => {
+      stderr = (stderr + chunk).slice(-4096)
+    })
+    this.proc.on('error', (error) => this.fail(error))
+    this.proc.stdin.on('error', (error) => this.fail(error))
+    this.proc.on('close', (code, signal) => {
+      this.fail(new Error(`mock app-server exited (${code ?? signal}): ${stderr.trim()}`))
+    })
     this.proc.stdout.setEncoding('utf8')
     this.proc.stdout.on('data', (chunk: string) => this.read(chunk))
   }
 
   request(method: string, params: Record<string, unknown> = {}): Promise<any> {
+    if (this.failure) return Promise.reject(this.failure)
     const id = this.nextId++
-    this.proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
-    return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }))
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject })
+      this.proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
+    })
   }
 
   // Where the notifications so far end. The server writes a notification
@@ -130,6 +143,12 @@ class AppServer {
       await once(this.proc, 'exit')
     }
     await rm(this.home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+
+  private fail(error: Error): void {
+    this.failure = error
+    for (const request of this.pending.values()) request.reject(error)
+    this.pending.clear()
   }
 
   private read(chunk: string): void {
