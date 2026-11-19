@@ -126,3 +126,133 @@ test('http runtime steers a turn only after its own prompt is posted', {
     await bridge.close()
   }
 })
+
+test('interrupting a queued HTTP turn leaves the bridge owner running and skips the canceled prompt', {
+  timeout: 10_000,
+}, async () => {
+  const bridge = await startBridge()
+  const runtime = new HttpAgentRuntime({
+    kind: 'agent-http',
+    baseUrl: bridge.baseUrl,
+    useSse: false,
+    pollIntervalMs: 10,
+    timeoutMs: 5_000,
+    sendInterruptRaw: true,
+    manageBridge: false,
+    modeCommand: '',
+  })
+  const canceled: RuntimeEvent[] = []
+  const first = runtime.runTurn(turnContext('first', 'first prompt'), handlers([]))
+  await bridge.firstSeen
+  try {
+    const queued = runtime.runTurn(turnContext('second', 'canceled prompt'), handlers(canceled))
+    await runtime.interrupt('unknown')
+    await runtime.interrupt('second')
+    const next = runtime.runTurn(turnContext('third', 'third prompt'), handlers([]))
+    assert.deepEqual(bridge.posts, ['first prompt'])
+    await queued
+    assert.ok(canceled.some((event) => event.type === 'completed' && !event.success))
+    assert.deepEqual(bridge.posts, ['first prompt'])
+    bridge.releaseFirst()
+    bridge.finish()
+    await Promise.all([first, next])
+    assert.deepEqual(bridge.posts, ['first prompt', 'third prompt'])
+  } finally {
+    bridge.releaseFirst()
+    bridge.finish()
+    await runtime.stop()
+    await first.catch(() => undefined)
+    await bridge.close()
+  }
+})
+
+test('the HTTP turn deadline cancels a bridge request that never returns', {
+  timeout: 5_000,
+}, async () => {
+  const bridge = await startBridge()
+  const runtime = new HttpAgentRuntime({
+    kind: 'agentapi',
+    baseUrl: bridge.baseUrl,
+    useSse: false,
+    pollIntervalMs: 10,
+    timeoutMs: 1_000,
+    sendInterruptRaw: false,
+    manageBridge: false,
+    modeCommand: '',
+  })
+  const turn = runtime.runTurn(turnContext('one', 'no reply'), handlers([]))
+  const rejected = assert.rejects(turn, /turn timed out after 1000ms/)
+  try {
+    await rejected
+    assert.deepEqual(bridge.posts, ['no reply'])
+  } finally {
+    bridge.releaseFirst()
+    bridge.finish()
+    await runtime.stop()
+    await bridge.close()
+  }
+})
+
+test('stopping the HTTP runtime cancels the active and queued turns', {
+  timeout: 10_000,
+}, async () => {
+  const bridge = await startBridge()
+  const runtime = new HttpAgentRuntime({
+    kind: 'agent-http',
+    baseUrl: bridge.baseUrl,
+    useSse: false,
+    pollIntervalMs: 10,
+    timeoutMs: 5_000,
+    sendInterruptRaw: true,
+    manageBridge: false,
+    modeCommand: '',
+  })
+  const firstEvents: RuntimeEvent[] = []
+  const secondEvents: RuntimeEvent[] = []
+  try {
+    const first = runtime.runTurn(turnContext('one', 'running prompt'), handlers(firstEvents))
+    await bridge.firstSeen
+    const second = runtime.runTurn(turnContext('two', 'queued prompt'), handlers(secondEvents))
+    await runtime.stop()
+    await Promise.all([first, second])
+    assert.deepEqual(bridge.posts, ['running prompt'])
+    for (const events of [firstEvents, secondEvents])
+      assert.ok(events.some((event) => event.type === 'completed' && !event.success))
+  } finally {
+    bridge.releaseFirst()
+    bridge.finish()
+    await runtime.stop()
+    await bridge.close()
+  }
+})
+
+test('an active bridge receives one raw interrupt before the next queued turn', {
+  timeout: 10_000,
+}, async () => {
+  const bridge = await startBridge()
+  const runtime = new HttpAgentRuntime({
+    kind: 'agentapi',
+    baseUrl: bridge.baseUrl,
+    useSse: false,
+    pollIntervalMs: 10,
+    timeoutMs: 5_000,
+    sendInterruptRaw: true,
+    manageBridge: false,
+    modeCommand: '',
+  })
+  try {
+    const first = runtime.runTurn(turnContext('one', 'first prompt'), handlers([]))
+    await bridge.firstSeen
+    const second = runtime.runTurn(turnContext('two', 'next prompt'), handlers([]))
+    await Promise.all([runtime.interrupt('one'), runtime.interrupt('one')])
+    bridge.releaseFirst()
+    bridge.finish()
+    await Promise.all([first, second])
+    assert.deepEqual(bridge.posts, ['first prompt', '\u0003', 'next prompt'])
+  } finally {
+    bridge.releaseFirst()
+    bridge.finish()
+    await runtime.stop()
+    await bridge.close()
+  }
+})

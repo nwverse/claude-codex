@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { promisify } from 'node:util'
 import { flatPrompt } from './turn-context.mjs'
 import type {
@@ -7,7 +8,7 @@ import type {
   RuntimeSteerOptions,
   RuntimeTurnContext,
 } from './types.mjs'
-import { debugLog, sleep } from './util.mjs'
+import { debugLog } from './util.mjs'
 
 const execFileAsync = promisify(execFile)
 
@@ -24,7 +25,9 @@ export interface HttpAgentRuntimeOptions {
 
 interface ActiveRun {
   abort: AbortController
-  baseUrl: string
+  // Set immediately before posting this turn's prompt to its chosen bridge.
+  baseUrl: string | null
+  rawInterrupt?: Promise<void>
   // Set once the turn's own prompt is on the bridge. A steer before that would
   // land ahead of the prompt, possibly on a different bridge than the turn's.
   promptPosted: boolean
@@ -46,47 +49,50 @@ export class HttpAgentRuntime implements ClaudeRuntime {
   }
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
-    await this.serializedRun(this.queueKeyForContext(context), () =>
-      this.runTurnLocked(context, handlers),
-    )
-  }
-
-  private async serializedRun<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const run: ActiveRun = { abort: new AbortController(), baseUrl: null, promptPosted: false }
+    this.active.set(context.threadId, run)
+    const key = this.queueKeyForContext(context)
+    const previous = this.turnQueues.get(key) ?? Promise.resolve()
     let release!: () => void
     const slot = new Promise<void>((resolve) => {
       release = resolve
     })
-    const previous = this.turnQueues.get(key) ?? Promise.resolve()
-    const next = previous.catch(() => {}).then(() => slot)
+    const next = previous.then(() => slot)
     this.turnQueues.set(key, next)
-    await previous.catch(() => {})
+    const canceled = new Promise<void>((resolve) => {
+      run.abort.signal.addEventListener('abort', () => resolve(), { once: true })
+    })
     try {
-      return await fn()
+      await Promise.race([previous, canceled])
+      await this.runTurnLocked(context, handlers, run)
     } finally {
+      if (this.active.get(context.threadId) === run) this.active.delete(context.threadId)
+      // Wait for a raw interrupt already sent to this bridge before another
+      // prompt can be posted. A canceled waiter never overtakes its predecessor.
+      await run.rawInterrupt
       release()
-      if (this.turnQueues.get(key) === next) {
-        this.turnQueues.delete(key)
-      }
+      void next.then(() => {
+        if (this.turnQueues.get(key) === next) this.turnQueues.delete(key)
+      })
     }
   }
 
   private async runTurnLocked(
     context: RuntimeTurnContext,
     handlers: RuntimeHandlers,
+    run: ActiveRun,
   ): Promise<void> {
-    const abort = new AbortController()
-    this.active.set(context.threadId, { abort, baseUrl: this.options.baseUrl, promptPosted: false })
+    const timeout = AbortSignal.timeout(this.options.timeoutMs)
+    const signal = AbortSignal.any([run.abort.signal, timeout])
     const tracker = new MessageDeltaTracker(this.options.kind)
-    const startedAt = Date.now()
     let sseTask: Promise<void> | null = null
     let baseUrl = this.options.baseUrl
     let sessionId = `${this.options.kind}:${baseUrl}`
 
     try {
-      baseUrl = await this.baseUrlForContext(context)
+      signal.throwIfAborted()
+      baseUrl = await this.baseUrlForContext(context, signal)
       sessionId = `${this.options.kind}:${baseUrl}`
-      const active = this.active.get(context.threadId)
-      if (active) active.baseUrl = baseUrl
 
       if (context.imageInputs.length > 0) {
         await handlers.onEvent({
@@ -96,7 +102,7 @@ export class HttpAgentRuntime implements ClaudeRuntime {
         })
       }
 
-      const initialMessages = await this.fetchMessages(baseUrl, abort.signal)
+      const initialMessages = await this.fetchMessages(baseUrl, signal)
       if (this.options.kind === 'agentapi' && hasAgentapiTrustPrompt(initialMessages)) {
         const message =
           'agentapi is waiting at Claude Code workspace trust prompt; run `claude-codex-mode trust` on the remote host after reviewing the path, then retry.'
@@ -108,30 +114,30 @@ export class HttpAgentRuntime implements ClaudeRuntime {
 
       const useSse = this.options.useSse && this.options.kind !== 'agentapi'
       if (useSse) {
-        sseTask = this.listenEvents(baseUrl, tracker, handlers, abort.signal).catch(
-          async (error) => {
-            if (!abort.signal.aborted) {
-              debugLog('http.sse.fallback', {
-                kind: this.options.kind,
-                baseUrl,
-                error: error instanceof Error ? error.message : String(error),
-              })
-            }
-          },
-        )
+        sseTask = this.listenEvents(baseUrl, tracker, handlers, signal).catch(async (error) => {
+          if (!signal.aborted) {
+            debugLog('http.sse.fallback', {
+              kind: this.options.kind,
+              baseUrl,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          }
+        })
       }
 
       try {
+        signal.throwIfAborted()
+        run.baseUrl = baseUrl
         await this.postMessage(
           baseUrl,
           flatPrompt(context.prompt, context.promptContext),
           'user',
-          abort.signal,
+          signal,
         )
-        if (active) active.promptPosted = true
+        run.promptPosted = true
       } catch (error) {
         if (this.options.kind === 'agentapi') {
-          const latestMessages = await this.fetchMessages(baseUrl, abort.signal).catch(() => null)
+          const latestMessages = await this.fetchMessages(baseUrl, signal).catch(() => null)
           if (latestMessages && hasAgentapiTrustPrompt(latestMessages)) {
             throw new Error(
               'agentapi is waiting at Claude Code workspace trust prompt; run `claude-codex-mode trust` on the remote host after reviewing the path, then retry.',
@@ -141,22 +147,18 @@ export class HttpAgentRuntime implements ClaudeRuntime {
         throw error
       }
 
-      while (Date.now() - startedAt < this.options.timeoutMs) {
-        if (abort.signal.aborted) throw new Error('interrupted')
-        const status = await this.fetchStatus(baseUrl, abort.signal)
+      for (;;) {
+        signal.throwIfAborted()
+        const status = await this.fetchStatus(baseUrl, signal)
         if (status === 'stable') break
-        await this.pollMessages(baseUrl, tracker, handlers, abort.signal)
-        await sleep(this.options.pollIntervalMs)
+        await this.pollMessages(baseUrl, tracker, handlers, signal)
+        await sleep(this.options.pollIntervalMs, undefined, { signal })
       }
 
-      if (Date.now() - startedAt >= this.options.timeoutMs) {
-        throw new Error(`${this.options.kind} turn timed out after ${this.options.timeoutMs}ms`)
-      }
-
-      await this.pollMessages(baseUrl, tracker, handlers, abort.signal)
+      await this.pollMessages(baseUrl, tracker, handlers, signal)
       await handlers.onEvent({ type: 'completed', success: true, claudeSessionId: sessionId })
     } catch (error) {
-      if (abort.signal.aborted) {
+      if (run.abort.signal.aborted) {
         await handlers.onEvent({
           type: 'completed',
           success: false,
@@ -165,14 +167,16 @@ export class HttpAgentRuntime implements ClaudeRuntime {
         })
         return
       }
+      const failure = timeout.aborted
+        ? new Error(`${this.options.kind} turn timed out after ${this.options.timeoutMs}ms`)
+        : error
       await handlers.onEvent({
         type: 'error',
-        message: error instanceof Error ? error.message : String(error),
+        message: failure instanceof Error ? failure.message : String(failure),
       })
-      throw error
+      throw failure
     } finally {
-      abort.abort()
-      this.active.delete(context.threadId)
+      run.abort.abort()
       void sseTask
     }
   }
@@ -185,7 +189,7 @@ export class HttpAgentRuntime implements ClaudeRuntime {
     options: RuntimeSteerOptions = {},
   ): Promise<false | undefined> {
     const active = this.active.get(threadId)
-    if (!active?.promptPosted) return false
+    if (!active?.baseUrl || !active.promptPosted || active.abort.signal.aborted) return false
     await this.postMessage(
       active.baseUrl,
       flatPrompt(prompt, options.promptContext),
@@ -197,12 +201,17 @@ export class HttpAgentRuntime implements ClaudeRuntime {
 
   async interrupt(threadId: string): Promise<void> {
     const active = this.active.get(threadId)
-    if (this.options.sendInterruptRaw) {
-      await this.postMessage(active?.baseUrl ?? this.options.baseUrl, '\u0003', 'raw').catch(
-        () => {},
-      )
+    if (!active || active.abort.signal.aborted) return
+    if (this.options.sendInterruptRaw && active.baseUrl) {
+      active.rawInterrupt = this.postMessage(
+        active.baseUrl,
+        '\u0003',
+        'raw',
+        AbortSignal.timeout(Math.min(this.options.timeoutMs, 5_000)),
+      ).catch(() => {})
     }
-    active?.abort.abort()
+    active.abort.abort()
+    await active.rawInterrupt
   }
 
   async stop(): Promise<void> {
@@ -216,7 +225,10 @@ export class HttpAgentRuntime implements ClaudeRuntime {
     return `${this.options.kind}\0${context.cwd}\0${context.model ?? ''}`
   }
 
-  private async baseUrlForContext(context: RuntimeTurnContext): Promise<string> {
+  private async baseUrlForContext(
+    context: RuntimeTurnContext,
+    signal: AbortSignal,
+  ): Promise<string> {
     if (!this.options.manageBridge) return this.options.baseUrl
     if (context.purpose === 'summary') return this.options.baseUrl
     const args = ['ensure-bridge', this.options.kind, context.model ?? '', context.cwd]
@@ -230,6 +242,7 @@ export class HttpAgentRuntime implements ClaudeRuntime {
       const { stdout, stderr } = await execFileAsync(this.options.modeCommand, args, {
         env: { ...process.env },
         timeout: 45_000,
+        signal,
         maxBuffer: 256 * 1024,
       })
       debugLog('http.bridge.ensure.done', {
