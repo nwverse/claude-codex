@@ -163,6 +163,14 @@ versioning or publishing metadata.
   workflow ran again after a stall ends as failed too, as soon as the next
   attempt starts, saying the workflow ran the agent again, instead of staying
   open. Claude Code's progress report does not keep that attempt's own error.
+- The `codex` shim no longer runs itself in an endless loop when its `PATH`
+  directory is a symlink, when it is on `PATH` twice (also as another version
+  of it), or when `CODEX_REAL` names a shim: it passes over every copy of
+  itself, runs the real Codex CLI later on `PATH`, or exits 127 and says to
+  set `CODEX_REAL`. `claude-codex-mode set` and `model` shell-quote the model
+  and bridge cwd they write to `runtime.env`, so `$`, quotes and backticks in
+  them are read back as written instead of being expanded or run each time
+  the shim sources the file, and a value with a line break is refused.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.
