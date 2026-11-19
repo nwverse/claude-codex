@@ -51,6 +51,7 @@ import { CodexClaudeAppServer } from '../src/server.mjs'
 import { SessionStore } from '../src/store.mjs'
 import { parseToml } from '../src/toml.mjs'
 import type { ClaudeRuntime, RpcPeer, RuntimeTurnContext } from '../src/types.mjs'
+import { tempRootOutsideGit } from './support/temp-root.mjs'
 
 async function write(path: string, text: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
@@ -542,8 +543,9 @@ test('Claude Code MCP servers come from the global config and approved .mcp.json
   }
 })
 
-test('Claude Code trust covers the project itself, never a folder above it', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'inherited-claude-trust-'))
+test('Claude Code trust covers the project itself, never a folder above it', async (t) => {
+  const root = await tempRootOutsideGit(t, 'inherited-claude-trust-')
+  if (!root) return
   const configDir = join(root, 'claude-config')
   const parent = join(root, 'parent')
   const repo = join(parent, 'repo')
@@ -611,7 +613,7 @@ test('Claude Code trust covers the project itself, never a folder above it', asy
     assert.equal((await read(worktree)).trusted, true)
     assert.equal((await read(nested)).trusted, false)
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5 })
   }
 })
 
@@ -942,6 +944,39 @@ env_vars = ["NARROW_TOKEN"]
       status: 'failed',
       error: `MCP config file not found: ${join(root, 'missing.json')}`,
     })
+
+    // A setting that is not valid JSON is reported quoting none of its text,
+    // which may hold a credential.
+    const token = 'ghp_DUMMY0123456789'
+    const failure = async (value: string): Promise<string> => {
+      const snapshot = await withEnv({ ...env, CLAUDE_CODEX_MCP_SERVERS: value }, async () =>
+        readMcpConfig({}),
+      )
+      const status = snapshot.startupStatuses.at(-1)
+      assert.equal(status?.name, 'CLAUDE_CODEX_MCP_SERVERS')
+      assert.equal(status?.status, 'failed')
+      assert.ok(status?.error)
+      // Not even the start of the token, which JSON.parse may clip.
+      assert.doesNotMatch(status.error, /ghp_|DUMMY|GITHUB_TOKEN|"/)
+      return status.error
+    }
+    // A credential pasted without quotes: JSON.parse quotes the text around it.
+    const pasted = `{"github": {"command": "github-mcp", "env": {"GITHUB_TOKEN": ${token}}}}`
+    assert.equal(
+      await failure(pasted),
+      "invalid MCP config JSON in CLAUDE_CODEX_MCP_SERVERS: Unexpected token 'g'",
+    )
+    // JSON in literal quotes is no file path either.
+    assert.equal(
+      await failure(`'${JSON.stringify({ github: { env: { GITHUB_TOKEN: token } } })}'`),
+      'CLAUDE_CODEX_MCP_SERVERS is neither JSON (starting with { or [) nor a file path',
+    )
+    const brokenFile = join(root, 'broken.json')
+    await write(brokenFile, `{\n  "mcpServers": ${pasted}\n}\n`)
+    assert.equal(
+      await failure(brokenFile),
+      `invalid MCP config JSON in ${brokenFile}: Unexpected token 'g'`,
+    )
 
     const codexOnly = await withEnv(
       { ...env, CLAUDE_CODEX_CLAUDE_CONFIG_DIR: undefined, CLAUDE_CODEX_MCP_SERVERS: undefined },

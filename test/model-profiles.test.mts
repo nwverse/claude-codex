@@ -68,6 +68,7 @@ const PROFILE_ENV = [
   'CLAUDE_CONFIG_DIRS',
   'CLAUDE_ROUTER_DIR',
   'ANTHROPIC_API_KEY',
+  'CLAUDE_CODEX_REAP_ORPHANED_CLI',
 ]
 
 const TWO_PROFILES = {
@@ -160,7 +161,7 @@ test('model profiles expose models and build isolated child environments', async
     assert.equal(resolveClaudeModelProcess('main-model', { HOME: root }), null)
     assert.equal(modelProfileFingerprint('main-model', { HOME: root }), null)
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -270,7 +271,7 @@ test('profile fingerprints reject configuration drift without hashing secret val
       /model process profile main-model changed since this chat started, so this chat cannot continue; start a new chat/,
     )
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -299,7 +300,7 @@ test('model profiles reject literal inline secrets', async () => {
       )
     }
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -320,7 +321,7 @@ test('model profile config must be owner-controlled and cannot be a symbolic lin
       /must not be a symbolic link/,
     )
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -353,7 +354,7 @@ test('profiles that fail to load say where and why in one short line, quoting no
     )
 
     const fromFile = { CLAUDE_CODEX_MODEL_PROFILES_FILE: configFile }
-    const fileSource = `cannot load Claude model profiles from ${configFile} (CLAUDE_CODEX_MODEL_PROFILES_FILE): `
+    const fileSource = `cannot load Claude model profiles from ${expectedSourcePath(configFile)} (CLAUDE_CODEX_MODEL_PROFILES_FILE): `
     await writeFile(
       configFile,
       '{\n  "models": [\n    { "id": "main-model",\n      "env": { "API_KEY": sk-file-credential } }\n  ]\n}\n',
@@ -370,7 +371,7 @@ test('profiles that fail to load say where and why in one short line, quoting no
     )
     assert.equal(
       failure({ CLAUDE_CODEX_MODEL_PROFILES_FILE: join(root, 'missing.json') }),
-      `cannot load Claude model profiles from ${join(root, 'missing.json')} (CLAUDE_CODEX_MODEL_PROFILES_FILE): the file does not exist`,
+      `cannot load Claude model profiles from ${expectedSourcePath(join(root, 'missing.json'))} (CLAUDE_CODEX_MODEL_PROFILES_FILE): the file does not exist`,
     )
     // A long path keeps its end, where the file name is.
     const deep = join(root, 'a'.repeat(100), 'b'.repeat(100))
@@ -403,7 +404,7 @@ test('profiles that fail to load say where and why in one short line, quoting no
     assert.equal(clipped.length, 300)
     assert.match(clipped, /must reference a parent environment variable: PROVIDER_TOKEN_X+…$/)
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -439,7 +440,7 @@ test('model profile env files must be private regular files', async () => {
     )
     assert.throws(() => resolveClaudeModelProcess('main-model', env), /symbolic link/)
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -646,7 +647,7 @@ test('a model change refuses profiles that fail to load as an invalid request, q
       '{"models": [{"id": "main-model", "env": {"API_KEY": sk-pasted-credential}}]}',
       { mode: 0o600 },
     )
-    const reason = `cannot load Claude model profiles from ${harness.configFile} (CLAUDE_CODEX_MODEL_PROFILES_FILE): invalid Claude model profiles JSON: Unexpected token 's'`
+    const reason = `cannot load Claude model profiles from ${expectedSourcePath(harness.configFile)} (CLAUDE_CODEX_MODEL_PROFILES_FILE): invalid Claude model profiles JSON: Unexpected token 's'`
     // The model menu, a running turn's settings, and a turn on another model.
     // App rule: model-menu-settings
     const refusals = [
@@ -955,7 +956,7 @@ test('configured model profiles drive the model picker and native SDK process op
     )
   } finally {
     restore()
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -1047,7 +1048,7 @@ test('a profile reads what its env file sets, and token budgets are no secrets',
       /secret-like environment key must reference a parent environment variable: PROXY_AUTH_TOKENS/,
     )
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -1160,6 +1161,10 @@ test('the native runtime starts each profile turn in its own process', async () 
   )
   const restore = saveEnv(PROFILE_ENV)
   process.env.HOME = root
+  // The fake session reports init, which would otherwise record CLI children
+  // under HOME after the turn ends and race the cleanup below.
+  process.env.CLAUDE_CODEX_HOME = join(root, 'adapter')
+  process.env.CLAUDE_CODEX_REAP_ORPHANED_CLI = '0'
   process.env.CLAUDE_CODEX_MODEL_PROFILES_FILE = configFile
   process.env.ANTHROPIC_API_KEY = 'adapter-key'
   // Ignored for a profile turn, which runs the profile's executable.
@@ -1213,7 +1218,7 @@ test('the native runtime starts each profile turn in its own process', async () 
   } finally {
     await runtime.stop()
     restore()
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -1243,9 +1248,13 @@ test('profile sessions resume only from the profile config dir', async () => {
     assert.equal(sdkResumeSessionId('default-session', cwd), 'default-session')
   } finally {
     restore()
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
+
+function expectedSourcePath(path: string): string {
+  return path.length > 80 ? `…${path.slice(-79)}` : path
+}
 
 function fingerprint(modelId: string): string | null {
   return modelProfileFingerprint(modelId)
@@ -1341,7 +1350,7 @@ async function profileServer(
   const close = async () => {
     await server.stop()
     restore()
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
   return {
     root,
@@ -1447,3 +1456,137 @@ function saveEnv(keys: string[]): () => void {
     }
   }
 }
+
+test('profile env files strip comments while preserving quoted content and URL fragments', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-env-comments-'))
+  const envFile = join(root, 'provider.env')
+  const env = {
+    HOME: root,
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([{ id: 'main-model', envFile }]),
+  }
+  const expected = {
+    ANTHROPIC_BASE_URL: 'https://gw.example',
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '32000',
+    ANTHROPIC_MODEL: 'claude-x',
+    LINK: 'http://host/#frag',
+    EMPTY: '',
+    HASH: '#literal',
+    QUOTED: ' inside # value ',
+    ADJACENT: 'value',
+    NOREF: 'v',
+  }
+  try {
+    await writeFile(
+      envFile,
+      [
+        '# full-line comment',
+        'export ANTHROPIC_BASE_URL=https://gw.example # corp gateway',
+        'CLAUDE_CODE_MAX_OUTPUT_TOKENS="32000" # cap',
+        "ANTHROPIC_MODEL='claude-x' # model",
+        'LINK=http://host/#frag',
+        'EMPTY= \t# comment',
+        'HASH=#literal',
+        'QUOTED=" inside # value " # comment',
+        "ADJACENT='value'# comment",
+        'NOREF=v # ${MISSING_VAR}',
+        '',
+      ].join('\n'),
+      { mode: 0o600 },
+    )
+    const resolved = resolveClaudeModelProcess('main-model', env)
+    assert.ok(resolved)
+    for (const [key, value] of Object.entries(expected)) assert.equal(resolved.env[key], value, key)
+    const fingerprint = modelProfileFingerprint('main-model', env)
+    await writeFile(
+      envFile,
+      Object.entries(expected)
+        .map(([key, value]) => `${key}='${value}'`)
+        .join('\n'),
+      { mode: 0o600 },
+    )
+    assert.equal(modelProfileFingerprint('main-model', env), fingerprint)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('profile env files reject unterminated quotes and text after closing quotes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-env-invalid-'))
+  const envFile = join(root, 'provider.env')
+  const env = {
+    HOME: root,
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([{ id: 'main-model', envFile }]),
+  }
+  try {
+    for (const value of [
+      '"unterminated',
+      "'unterminated",
+      '"value"suffix',
+      "'value' trailing",
+      '"a\\"b"',
+    ]) {
+      await writeFile(envFile, `# first line\nLINK=${value}\n`, { mode: 0o600 })
+      assert.throws(() => resolveClaudeModelProcess('main-model', env), {
+        message: `invalid env assignment at ${envFile}:2`,
+      })
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('custom header credential rotation in env files keeps profile fingerprints and chats', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-header-rotation-'))
+  const envFile = join(root, 'provider.env')
+  const env = {
+    HOME: root,
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([{ id: 'main-model', envFile }]),
+  }
+  try {
+    await writeFile(envFile, 'ANTHROPIC_CUSTOM_HEADERS=x-api-key: old\n', { mode: 0o600 })
+    const pinned = modelProfileFingerprint('main-model', env)
+    assert.ok(pinned)
+    await writeFile(envFile, 'ANTHROPIC_CUSTOM_HEADERS=x-api-key: new\n')
+    assert.equal(modelProfileFingerprint('main-model', env), pinned)
+    assert.equal(
+      resolveClaudeModelProcess('main-model', env, pinned)?.env.ANTHROPIC_CUSTOM_HEADERS,
+      'x-api-key: new',
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('custom headers in profile env reject literal credentials', () => {
+  assert.throws(
+    () =>
+      loadClaudeModelProfiles({
+        CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([
+          {
+            id: 'main-model',
+            env: { ANTHROPIC_CUSTOM_HEADERS: 'x-api-key: literal' },
+          },
+        ]),
+      }),
+    /secret-like environment key must reference a parent environment variable: ANTHROPIC_CUSTOM_HEADERS/,
+  )
+})
+
+test('custom headers resolve parent references without pinning credential values', () => {
+  const env = {
+    HEADER_VAR: 'Authorization: Bearer old',
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([
+      {
+        id: 'main-model',
+        inheritEnv: ['*'],
+        env: { ANTHROPIC_CUSTOM_HEADERS: '${HEADER_VAR}' },
+      },
+    ]),
+  }
+  const pinned = modelProfileFingerprint('main-model', env)
+  assert.ok(pinned)
+  const rotated = { ...env, HEADER_VAR: 'Authorization: Bearer new' }
+  assert.equal(modelProfileFingerprint('main-model', rotated), pinned)
+  const resolved = resolveClaudeModelProcess('main-model', rotated, pinned)
+  assert.equal(resolved?.env.ANTHROPIC_CUSTOM_HEADERS, 'Authorization: Bearer new')
+})

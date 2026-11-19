@@ -20,7 +20,7 @@ import type {
   TurnRecord,
   TurnStatus,
 } from './types.mjs'
-import { adapterHome, jsonClone, newId, nowSeconds } from './util.mjs'
+import { adapterHome, debugLog, jsonClone, newId, nowSeconds } from './util.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -34,6 +34,13 @@ type DatabaseSync = any
 // file at the wrong moment (a backup, a sqlite3 shell, a status script) fails
 // whichever turn happens to write then. Python's sqlite3 uses the same 5s.
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000
+
+// How long streamed item updates (see streamItem) stay in memory before they
+// are written. The file is in rollback-journal mode with synchronous=FULL, so
+// every commit is an fsync; a turn streams thousands of deltas.
+const STREAM_FLUSH_MS = 50
+// When a timed write fails (the file is busy), how long until it is tried again.
+const STREAM_RETRY_MS = 250
 
 function busyTimeoutMs(): number {
   const raw = process.env.CLAUDE_CODEX_STATE_DB_TIMEOUT_MS?.trim()
@@ -107,12 +114,22 @@ function parseGitInfo(json: unknown): GitInfo | null {
 }
 
 export class SessionStore {
-  private db: DatabaseSync
+  private conn: DatabaseSync
+  // Turns streamItem changed that are not written yet, by id.
+  private pendingTurns = new Map<string, TurnRecord>()
+  private flushTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(path = join(adapterHome(), 'state.sqlite')) {
     mkdirSync(adapterHome(), { recursive: true, mode: 0o700 })
-    this.db = openDatabase(path)
+    this.conn = openDatabase(path)
     this.migrate()
+  }
+
+  // Every statement goes through here, so whatever reads, writes or opens a
+  // transaction first writes the turns streamItem left in memory.
+  private get db(): DatabaseSync {
+    if (this.pendingTurns.size > 0) this.flushPendingTurns()
+    return this.conn
   }
 
   private migrate(): void {
@@ -278,6 +295,15 @@ export class SessionStore {
     // Model process profile identity a thread is pinned to (model-profiles.mts).
     this.ensureColumn('threads', 'model_profile_fingerprint', 'TEXT')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id)')
+    // Without these the default thread/list page (newest created first) and
+    // every fork-tree lookup (forked_from_id = ?) scan and sort the whole
+    // table. archived does not lead: with no ANALYZE stats SQLite would then
+    // prefer it over the project and section indexes.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_threads_created ON threads(created_at, id);
+      CREATE INDEX IF NOT EXISTS idx_threads_forked_from
+        ON threads(forked_from_id, archived, created_at, id);
+    `)
     // Codex's per-thread memory mode; set when the thread is created, then
     // only by setThreadMemoryMode.
     this.ensureColumn('threads', 'memory_mode', 'TEXT')
@@ -294,7 +320,12 @@ export class SessionStore {
     this.sanitizeLegacyEnumColumns()
   }
 
+  // Read first: INSERT OR IGNORE takes the write lock even when it inserts
+  // nothing, and every adapter process opening the shared store runs this.
   private ensurePinnedSection(): void {
+    if (this.db.prepare('SELECT 1 FROM thread_sections WHERE id = ?').get(PINNED_SECTION_ID)) {
+      return
+    }
     const now = nowSeconds()
     this.db
       .prepare(
@@ -305,27 +336,44 @@ export class SessionStore {
       .run(PINNED_SECTION_ID, PINNED_SECTION_NAME, now, now)
   }
 
+  // Rows that predate sections: a pin flag with no section, a pin flag that
+  // disagrees with the row's section, or ordering left on an unsectioned row.
+  // Each UPDATE matches only rows it would change, and the probe skips them
+  // all when none would, so opening a clean store writes nothing.
   private migrateLegacyPinState(): void {
+    const needsPinnedSection = `is_pinned = 1 AND (section_id IS NULL OR section_id = '')`
+    const wrongPinFlag = `(section_id IS NOT NULL OR is_pinned = 1)
+      AND is_pinned IS NOT (CASE WHEN section_id = ? THEN 1 ELSE 0 END)`
+    const strayOrdering = `section_id IS NULL
+      AND (section_entered_at IS NOT NULL OR section_position IS NOT NULL)`
+    if (
+      !this.threadsMatch(
+        `(${needsPinnedSection}) OR (${wrongPinFlag}) OR (${strayOrdering})`,
+        PINNED_SECTION_ID,
+      )
+    ) {
+      return
+    }
     this.db
       .prepare(
         `UPDATE threads
          SET section_id = ?,
              section_entered_at = COALESCE(section_entered_at, updated_at),
              section_position = COALESCE(section_position, rowid)
-         WHERE is_pinned = 1 AND (section_id IS NULL OR section_id = '')`,
+         WHERE ${needsPinnedSection}`,
       )
       .run(PINNED_SECTION_ID)
     this.db
       .prepare(
         `UPDATE threads
          SET is_pinned = CASE WHEN section_id = ? THEN 1 ELSE 0 END
-         WHERE section_id IS NOT NULL OR is_pinned = 1`,
+         WHERE ${wrongPinFlag}`,
       )
-      .run(PINNED_SECTION_ID)
+      .run(PINNED_SECTION_ID, PINNED_SECTION_ID)
     this.db.exec(
       `UPDATE threads
        SET section_entered_at = NULL, section_position = NULL
-       WHERE section_id IS NULL`,
+       WHERE ${strayOrdering}`,
     )
   }
 
@@ -333,24 +381,37 @@ export class SessionStore {
   // `app_server` source) in columns the Codex App treats as strict enums.
   // Codex App's ts-rs deserializer rejects the invalid values on `thread/list`
   // / `thread/read`, surfacing as the generic "Oops, an error has occurred"
-  // toast when reopening a page. Repair the rows in place once on startup so
-  // a downgrade-then-upgrade cycle doesn't leave permanent landmines.
+  // toast when reopening a page. Repair the rows in place on startup so a
+  // downgrade-then-upgrade cycle doesn't leave permanent landmines. The check
+  // runs on every open for that reason; it is a single read-only scan, and
+  // octet_length (SQLite 3.43+, bundled with Node 24) tests the instruction
+  // columns for '' without reading their (often large) text.
   private sanitizeLegacyEnumColumns(): void {
+    const invalidThreadSource = `thread_source IS NOT NULL
+      AND thread_source NOT IN ('user', 'subagent', 'memory_consolidation')`
+    const repairs: Array<[string, string]> = [
+      ['thread_source = NULL', invalidThreadSource],
+      ['agent_role = NULL', `agent_role = ''`],
+      ['agent_nickname = NULL', `agent_nickname = ''`],
+      ['base_instructions = NULL', 'octet_length(base_instructions) = 0'],
+      ['developer_instructions = NULL', 'octet_length(developer_instructions) = 0'],
+      [`source = 'appServer'`, `source = 'app_server'`],
+    ]
     try {
-      this.db.exec(`
-        UPDATE threads
-        SET thread_source = NULL
-        WHERE thread_source IS NOT NULL
-          AND thread_source NOT IN ('user', 'subagent', 'memory_consolidation');
-        UPDATE threads SET agent_role = NULL WHERE agent_role = '';
-        UPDATE threads SET agent_nickname = NULL WHERE agent_nickname = '';
-        UPDATE threads SET base_instructions = NULL WHERE base_instructions = '';
-        UPDATE threads SET developer_instructions = NULL WHERE developer_instructions = '';
-        UPDATE threads SET source = 'appServer' WHERE source = 'app_server';
-      `)
+      if (!this.threadsMatch(repairs.map(([, where]) => `(${where})`).join(' OR '))) return
+      for (const [set, where] of repairs) this.db.exec(`UPDATE threads SET ${set} WHERE ${where}`)
     } catch {
       // Migrations are best-effort; never block adapter startup on cleanup.
     }
+  }
+
+  // Whether any thread row matches the condition. A read, so it takes no
+  // write lock on a store other adapter processes share.
+  private threadsMatch(where: string, ...params: string[]): boolean {
+    const row = this.db
+      .prepare(`SELECT EXISTS (SELECT 1 FROM threads WHERE ${where}) AS found`)
+      .get(...params) as { found: number }
+    return row.found === 1
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -477,6 +538,10 @@ export class SessionStore {
       // Keeps threads whose name, preview or stored items contain the text.
       // A prefilter: a match inside item JSON may be a key, not visible text.
       searchTerm?: string | undefined
+      // Keeps threads whose name or preview contains the text.
+      titleSearch?: string | undefined
+      // Leaves out these threads before the page limit applies.
+      excludedThreadIds?: string[]
       // Leaves out threads that have no turn and no preview yet.
       excludeEmpty?: boolean
       sortKey?: 'created_at' | 'updated_at' | 'recency_at' | 'section_position'
@@ -545,6 +610,15 @@ export class SessionStore {
              WHERE h.thread_id = t.id AND h.items_json LIKE ? ESCAPE '\\'))`,
       )
       args.push(text, text, json, json)
+    }
+    if (options.titleSearch) {
+      const text = likePattern(options.titleSearch)
+      where.push(`(t.name LIKE ? ESCAPE '\\' OR t.preview LIKE ? ESCAPE '\\')`)
+      args.push(text, text)
+    }
+    if (options.excludedThreadIds && options.excludedThreadIds.length > 0) {
+      where.push(`t.id NOT IN (${options.excludedThreadIds.map(() => '?').join(', ')})`)
+      args.push(...options.excludedThreadIds)
     }
     const parentThreadId = options.parentThreadId ?? null
     const ancestorThreadId = options.ancestorThreadId ?? null
@@ -633,6 +707,25 @@ export class SessionStore {
       )
       .all(...queryArgs, limit)
     return rows.map((row: unknown) => this.rowToThread(row))
+  }
+
+  // Every unarchived thread below rootId, ephemeral ones included, without
+  // listThreads' page cap. An archived thread hides its own descendants too.
+  // CROSS JOIN keeps the walk going parent to child through
+  // idx_threads_forked_from; left to itself SQLite may scan threads instead.
+  descendantThreadIds(rootId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `WITH RECURSIVE descendants(id) AS (
+           SELECT id FROM threads WHERE forked_from_id = ? AND archived = 0
+           UNION
+           SELECT child.id FROM descendants parent CROSS JOIN threads child
+             ON child.forked_from_id = parent.id WHERE child.archived = 0
+         )
+         SELECT id FROM descendants WHERE id <> ?`,
+      )
+      .all(rootId, rootId) as Array<{ id: unknown }>
+    return rows.map((row) => String(row.id))
   }
 
   listSections(limit = 100, cursor: string | null = null): ThreadSectionRecord[] {
@@ -1180,8 +1273,13 @@ export class SessionStore {
   }
 
   upsertTurn(turn: TurnRecord): void {
+    this.flushPendingTurns()
+    this.writeTurn(turn)
+  }
+
+  private writeTurn(turn: TurnRecord): void {
     const owner = currentProcessOwner()
-    this.db
+    this.conn
       .prepare(`
         INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id, owner_pid, owner_started)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1213,13 +1311,30 @@ export class SessionStore {
       )
   }
 
+  // What a flush writes: only the items streamItem changed. A turn another
+  // process deleted or rolled back meanwhile stays gone instead of coming back
+  // (or failing its thread's FOREIGN KEY on every later store call).
+  private writeTurnItems(turn: TurnRecord): void {
+    this.conn
+      .prepare('UPDATE turns SET items_json = ? WHERE id = ?')
+      .run(JSON.stringify(turn.items), turn.id)
+  }
+
+  // A turn streamItem holds in memory is read from there, so the status checks
+  // the server runs before each streamed delta do not write it early. Only this
+  // process changes a turn it owns, and its other writes flush first, so the
+  // copy is never behind the file.
   getTurn(id: string): TurnRecord | null {
+    const pending = this.pendingTurns.get(id)
+    if (pending) return jsonClone(pending)
     const row = this.db.prepare('SELECT * FROM turns WHERE id = ?').get(id)
     return row ? this.rowToTurn(row) : null
   }
 
   // A turn's status, without decoding its items.
   turnStatus(id: string): TurnRecord['status'] | null {
+    const pending = this.pendingTurns.get(id)
+    if (pending) return pending.status
     const row = this.db.prepare('SELECT status FROM turns WHERE id = ?').get(id) as
       | { status?: unknown }
       | undefined
@@ -1677,6 +1792,56 @@ export class SessionStore {
     return turn
   }
 
+  // updateItem for a streamed delta: the update lands in an in-memory copy of
+  // the turn, written once STREAM_FLUSH_MS later or before the store's next
+  // other use, whichever comes first. False when there is no such turn.
+  streamItem(turnId: string, itemId: string, updater: (item: ThreadItem) => ThreadItem): boolean {
+    let turn = this.pendingTurns.get(turnId)
+    if (!turn) {
+      const stored = this.getTurn(turnId)
+      if (!stored) return false
+      turn = stored
+      this.pendingTurns.set(turnId, turn)
+    }
+    turn.items = turn.items.map((item) => (item.id === itemId ? updater(jsonClone(item)) : item))
+    this.flushTimer ??= setTimeout(() => this.flushOnTimer(), STREAM_FLUSH_MS)
+    return true
+  }
+
+  private flushOnTimer(): void {
+    this.flushTimer = null
+    try {
+      this.flushPendingTurns()
+    } catch (error) {
+      // The turns stay pending and the timer tries again; a store write or
+      // close before then retries too and throws to its caller.
+      debugLog('store.stream_flush_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      if (this.pendingTurns.size > 0) {
+        this.flushTimer ??= setTimeout(() => this.flushOnTimer(), STREAM_RETRY_MS)
+      }
+    }
+  }
+
+  private flushPendingTurns(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer)
+      this.flushTimer = null
+    }
+    if (this.pendingTurns.size === 0) return
+    const turns = [...this.pendingTurns.values()]
+    this.pendingTurns.clear()
+    for (const [index, turn] of turns.entries()) {
+      try {
+        this.writeTurnItems(turn)
+      } catch (error) {
+        for (const unwritten of turns.slice(index)) this.pendingTurns.set(unwritten.id, unwritten)
+        throw error
+      }
+    }
+  }
+
   updateItemAndMoveToEnd(
     turnId: string,
     itemId: string,
@@ -2025,7 +2190,11 @@ export class SessionStore {
   }
 
   close(): void {
-    this.db.close()
+    try {
+      this.flushPendingTurns()
+    } finally {
+      this.conn.close()
+    }
   }
 
   private rowToThread(row: any): ThreadRecord {

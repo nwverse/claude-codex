@@ -20,6 +20,12 @@ export function isExploreTool(toolName: string): boolean {
   return EXPLORE_TOOLS.has(toolName)
 }
 
+// The tools a read-only sandbox runs when nobody is asked: they read files or
+// search the web and change nothing.
+export function readsOnly(toolName: string): boolean {
+  return EXPLORE_TOOLS.has(toolName) || toolName === 'WebSearch'
+}
+
 const text = (value: unknown): string => (typeof value === 'string' ? value : '')
 
 const absolutePath = (path: string, cwd: string): string =>

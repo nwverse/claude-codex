@@ -15,7 +15,9 @@ const gitInfoCache = new Map<string, { at: number; info: Promise<GitInfo | null>
 
 // The Codex GitInfo of a workspace: HEAD's sha, its branch (null when
 // detached) and the origin remote without credentials; null outside a
-// repository. `fresh` skips the cache, for when the branch may have moved.
+// repository. Rejects, without caching the failure, when git times out, is
+// killed or cannot be spawned (a missing directory included). `fresh` skips
+// the cache, for when the branch may have moved.
 export function gitInfoFor(
   cwd: string,
   options: { fresh?: boolean } = {},
@@ -28,7 +30,11 @@ export function gitInfoFor(
       if (now - entry.at >= GIT_INFO_TTL_MS) gitInfoCache.delete(key)
     if (gitInfoCache.size >= MAX_CACHED_DIRECTORIES) gitInfoCache.clear()
   }
-  const info = readGitInfo(cwd)
+  const info = readGitInfo(cwd).catch((error) => {
+    // A superseded lookup must not evict a newer fresh lookup.
+    if (gitInfoCache.get(cwd)?.info === info) gitInfoCache.delete(cwd)
+    throw error
+  })
   gitInfoCache.set(cwd, { at: now, info })
   return info
 }
@@ -52,7 +58,8 @@ async function git(cwd: string, args: string[]): Promise<string | null> {
       maxBuffer: 64 * 1024,
     })
     return stdout.trim() || null
-  } catch {
+  } catch (error) {
+    if (typeof (error as { code?: unknown } | null)?.code !== 'number') throw error
     // Outside a repository, on an unborn branch or without an origin.
     return null
   }
