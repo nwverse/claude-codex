@@ -215,3 +215,29 @@ test('a clean store opens while another connection holds the write lock', async 
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
+
+test('a legacy Claude conversation retains its last confirmed workspace across multiple resumes', async () => {
+  const { home, path } = await cleanStore()
+  let store = new SessionStore(path)
+  try {
+    const raw = new DatabaseSync(path)
+    raw.exec(
+      "UPDATE threads SET cwd = '/former/workspace', claude_session_id = 'persisted-session', claude_session_cwd = NULL WHERE id = 'clean'",
+    )
+    raw.close()
+    for (const cwd of ['/next/workspace', '/final/workspace']) {
+      const thread = store.getThread('clean')
+      assert.ok(thread)
+      assert.equal(thread.claudeSessionCwd, '/former/workspace')
+      store.upsertThread({ ...thread, cwd })
+    }
+    store.close()
+    store = new SessionStore(path)
+    assert.equal(store.getThread('clean')?.claudeSessionCwd, '/former/workspace')
+    store.updateClaudeSessionId('clean', 'persisted-session', '/final/workspace')
+    assert.equal(store.getThread('clean')?.claudeSessionCwd, '/final/workspace')
+  } finally {
+    store.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})

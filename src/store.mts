@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { currentProcessOwner, otherProcessRunning } from './process-owner.mjs'
@@ -297,6 +297,7 @@ export class SessionStore {
     // Real Codex session id for runtime_backend='codex' threads (returned
     // by `codex exec` as thread.started.thread_id). NULL until first turn.
     this.ensureColumn('threads', 'codex_session_id', 'TEXT')
+    this.ensureColumn('threads', 'claude_session_cwd', 'TEXT')
     this.ensureColumn('threads', 'native_codex_provider', 'TEXT')
     // Claude transcript checkpoints for thread/rollback, thread/revert and
     // thread/fork: see setTurnCheckpoint and rewindClaudeSession.
@@ -467,10 +468,10 @@ export class SessionStore {
           source, created_at, updated_at, status_json,
           approval_policy, sandbox_mode, permission_profile_id, ephemeral, thread_source, agent_role, agent_nickname,
           base_instructions, developer_instructions, personality, runtime_backend, codex_session_id,
-          memory_mode, collaboration_mode, approvals_reviewer, native_codex_provider
+          memory_mode, collaboration_mode, approvals_reviewer, native_codex_provider, claude_session_cwd
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
@@ -487,6 +488,10 @@ export class SessionStore {
           model_profile_fingerprint=excluded.model_profile_fingerprint,
           reasoning_effort=excluded.reasoning_effort,
           model_provider=excluded.model_provider,
+          claude_session_cwd=CASE
+            WHEN excluded.claude_session_id IS NULL THEN NULL
+            WHEN threads.claude_session_id=excluded.claude_session_id THEN COALESCE(threads.claude_session_cwd, threads.cwd)
+            ELSE excluded.claude_session_cwd END,
           claude_session_id=excluded.claude_session_id,
           source=excluded.source,
           updated_at=excluded.updated_at,
@@ -544,6 +549,7 @@ export class SessionStore {
         thread.collaborationMode ?? null,
         thread.approvalsReviewer ?? null,
         thread.nativeCodexProvider ?? null,
+        thread.claudeSessionId ? (thread.claudeSessionCwd ?? thread.cwd) : null,
       )
   }
 
@@ -1305,10 +1311,18 @@ export class SessionStore {
       .run(name, nowSeconds(), threadId)
   }
 
-  updateClaudeSessionId(threadId: string, claudeSessionId: string | null): void {
+  updateClaudeSessionId(threadId: string, claudeSessionId: string | null, cwd?: string): void {
+    let sourceCwd = cwd
+    if (cwd) {
+      try {
+        sourceCwd = realpathSync(cwd)
+      } catch {}
+    }
     this.db
-      .prepare('UPDATE threads SET claude_session_id = ?, updated_at = ? WHERE id = ?')
-      .run(claudeSessionId, nowSeconds(), threadId)
+      .prepare(
+        'UPDATE threads SET claude_session_id = ?, claude_session_cwd = COALESCE(?, cwd), updated_at = ? WHERE id = ?',
+      )
+      .run(claudeSessionId, sourceCwd ?? null, nowSeconds(), threadId)
   }
 
   // Stored separately from Claude's session id so a thread that was
@@ -2370,6 +2384,8 @@ export class SessionStore {
       reasoningEffort: row.reasoning_effort == null ? null : String(row.reasoning_effort),
       modelProvider: String(row.model_provider),
       claudeSessionId: row.claude_session_id == null ? null : String(row.claude_session_id),
+      claudeSessionCwd:
+        row.claude_session_id == null ? null : String(row.claude_session_cwd ?? row.cwd),
       source: String(row.source),
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at),

@@ -15,6 +15,7 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join } from 'node:path'
+import { CLAUDE_SESSION_UUID, relocateClaudeTranscript } from './claude-session-relocation.mjs'
 
 // Extended cache TTL for 1-hour prompt caching
 if (!process.env.ANTHROPIC_BETAS) {
@@ -919,7 +920,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       context.cwd,
       profileRoot,
       context.model,
+      context.claudeSessionCwd,
     )
+    if (!resume && context.claudeSessionId && CLAUDE_SESSION_UUID.test(context.claudeSessionId))
+      throw new Error(
+        `Cannot resume Claude session ${context.claudeSessionId}: its transcript is missing from the configured workspace`,
+      )
     if (resume) opts.resume = resume
     if (resume && context.forkSession) opts.forkSession = true
     // A rewound thread continues from one of its own checkpoints. Forking
@@ -4677,12 +4683,15 @@ export function sdkResumeSessionId(
   cwd?: string,
   configRoot?: string,
   model?: string | null,
+  sourceCwd?: string | null,
 ): string | null {
   if (!value) return null
   if (/^(agent-http|agentapi|claude-p):/.test(value)) return null
   if (!cwd) return value
   const slugs = projectSlugs(cwd)
   const runRoot = configRoot ?? nativeConfigRoot(model)
+  if (sourceCwd && sourceCwd !== cwd && relocateClaudeTranscript(value, sourceCwd, cwd, runRoot))
+    return value
   const roots = configRoot ? [configRoot] : [runRoot, ...knownConfigRoots()]
   let source: TranscriptCopy | null = null
   for (const root of new Set(roots)) {

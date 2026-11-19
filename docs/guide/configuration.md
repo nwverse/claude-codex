@@ -105,6 +105,19 @@ whatever its modification time says. Since a transcript
 holds the whole conversation, the copy keeps the transcript's file mode, and it
 is a clone where the file system supports it.
 
+### Continuing a Claude chat after moving its workspace
+
+Resume the existing thread with the new workspace path. The adapter uses the
+Claude session ID and its last recorded workspace to locate the transcript in
+the selected CLI's configuration directory. It publishes an independent copy
+for the new workspace and keeps the source file. The profile, executable and
+provider continue to follow the thread's existing binding.
+
+If the previous workspace has multiple candidate transcripts, or a same-ID
+file at the destination has diverged, the turn reports an error and preserves
+both histories. Restore the intended private transcript before retrying.
+An identical destination copy can be reused after an interrupted launch.
+
 ## Model process profiles
 
 Every Claude thread normally runs the same Claude Code: the one the SDK ships

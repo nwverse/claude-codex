@@ -86,6 +86,8 @@ export interface ThreadRecord {
   // the model id again.
   runtimeBackend: 'claude' | 'codex'
   claudeSessionId: string | null
+  // Workspace in which the persisted Claude session was last written.
+  claudeSessionCwd?: string | null
   // Real Codex's persisted session id (returned by `codex exec` as
   // thread.started.thread_id). Reused on subsequent turns via
   // `codex exec resume <id>` so the conversation history survives. Only
@@ -526,6 +528,8 @@ export interface RuntimeTurnContext {
   modelProfileFingerprint?: string | null
   effort: string | null
   claudeSessionId: string | null
+  // Workspace in which the persisted Claude session was last written.
+  claudeSessionCwd?: string | null
   forkSession: boolean
   // Resume claudeSessionId only up to this transcript entry, in a forked
   // session (thread rewind or fork). Backends that cannot truncate ignore it.

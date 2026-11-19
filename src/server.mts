@@ -1882,6 +1882,7 @@ export class CodexClaudeAppServer {
       reasoningEffort: reasoningEffortFromParams(params, parent.reasoningEffort),
       claudeSessionId:
         forkPoint === 'new' ? null : (forkPoint?.sessionId ?? parent.claudeSessionId),
+      claudeSessionCwd: parent.claudeSessionCwd ?? parent.cwd,
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
@@ -4141,7 +4142,7 @@ export class CodexClaudeAppServer {
           }
           if (!active()) return
           if (event.type === 'session') {
-            this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+            this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
             if (built.resumeSessionAt) this.store.clearClaudeResumeAt(thread.id)
             return
           }
@@ -4162,7 +4163,7 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'completed') {
             if (event.claudeSessionId)
-              this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+              this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
             if (!event.success) failure = event.result ?? 'Claude did not compact the conversation'
             return
           }
@@ -4924,6 +4925,7 @@ export class CodexClaudeAppServer {
       modelProfileFingerprint,
       effort: resolvedEffort,
       claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
+      claudeSessionCwd: thread.claudeSessionCwd ?? null,
       forkSession,
       resumeSessionAt,
       // createdAt is in whole seconds: the history a fork copies from its
@@ -5467,7 +5469,7 @@ export class CodexClaudeAppServer {
             this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
           if (event.type === 'subagent_progress') return
           if (event.type === 'session') {
-            this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+            this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
             if (resumeSessionAt) {
               this.store.clearClaudeResumeAt(thread.id)
               resumedAtCheckpoint = true
@@ -6422,7 +6424,7 @@ export class CodexClaudeAppServer {
               if (isCodexThread) {
                 this.store.updateCodexSessionId(thread.id, event.claudeSessionId)
               } else {
-                this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+                this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
               }
             }
             if (!event.success)
