@@ -13,6 +13,17 @@ import type {
   RuntimeTurnContext,
 } from '../src/types.mjs'
 
+// The runtime records its Claude CLI children (cli-children/<pid>.json) and
+// writes debug.jsonl under the adapter home. Point that home at a temp dir so
+// this suite never writes into the developer's ~/.codex, where a real
+// adapter's startup reaper would read the stray records.
+// The CLI child registry write is fire-and-forget and lands after test.after
+// removes the dir, so it is off here; cli-orphans.test covers it.
+const adapterHome = mkdtempSync(join(tmpdir(), 'native-runtime-background-adapter-home-'))
+process.env.CLAUDE_CODEX_HOME = adapterHome
+process.env.CLAUDE_CODEX_REAP_ORPHANED_CLI = '0'
+test.after(() => rmSync(adapterHome, { recursive: true, force: true, maxRetries: 5 }))
+
 const context: RuntimeTurnContext = {
   threadId: 'thread',
   turnId: 'turn-1',
@@ -367,6 +378,185 @@ test('native session outlives its turn while a background agent runs and hands t
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+function timedOutBash(taskId = 'shell-1', fields: Record<string, unknown> = {}) {
+  const call = `call-${taskId}`
+  return [
+    assistant(call, [{ type: 'tool_use', id: call, name: 'Bash', input: { command: 'build' } }]),
+    {
+      type: 'system',
+      subtype: 'task_started',
+      task_id: taskId,
+      tool_use_id: call,
+      task_type: 'local_bash',
+      is_backgrounded: false,
+    },
+    { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: taskId }] },
+    {
+      type: 'user',
+      tool_use_result: { backgroundTaskId: taskId, timedOutAfterMs: 300000, ...fields },
+      message: {
+        content: [
+          { type: 'tool_result', tool_use_id: call, content: 'Command moved to the background.' },
+        ],
+      },
+    },
+  ]
+}
+
+const shellNotice = {
+  type: 'system',
+  subtype: 'task_notification',
+  task_id: 'shell-1',
+  run_id: 'run-shell',
+  tool_use_id: 'call-shell-1',
+  status: 'completed',
+  summary: 'Background command completed (exit code 0)',
+}
+
+test('a foreground Bash timeout stays in the same Codex turn through the CLI notification reply', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+  const events: RuntimeEvent[] = []
+  const run = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  try {
+    query.push(
+      ...timedOutBash(),
+      assistant('wait', [text('Waiting.')]),
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Waiting.',
+        user_message_uuids: [query.prompts[0]?.uuid],
+      },
+      { type: 'system', subtype: 'session_state_changed', state: 'idle' },
+    )
+    await waitFor(() => events.some((e) => e.type === 'metrics'), 'intermediate CLI result')
+    assert.ok(!events.some((e) => e.type === 'completed'), 'a CLI handoff must not finish the turn')
+    assert.ok(!events.some((e) => e.type === 'tool_result'), 'the command has no exit status yet')
+    query.push(
+      shellNotice,
+      { type: 'system', subtype: 'background_tasks_changed', tasks: [] },
+      { type: 'system', subtype: 'init' },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Another task.',
+        origin: { kind: 'task-notification', runId: 'run-other' },
+      },
+      { type: 'system', subtype: 'init' },
+      assistant('reply', [text('Finished.')]),
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Finished.',
+        origin: { kind: 'task-notification', runId: 'run-shell' },
+      },
+    )
+    await run
+    assert.deepEqual(
+      events.filter((e) => e.type === 'completed').map((e) => e.result),
+      ['Finished.'],
+    )
+    assert.equal(events.filter((e) => e.type === 'tool_result').length, 1)
+    assert.deepEqual(textDeltas(events), ['Waiting.', 'Finished.'])
+    assert.equal(query.prompts.length, 1)
+    assert.deepEqual(listener.autonomous, [])
+  } finally {
+    await runtime.stop()
+  }
+})
+
+test('a shell already finished when its timeout result arrives closes with its actual exit', async () => {
+  const { runtime, queries } = fakeRuntime()
+  runtime.setBackgroundListener(recordingListener())
+  const events: RuntimeEvent[] = []
+  const run = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  const frames = timedOutBash()
+  query.push(
+    ...frames.slice(0, -1),
+    { ...shellNotice, status: 'failed', summary: 'Background command failed with exit code 7' },
+    { type: 'system', subtype: 'background_tasks_changed', tasks: [] },
+    ...frames.slice(-1),
+    { type: 'result', subtype: 'success', result: 'The build failed.' },
+  )
+  await run
+  const exit = events.filter((e) => e.type === 'tool_result')
+  assert.equal(exit.length, 1)
+  assert.equal(exit[0]?.isError, true)
+  assert.equal(exit[0]?.commandExitCode, 7)
+  await runtime.stop()
+})
+
+test('deliberately backgrounded shells and commands that end with the CLI response allow the turn to finish', async () => {
+  for (const fields of [
+    { timedOutAfterMs: undefined },
+    { backgroundedByUser: true },
+    { backgroundEndsWithFinalResponse: true },
+  ]) {
+    const { runtime, queries } = fakeRuntime()
+    runtime.setBackgroundListener(recordingListener())
+    const run = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(...timedOutBash('shell-1', fields), {
+      type: 'result',
+      subtype: 'success',
+      result: 'Started.',
+    })
+    await run
+    await runtime.stop()
+  }
+})
+
+test('interrupting the waiting turn stops its timed-out shell and leaves independent work running', async () => {
+  const { runtime, queries } = fakeRuntime()
+  runtime.setBackgroundListener(recordingListener())
+  const events: RuntimeEvent[] = []
+  const run = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(
+    ...timedOutBash(),
+    {
+      type: 'system',
+      subtype: 'background_tasks_changed',
+      tasks: [{ task_id: 'shell-1' }, { task_id: 'independent' }],
+    },
+    { type: 'result', subtype: 'success', result: 'Waiting.' },
+  )
+  await waitFor(() => events.some((e) => e.type === 'metrics'), 'waiting turn')
+  await runtime.interrupt('thread')
+  await run
+  assert.deepEqual(query.stoppedTasks, ['shell-1'])
+  assert.equal(query.closed, false)
+  assert.ok(!events.some((e) => e.type === 'completed'))
+  await runtime.stop()
+})
+
+test('a lost shell reply or an unexpected CLI exit fails the waiting turn', async () => {
+  await withSettleMs(40, async () => {
+    for (const end of ['no reply', 'EOF']) {
+      const { runtime, queries } = fakeRuntime()
+      runtime.setBackgroundListener(recordingListener())
+      const events: RuntimeEvent[] = []
+      const run = runtime.runTurn(context, handlers(events))
+      const failure = assert.rejects(run, /foreground command/)
+      const query = await waitFor(() => queries[0], 'session')
+      query.push(...timedOutBash(), { type: 'result', subtype: 'success', result: 'Waiting.' })
+      await waitFor(() => events.some((e) => e.type === 'metrics'), 'waiting turn')
+      if (end === 'EOF') query.close()
+      else
+        query.push(shellNotice, { type: 'system', subtype: 'background_tasks_changed', tasks: [] })
+      // Keep the event loop alive alongside the runtime's unref'd settle timer.
+      await waitFor(() => events.some((e) => e.type === 'error'), 'reported failure')
+      await failure
+      assert.ok(!events.some((e) => e.type === 'completed'))
+      await runtime.stop()
+    }
+  })
 })
 
 test('native user turn reuses the live session and receives a report that lands mid-turn', async () => {
@@ -1114,6 +1304,46 @@ test('native model switch mid-turn sends the permission mode again for the new m
     )
     finishTurn(query)
     await turn
+    await runtime.stop()
+  }
+})
+
+test('a monitor expiring between turns wakes Claude without synthesizing a user interrupt', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+  const turn = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  try {
+    query.push(...launchBackgroundAgent('other-work'))
+    await turn
+    query.push(
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: 'monitor',
+        status: 'stopped',
+        summary: 'Monitor expired',
+      },
+      init,
+    )
+    await waitFor(() => listener.autonomous.length || query.interrupts, 'monitor expiry')
+    assert.equal(query.interrupts, 0, 'the client never requested a stop')
+    assert.deepEqual(listener.autonomous, ['thread'])
+    const events: RuntimeEvent[] = []
+    const reply = runtime.runTurn(
+      { ...context, turnId: 'monitor-reply', prompt: '', continuation: true },
+      handlers(events),
+    )
+    query.push(assistant('report', [text('Monitor expired.')]), {
+      type: 'result',
+      subtype: 'success',
+      result: 'Monitor expired.',
+      origin: { kind: 'task-notification' },
+    })
+    await reply
+    assert.deepEqual(textDeltas(events), ['Monitor expired.'])
+  } finally {
     await runtime.stop()
   }
 })

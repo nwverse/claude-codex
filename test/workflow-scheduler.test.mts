@@ -120,6 +120,41 @@ test('workflow scheduler reclaims stale running tasks but ignores active leases'
   assert.equal(decision.task.lease?.workerId, 'worker-a')
 })
 
+test('workflow scheduler fails exhausted leases while reclaiming a retryable task', () => {
+  const exhausted = task({
+    status: 'running',
+    attempts: 2,
+    maxAttempts: 2,
+    lease: {
+      workerId: 'worker-b',
+      renewedAt: '2026-07-03T23:59:00.000Z',
+      expiresAt: now.toISOString(),
+    },
+  })
+  const state: WorkflowState = {
+    version: 1,
+    tasks: [
+      exhausted,
+      { ...exhausted, id: 'also-spent' },
+      { ...exhausted, id: 'retry', maxAttempts: 3 },
+    ],
+  }
+
+  const decision = scheduleNextWorkflowTask(state, options())
+
+  assert.equal(decision.type, 'claimed')
+  assert.equal(decision.task.id, 'retry')
+  assert.equal(decision.task.lease?.workerId, 'worker-a')
+  assert.deepEqual(
+    decision.state.tasks.map(({ status, attempts }) => [status, attempts]),
+    [
+      ['failed', 2],
+      ['failed', 2],
+      ['running', 3],
+    ],
+  )
+})
+
 test('workflow scheduler renews only the owning worker lease', () => {
   const state: WorkflowState = {
     version: 1,
