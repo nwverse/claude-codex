@@ -1,7 +1,7 @@
 # Claude Codex Adapter
 
-[![CI](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml)
-[![Docs](https://github.com/fuergaosi233/claude-codex/actions/workflows/deploy-docs.yml/badge.svg)](https://fuergaosi233.github.io/claude-codex/)
+[![CI](https://github.com/nwverse/claude-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/nwverse/claude-codex/actions/workflows/ci.yml)
+[![Docs](https://github.com/nwverse/claude-codex/actions/workflows/deploy-docs.yml/badge.svg)](https://nwverse.github.io/claude-codex/)
 [![Node](https://img.shields.io/badge/node-%3E%3D24-brightgreen)](https://nodejs.org)
 
 Production TypeScript adapter that lets the **Codex desktop app** talk to
@@ -20,7 +20,7 @@ real Codex runtime, so agent turns run on Claude Code.
 answers with an <a href="#inline-visualizations">inline visualization</a> that the
 App renders inside the reply. The request was in Chinese, so are the labels.</sub></p>
 
-📖 **Documentation: <https://fuergaosi233.github.io/claude-codex/>**
+📖 **Documentation: <https://nwverse.github.io/claude-codex/>**
 
 ## Quick start
 
@@ -67,7 +67,7 @@ configuration as they are. Ordinary `codex app-server`, CLI commands and Orca
 chats keep their native route. It requires a native Codex CLI with `--remote`
 and `--remote-auth-token-env` support; an already installed global shim still
 intercepts app-server calls, so clients needing native Codex must resolve the
-real executable. See [Deployment](https://fuergaosi233.github.io/claude-codex/guide/deployment#alongside-orca-and-native-codex)
+real executable. See [Deployment](https://nwverse.github.io/claude-codex/guide/deployment#alongside-orca-and-native-codex)
 for lifecycle, crash recovery and environment details.
 
 ### Codex App over SSH
@@ -94,7 +94,7 @@ workflow and use the foreground launcher's own lifecycle instead.
 Provide credentials only through your local shell or secret manager. Do not
 commit API keys, OAuth/session data, `.env` files, or acceptance-test logs.
 
-Full walkthrough → **[Getting started](https://fuergaosi233.github.io/claude-codex/guide/getting-started)**.
+Full walkthrough → **[Getting started](https://nwverse.github.io/claude-codex/guide/getting-started)**.
 
 ## How it works
 
@@ -119,7 +119,7 @@ reaches it through `codex app-server proxy`. Neither names a socket, so both use
 somewhere else, set `CLAUDE_CODEX_SOCKET_PATH` to an absolute path in a folder of
 its own, in the login shell or `~/.claude-codex/runtime.env`, since the daemon
 and the proxy must agree on it. See
-[Configuration](https://fuergaosi233.github.io/claude-codex/guide/configuration).
+[Configuration](https://nwverse.github.io/claude-codex/guide/configuration).
 
 Each Claude thread runs its own Claude Code process. Several of them starting at
 the same moment, such as the chats that all resume their Claude sessions right
@@ -137,7 +137,7 @@ Claude from starting fork subagents (`subagent_type: "fork"`), which Claude Code
 offers Agent SDK sessions by default since 2.1.302; a fork shows in the App as a
 subagent with the role `fork`. With model process profiles, a profile passes such
 a variable on only when its `inheritEnv` names it or its `env` sets it. See
-[Claude Code variables](https://fuergaosi233.github.io/claude-codex/guide/configuration#claude-code-variables).
+[Claude Code variables](https://nwverse.github.io/claude-codex/guide/configuration#claude-code-variables).
 
 ### Model process profiles
 
@@ -152,7 +152,7 @@ on. Once that profile's configuration changes, or for a chat from before
 profiles were set up, the chat still opens to be read, but a new message asks
 for a new chat rather than resuming its session somewhere else. Without a
 profiles file nothing changes. See
-[Model process profiles](https://fuergaosi233.github.io/claude-codex/guide/configuration#model-process-profiles)
+[Model process profiles](https://nwverse.github.io/claude-codex/guide/configuration#model-process-profiles)
 for the file format, its safety rules and how it relates to
 `CLAUDE_CODEX_MODELS`.
 
@@ -194,7 +194,7 @@ New threads, forks and subagents get one; chats created before keep working but
 cannot render inline visualizations. The file rules (a lowercase hyphenated
 `.html` name, an absolute path inside the thread's folders or `/tmp`, at most
 5 MB) are in
-**[Using the Codex App](https://fuergaosi233.github.io/claude-codex/guide/gui#inline-visualizations)**.
+**[Using the Codex App](https://nwverse.github.io/claude-codex/guide/gui#inline-visualizations)**.
 
 ### Pull Requests panel
 
@@ -215,7 +215,7 @@ login; the adapter does not read, log or pass on any token. Starting a review
 from the panel runs the Codex CLI's own `exec`, which needs a working Codex
 install and sign-in, and the plugin's ChatGPT-backed GitHub connection is not
 available, since it would start a second app-server. Details are in
-**[Using the Codex App](https://fuergaosi233.github.io/claude-codex/guide/gui#pull-requests-panel)**.
+**[Using the Codex App](https://nwverse.github.io/claude-codex/guide/gui#pull-requests-panel)**.
 
 ### Project instructions
 
@@ -404,7 +404,7 @@ own settings. With `CLAUDE_CODEX_CODEX_AUTO_COMPACT=1`, the key in
 too. This is off by default because users set that key for Codex models, and
 it would otherwise replace their Claude Code window on every Claude thread.
 Unset, Claude Code keeps its own window. See
-**[Configuration](https://fuergaosi233.github.io/claude-codex/guide/configuration#context-compaction)**.
+**[Configuration](https://nwverse.github.io/claude-codex/guide/configuration#context-compaction)**.
 
 ### Leader chats
 
@@ -419,7 +419,7 @@ leader's permissions and never more, and cannot lead in turn; a leader has at
 most `CLAUDE_CODEX_LEADER_MAX_RUNNING` (default 4) chats working at once, and it
 never answers their approvals or questions: those stay with you. The tools need
 the native Claude Agent SDK backend; see
-**[Using the Codex App](https://fuergaosi233.github.io/claude-codex/guide/gui#leader-chats)**.
+**[Using the Codex App](https://nwverse.github.io/claude-codex/guide/gui#leader-chats)**.
 
 ### `/workflows` compatibility
 
@@ -440,7 +440,7 @@ starts that wait over, so a long but healthy workflow runs to the end. The wait 
 the turn waits on the user, and time the computer spends asleep does not count. When it does
 give up, the turn fails and its stuck agents stop; background agents it handed off keep
 running. See the
-[configuration reference](https://fuergaosi233.github.io/claude-codex/guide/configuration#reference-table).
+[configuration reference](https://nwverse.github.io/claude-codex/guide/configuration#reference-table).
 
 A subagent's thread shows the subagent's own work as it goes (its messages, thinking, and tool
 calls with their results) and keeps it with the thread; the parent chat shows none of it.
@@ -480,22 +480,22 @@ Full Access turn. Operators can still opt into native SDK bypass explicitly with
   credentials.
 
 See the
-**[release readiness reference](https://fuergaosi233.github.io/claude-codex/reference/release-readiness)**
+**[release readiness reference](https://nwverse.github.io/claude-codex/reference/release-readiness)**
 for the verification matrix and reviewer checklist.
 
 ## Documentation
 
 | Topic | Link |
 | --- | --- |
-| Getting started | <https://fuergaosi233.github.io/claude-codex/guide/getting-started> |
-| Deployment (remote host) | <https://fuergaosi233.github.io/claude-codex/guide/deployment> |
-| Using the Codex App | <https://fuergaosi233.github.io/claude-codex/guide/gui> |
-| Configuration | <https://fuergaosi233.github.io/claude-codex/guide/configuration> |
-| Backends | <https://fuergaosi233.github.io/claude-codex/guide/backends> |
-| Capability matrix | <https://fuergaosi233.github.io/claude-codex/reference/capability-matrix> |
-| Workflow operations | <https://fuergaosi233.github.io/claude-codex/reference/workflow-operations> |
-| Release readiness | <https://fuergaosi233.github.io/claude-codex/reference/release-readiness> |
-| Contributing / toolchain | <https://fuergaosi233.github.io/claude-codex/contributing> |
+| Getting started | <https://nwverse.github.io/claude-codex/guide/getting-started> |
+| Deployment (remote host) | <https://nwverse.github.io/claude-codex/guide/deployment> |
+| Using the Codex App | <https://nwverse.github.io/claude-codex/guide/gui> |
+| Configuration | <https://nwverse.github.io/claude-codex/guide/configuration> |
+| Backends | <https://nwverse.github.io/claude-codex/guide/backends> |
+| Capability matrix | <https://nwverse.github.io/claude-codex/reference/capability-matrix> |
+| Workflow operations | <https://nwverse.github.io/claude-codex/reference/workflow-operations> |
+| Release readiness | <https://nwverse.github.io/claude-codex/reference/release-readiness> |
+| Contributing / toolchain | <https://nwverse.github.io/claude-codex/contributing> |
 | Security policy | [SECURITY.md](SECURITY.md) |
 | Safe examples | [examples/](examples/) |
 
@@ -513,7 +513,7 @@ npm test             # build + node --test
 npm run docs:dev     # preview this documentation site
 ```
 
-See **[Contributing](https://fuergaosi233.github.io/claude-codex/contributing)**
+See **[Contributing](https://nwverse.github.io/claude-codex/contributing)**
 for the full toolchain and conventions.
 
 ## Workflow operations

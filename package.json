@@ -4,13 +4,13 @@
   "private": true,
   "description": "Remote-mode adapter that lets the Codex desktop app talk to Claude Code through the Codex app-server protocol.",
   "license": "MIT",
-  "homepage": "https://fuergaosi233.github.io/claude-codex/",
+  "homepage": "https://nwverse.github.io/claude-codex/",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/fuergaosi233/claude-codex.git"
+    "url": "git+https://github.com/nwverse/claude-codex.git"
   },
   "bugs": {
-    "url": "https://github.com/fuergaosi233/claude-codex/issues"
+    "url": "https://github.com/nwverse/claude-codex/issues"
   },
   "type": "module",
   "bin": {
@@ -56,8 +56,8 @@
     "ws": "^8.23.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.14",
-    "@types/node": "^26.6.2",
+    "@biomejs/biome": "^2.6.4",
+    "@types/node": "^26.6.6",
     "@types/ws": "^8.18.2",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
