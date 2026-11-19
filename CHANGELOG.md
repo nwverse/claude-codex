@@ -138,6 +138,13 @@ versioning or publishing metadata.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.
+- An unexpected error the adapter does not catch now ends it with exit code 1
+  and the stack on stderr, logged once in `debug.jsonl`, so whatever started
+  it can start it again. The adapter used to log and re-throw the same error
+  forever, so it kept running in whatever state the error left it in, busy
+  writing thousands of `adapter.uncaughtException` lines a second to
+  `debug.jsonl`. Errors from a peer that went away (`EPIPE`, `ECONNRESET`,
+  `EBADF`) are still logged and ignored.
 
 ### App-server and protocol compatibility
 
