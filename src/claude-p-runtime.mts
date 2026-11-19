@@ -251,16 +251,15 @@ function terminateProcessTree(
   signal: NodeJS.Signals,
   knownDescendants: number[] = [],
 ): number[] {
-  // Kill the descendants first, deepest first, then the process group and
-  // the leader itself. There is deliberately no early return when the
-  // leader has already exited: once it is gone, `ps` can no longer
-  // attribute its descendants to it, so a fresh snapshot would come back
-  // empty and the group kill would be skipped. Callers therefore pass the
-  // snapshot taken while the leader was still alive; without one, snapshot
-  // now. The group and leader kills are best-effort and no-op once the
-  // leader is gone (see #263).
-  const childPids =
-    knownDescendants.length > 0 ? knownDescendants : child.pid ? descendantPids(child.pid) : []
+  // Kill descendants deepest first, then the process group, then the leader.
+  // Callers pass the snapshot taken while the leader was alive; while the
+  // leader is still alive, union it with a fresh snapshot (it may have
+  // spawned more since). Once Node has reaped the leader, skip the fresh
+  // snapshot and the leader kill because its PID may be reused; the group
+  // kill stays because a PGID is not reused while members survive (see #263).
+  const leaderAlive = child.exitCode === null && child.signalCode === null
+  const fresh = leaderAlive && child.pid ? descendantPids(child.pid) : []
+  const childPids = [...new Set([...knownDescendants, ...fresh])]
   for (const pid of [...childPids].reverse()) {
     killPid(pid, signal)
   }
@@ -269,7 +268,7 @@ function terminateProcessTree(
       process.kill(-child.pid, signal)
     } catch {}
   }
-  killPid(child.pid, signal)
+  if (leaderAlive) killPid(child.pid, signal)
   return childPids
 }
 

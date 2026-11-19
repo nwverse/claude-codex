@@ -11,23 +11,31 @@ import type { RuntimeHandlers, RuntimeTurnContext } from '../src/types.mjs'
 // out, the SIGKILL escalation must still reach descendants that ignore
 // SIGTERM, even after claude-p itself has exited. The stubs below model a
 // claude-p leader that exits at once on SIGTERM/SIGINT and a detached
-// grandchild that traps both signals and keeps running.
+// grandchild that traps both signals and keeps running. With lateSpawn set,
+// the leader instead ignores SIGTERM and starts one more detached descendant
+// during the grace period.
 //
-// Note: a node process takes ~1 s to boot in this sandbox, so the tests
-// wait for the descendant's ready file (written after its signal handlers
-// are installed) before triggering a timeout or interrupt; otherwise the
-// signals land before the handlers exist and the descendant dies for the
-// wrong reason.
+// Note: a node process can take ~1 s to boot on a slow or loaded machine,
+// so the tests wait for the descendant's ready file (written after its
+// signal handlers are installed) before triggering a timeout or interrupt;
+// otherwise the signals land before the handlers exist and the descendant
+// dies for the wrong reason.
 
 const LEADER_STUB = `import { spawn } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
-const [pidFile, holdStdio, descendantPath, markerFile, readyFile] = process.argv.slice(2)
+const [pidFile, holdStdio, descendantPath, markerFile, readyFile, lateSpawn] = process.argv.slice(2)
 const grandchild = spawn(process.execPath, [descendantPath, markerFile ?? '', readyFile ?? ''], {
   stdio: holdStdio === '1' ? 'inherit' : 'ignore',
   detached: true,
 })
 writeFileSync(pidFile, String(grandchild.pid), 'utf8')
-process.on('SIGTERM', () => process.exit(0))
+let late = null
+process.on('SIGTERM', () => {
+  if (lateSpawn !== '1') process.exit(0)
+  if (late) return
+  late = spawn(process.execPath, [descendantPath, '', ''], { stdio: 'ignore', detached: true })
+  writeFileSync(pidFile + '.late', String(late.pid), 'utf8')
+})
 process.on('SIGINT', () => process.exit(0))
 setInterval(() => {}, 1000)
 `
@@ -128,6 +136,7 @@ async function startStubTurn(
   dir: string,
   holdStdio: '0' | '1',
   timeoutMs: number,
+  lateSpawn: '0' | '1' = '0',
 ): Promise<{ runtime: ClaudePTranscriptRuntime; turn: Promise<void>; paths: StubPaths }> {
   const { leader, descendant } = await writeStubs(dir)
   const paths: StubPaths = {
@@ -137,7 +146,15 @@ async function startStubTurn(
   }
   const runtime = new ClaudePTranscriptRuntime({
     command: process.execPath,
-    extraArgs: [leader, paths.pidFile, holdStdio, descendant, paths.markerFile, paths.readyFile],
+    extraArgs: [
+      leader,
+      paths.pidFile,
+      holdStdio,
+      descendant,
+      paths.markerFile,
+      paths.readyFile,
+      lateSpawn,
+    ],
     timeoutMs,
     skipPermissions: true,
     resume: false,
@@ -150,7 +167,7 @@ async function startStubTurn(
 test('claude-p timeout SIGKILLs a detached descendant after the leader exits', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'claude-p-runtime-263-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
-  const { turn, paths } = await startStubTurn(dir, '0', 3000)
+  const { turn, paths } = await startStubTurn(dir, '0', 8000)
   const observed = turn.then(
     () => 'resolved',
     (error: unknown) => `rejected: ${error instanceof Error ? error.message : String(error)}`,
@@ -159,8 +176,8 @@ test('claude-p timeout SIGKILLs a detached descendant after the leader exits', a
   t.after(() => killLeftover(grandchildPid))
   await waitForFile(paths.readyFile)
   assert.equal(
-    await Promise.race([observed, sleep(8000).then(() => 'unsettled')]),
-    'rejected: claude-p timed out after 3000ms',
+    await Promise.race([observed, sleep(15000).then(() => 'unsettled')]),
+    'rejected: claude-p timed out after 8000ms',
   )
   // The turn rejects when SIGTERM fires; the SIGKILL follows 1500 ms
   // later. Poll until the descendant is gone (deadline: grace + margin)
@@ -181,7 +198,7 @@ test('claude-p timeout SIGKILLs a detached descendant after the leader exits', a
 test('claude-p timeout settles when a descendant holds stdio open', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'claude-p-runtime-263-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
-  const { turn, paths } = await startStubTurn(dir, '1', 3000)
+  const { turn, paths } = await startStubTurn(dir, '1', 8000)
   const observed = turn.then(
     () => 'resolved',
     (error: unknown) => `rejected: ${error instanceof Error ? error.message : String(error)}`,
@@ -190,10 +207,10 @@ test('claude-p timeout settles when a descendant holds stdio open', async (t) =>
   t.after(() => killLeftover(grandchildPid))
   await waitForFile(paths.readyFile)
   try {
-    const outcome = await Promise.race([observed, sleep(8000).then(() => 'unsettled')])
+    const outcome = await Promise.race([observed, sleep(15000).then(() => 'unsettled')])
     assert.equal(
       outcome,
-      'rejected: claude-p timed out after 3000ms',
+      'rejected: claude-p timed out after 8000ms',
       'turn promise must settle once the escalation SIGKILLs the stdio-holding descendant',
     )
   } finally {
@@ -216,9 +233,13 @@ test('interrupt follow-up SIGTERM reaches descendants after the leader exits', a
   const interruptedAt = Date.now()
   await runtime.interrupt('thread-263')
   assert.equal(await Promise.race([settled, sleep(5000).then(() => 'unsettled')]), 'resolved')
-  // The SIGTERM follow-up is scheduled 1500 ms after SIGINT; check past it.
-  await sleep(Math.max(0, interruptedAt + 2200 - Date.now()))
-  const signals = existsSync(paths.markerFile) ? await readFile(paths.markerFile, 'utf8') : ''
+  // The SIGTERM follow-up is scheduled 1500 ms after SIGINT; poll for it.
+  let signals = ''
+  while (Date.now() <= interruptedAt + 5000) {
+    signals = existsSync(paths.markerFile) ? await readFile(paths.markerFile, 'utf8') : ''
+    if (/SIGTERM/.test(signals)) break
+    await sleep(100)
+  }
   assert.match(
     signals,
     /SIGTERM/,
@@ -226,8 +247,37 @@ test('interrupt follow-up SIGTERM reaches descendants after the leader exits', a
   )
 })
 
-test('claude-p turn still completes normally without a timeout', async () => {
+test('claude-p timeout SIGKILLs descendants spawned during the grace period', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'claude-p-runtime-263-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const { turn, paths } = await startStubTurn(dir, '0', 8000, '1')
+  const observed = turn.then(
+    () => 'resolved',
+    (error: unknown) => `rejected: ${error instanceof Error ? error.message : String(error)}`,
+  )
+  const grandchildPid = await waitForPidFile(paths.pidFile)
+  t.after(() => killLeftover(grandchildPid))
+  await waitForFile(paths.readyFile)
+  assert.equal(
+    await Promise.race([observed, sleep(15000).then(() => 'unsettled')]),
+    'rejected: claude-p timed out after 8000ms',
+  )
+  const latePid = await waitForPidFile(`${paths.pidFile}.late`)
+  t.after(() => killLeftover(latePid))
+  const deadline = Date.now() + 4000
+  while (isAlive(latePid) && Date.now() < deadline) {
+    await sleep(100)
+  }
+  assert.equal(
+    isAlive(latePid),
+    false,
+    'a descendant the leader spawns after SIGTERM must be SIGKILLed with the rest of the tree',
+  )
+})
+
+test('claude-p turn still completes normally without a timeout', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-p-runtime-263-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
   const echo = join(dir, 'echo.mjs')
   await writeFile(echo, ECHO_STUB, 'utf8')
   const seen: string[] = []
@@ -246,5 +296,4 @@ test('claude-p turn still completes normally without a timeout', async () => {
     onPermissionRequest: async () => ({ decision: 'decline' }),
   })
   assert.deepEqual(seen, ['hello'])
-  await rm(dir, { recursive: true, force: true })
 })
