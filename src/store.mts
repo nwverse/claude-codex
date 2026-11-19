@@ -1727,22 +1727,29 @@ export class SessionStore {
       .run(serializeResumePoint(this.historyBase(parentId)), threadId)
   }
 
-  // thread/delete: the thread, the subagent threads it spawned (recursively)
-  // and everything stored for them. Returns the deleted thread ids.
-  deleteThread(threadId: string): string[] {
-    const ids = (
+  // The thread and the subagent threads it spawned, recursively: what
+  // thread/delete removes and thread/archive archives. A fork of the thread
+  // is a chat of its own and stays out.
+  subagentTreeIds(threadId: string): string[] {
+    return (
       this.db
         .prepare(
-          `WITH RECURSIVE doomed(id) AS (
+          `WITH RECURSIVE tree(id) AS (
              SELECT id FROM threads WHERE id = ?
              UNION
-             SELECT child.id FROM threads child JOIN doomed parent ON child.forked_from_id = parent.id
+             SELECT child.id FROM threads child JOIN tree parent ON child.forked_from_id = parent.id
              WHERE child.thread_source = 'subagent'
            )
-           SELECT id FROM doomed`,
+           SELECT id FROM tree`,
         )
         .all(threadId) as Array<{ id: string }>
     ).map((row) => row.id)
+  }
+
+  // thread/delete: the thread, the subagent threads it spawned (recursively)
+  // and everything stored for them. Returns the deleted thread ids.
+  deleteThread(threadId: string): string[] {
+    const ids = this.subagentTreeIds(threadId)
     for (const id of ids) {
       this.db.prepare('DELETE FROM turns WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_inherited_turns WHERE thread_id = ?').run(id)
