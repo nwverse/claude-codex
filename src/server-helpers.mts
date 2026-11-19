@@ -1,5 +1,5 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
+import { constants, type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { promisify } from 'node:util'
@@ -326,6 +326,64 @@ export function summarizeRpcParams(method: string, params: unknown): unknown {
       inputTypes: Array.isArray(rec.input) ? rec.input.map((item) => asRecord(item).type) : [],
     }
   }
+  if (method === 'turn/steer') {
+    return {
+      threadId: rec.threadId,
+      expectedTurnId: rec.expectedTurnId,
+      inputTypes: Array.isArray(rec.input) ? rec.input.map((item) => asRecord(item).type) : [],
+    }
+  }
+  if (method === 'turn/diff/updated') {
+    return {
+      threadId: rec.threadId,
+      turnId: rec.turnId,
+      diffBytes: typeof rec.diff === 'string' ? Buffer.byteLength(rec.diff, 'utf8') : 0,
+    }
+  }
+  if (method === 'item/fileChange/patchUpdated') {
+    const changes = Array.isArray(rec.changes) ? rec.changes.map((change) => asRecord(change)) : []
+    return {
+      threadId: rec.threadId,
+      turnId: rec.turnId,
+      itemId: rec.itemId,
+      paths: changes.map((change) => change.path),
+      diffBytes: changes.reduce<number>(
+        (total, change) =>
+          total + (typeof change.diff === 'string' ? Buffer.byteLength(change.diff, 'utf8') : 0),
+        0,
+      ),
+    }
+  }
+  if (method === 'process/writeStdin' || method === 'command/exec/write') {
+    return {
+      processHandle: rec.processHandle,
+      processId: rec.processId,
+      deltaBytes:
+        typeof rec.deltaBase64 === 'string'
+          ? Buffer.from(rec.deltaBase64, 'base64').byteLength
+          : typeof rec.delta === 'string'
+            ? Buffer.byteLength(rec.delta, 'utf8')
+            : 0,
+      closeStdin: rec.closeStdin,
+    }
+  }
+  if (method === 'fs/writeFile') {
+    return {
+      path: rec.path,
+      bytes:
+        typeof rec.dataBase64 === 'string'
+          ? Buffer.from(rec.dataBase64, 'base64').byteLength
+          : typeof rec.data === 'string'
+            ? Buffer.byteLength(rec.data, 'utf8')
+            : 0,
+    }
+  }
+  if (method === 'thread/inject_items') {
+    return {
+      threadId: rec.threadId,
+      itemCount: Array.isArray(rec.items) ? rec.items.length : 0,
+    }
+  }
   if (method === 'process/spawn' || method === 'command/exec') {
     return {
       processHandle: rec.processHandle,
@@ -353,7 +411,7 @@ export function summarizeRpcParams(method: string, params: unknown): unknown {
       capReached: rec.capReached,
     }
   }
-  if (method === 'item/agentMessage/delta') {
+  if (method.endsWith('/delta') || method.endsWith('Delta')) {
     return {
       threadId: rec.threadId,
       turnId: rec.turnId,
@@ -1216,11 +1274,6 @@ function unwrapSubagentHandback(text: string): string {
     .replace(/\s+$/, '')
 }
 
-// Best-effort parse of a Claude Bash tool_result for the real shell exit
-// code. Claude's tool result content is usually plain stdout/stderr, but in
-// some failure modes (and via custom wrappers / Codex CLI shims) the SDK
-// suffixes a `Exit code: N` / `exit status N` marker. Returning null lets
-// the caller fall back to 0/1 from event.isError.
 // Map Claude's TodoWrite input to Codex v2 TurnPlanStep[]. Claude todos carry
 // { content, status, activeForm } with status pending|in_progress|completed;
 // the wire TurnPlanStepStatus is camelCase pending|inProgress|completed.
@@ -1247,6 +1300,11 @@ export function todoWriteToPlanSteps(
   })
 }
 
+// Best-effort parse of a failed Claude Bash tool_result for the real shell
+// exit code. Claude Code starts a failed result with `Exit code N` (no colon)
+// followed by the command output; wrappers and the codex proxy may instead end
+// it with `Exit code: N` / `exit status: N`. Callers parse only error results
+// and fall back to 1 when this returns null.
 export function parseExitCodeFromResult(content: unknown): number | null {
   const text =
     typeof content === 'string'
@@ -1257,7 +1315,9 @@ export function parseExitCodeFromResult(content: unknown): number | null {
             .join('')
         : ''
   if (!text) return null
-  const match = text.match(/(?:Exit code|exit status|exit code):\s*(-?\d+)/i)
+  const match =
+    text.match(/^(?:Exit code|exit status):?[ \t]*(-?\d+)[ \t]*(?:\r?\n|$)/i) ??
+    text.match(/(?:^|\n)(?:Exit code|exit status):?[ \t]*(-?\d+)\s*$/i)
   if (!match) return null
   const code = Number(match[1])
   return Number.isFinite(code) ? code : null
@@ -1434,19 +1494,20 @@ export function fileChangeFromTool(
   ]
 }
 
+function splitDiffLines(text: string): string[] {
+  if (!text) return []
+  const lines = text.split('\n')
+  if (lines[lines.length - 1] === '') lines.pop()
+  return lines
+}
+
 export function simpleDiff(path: string, oldText: string, newText: string): string {
   return [
     `--- a/${path}`,
     `+++ b/${path}`,
     '@@',
-    ...oldText
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => `-${line}`),
-    ...newText
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => `+${line}`),
+    ...splitDiffLines(oldText).map((line) => `-${line}`),
+    ...splitDiffLines(newText).map((line) => `+${line}`),
     '',
   ].join('\n')
 }
@@ -1506,7 +1567,7 @@ export async function gitDiff(cwd: string): Promise<string> {
 
 export async function gitUntrackedDiff(cwd: string): Promise<string> {
   try {
-    const { readFile } = await import('node:fs/promises')
+    const { lstat, open, readlink } = await import('node:fs/promises')
     const { stdout } = await execFileAsync(
       'git',
       ['ls-files', '--others', '--exclude-standard', '-z'],
@@ -1519,9 +1580,30 @@ export async function gitUntrackedDiff(cwd: string): Promise<string> {
     const paths = stdout.split('\0').filter(Boolean).slice(0, 50)
     const diffs: string[] = []
     for (const path of paths) {
-      const bytes = await readFile(`${cwd}/${path}`)
-      if (bytes.includes(0)) continue
-      diffs.push(addedFileDiff(path, bytes.toString('utf8')))
+      try {
+        const fullPath = join(cwd, path)
+        const stats = await lstat(fullPath)
+        if (stats.isSymbolicLink()) {
+          diffs.push(addedFileDiff(path, await readlink(fullPath), '120000'))
+        } else if (stats.isFile()) {
+          // Refuse a link swapped in after lstat, and never block on a FIFO.
+          const file = await open(
+            fullPath,
+            constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+          )
+          try {
+            if (!(await file.stat()).isFile()) continue
+            const bytes = await file.readFile()
+            if (bytes.includes(0)) continue
+            diffs.push(addedFileDiff(path, bytes.toString('utf8')))
+          } finally {
+            await file.close()
+          }
+        }
+      } catch (error) {
+        // A disappearing or unreadable path must not hide the other new files.
+        debugLog('git.untrackedDiff.fileFailed', { cwd, path, error: String(error) })
+      }
     }
     return diffs.join('\n')
   } catch (error) {
@@ -1534,16 +1616,20 @@ export async function gitUntrackedDiff(cwd: string): Promise<string> {
   }
 }
 
-export function addedFileDiff(path: string, text: string): string {
+export function addedFileDiff(path: string, text: string, mode = '100644'): string {
   const lines = text.length === 0 ? [] : text.replace(/\n$/, '').split('\n')
+  // A link target never ends in a newline; git marks that so `git apply` keeps the link intact.
+  const noNewline =
+    mode === '120000' && text !== '' && !text.endsWith('\n') ? ['\\ No newline at end of file'] : []
   return [
     `diff --git a/${path} b/${path}`,
-    'new file mode 100644',
+    `new file mode ${mode}`,
     'index 0000000..0000000',
     '--- /dev/null',
     `+++ b/${path}`,
     `@@ -0,0 +1,${lines.length} @@`,
     ...lines.map((line) => `+${line}`),
+    ...noNewline,
     '',
   ].join('\n')
 }

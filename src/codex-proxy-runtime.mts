@@ -6,13 +6,14 @@
 //
 // Multi-turn continuity: Codex's `thread.started.thread_id` returned on the
 // first turn is persisted on our ThreadRecord.codexSessionId; subsequent
-// turns invoke `codex exec resume <id>` so the conversation history survives.
+// turns invoke `codex exec <options> resume <id>` so the conversation history survives.
 //
 // Auth: relies on real Codex's own auth state (login via the Codex desktop
 // app or `codex login`). We don't manage tokens for it — just forward what
 // the OS user has.
 
 import { type ChildProcess, spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { createInterface, type Interface } from 'node:readline'
 import { flatPrompt } from './turn-context.mjs'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
@@ -67,36 +68,30 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       //                                approvalPolicy/sandboxMode; codex
       //                                would otherwise prompt on stdin and
       //                                deadlock the JSONL stream.
+      //   -s <mode>                    read-only / workspace-write sandbox (any other mode takes
+      //                                the bypass flag)
       //   -m <model>                   the model the user picked in the App
       //   -C <cwd>                     anchor the workspace
-      //   resume <sessionId>           multi-turn continuity
+      //   --add-dir <dir>              extra writable roots (CLAUDE_CODEX_ADD_DIRS)
+      //   resume <sessionId>           multi-turn continuity; goes after all the options above,
+      //                                since `codex exec resume` takes no -C, -s or --add-dir
+      //                                of its own
       const resumeId = context.claudeSessionId
-      const args: string[] = ['exec']
-      if (resumeId) {
-        args.push('resume', resumeId, '--json', '--skip-git-repo-check')
-        if (context.sandboxMode === 'danger-full-access' || !context.sandboxMode) {
-          args.push('--dangerously-bypass-approvals-and-sandbox')
-        }
-        if (context.model) args.push('-m', context.model)
+      const args: string[] = ['exec', '--json', '--skip-git-repo-check']
+      if (context.sandboxMode === 'read-only' || context.sandboxMode === 'workspace-write') {
+        args.push('-s', context.sandboxMode)
       } else {
-        args.push('--json', '--skip-git-repo-check')
-        if (context.sandboxMode === 'danger-full-access') {
-          args.push('--dangerously-bypass-approvals-and-sandbox')
-        } else if (
-          context.sandboxMode === 'read-only' ||
-          context.sandboxMode === 'workspace-write'
-        ) {
-          args.push('-s', context.sandboxMode)
-        } else {
-          args.push('--dangerously-bypass-approvals-and-sandbox')
-        }
-        if (context.model) args.push('-m', context.model)
-        if (context.cwd) args.push('-C', context.cwd)
-        if (context.addDirs && context.addDirs.length > 0) {
-          for (const dir of context.addDirs) args.push('--add-dir', dir)
-        }
+        args.push('--dangerously-bypass-approvals-and-sandbox')
       }
-      args.push(flatPrompt(context.prompt, context.promptContext))
+      if (context.model) args.push('-m', context.model)
+      if (context.cwd) args.push('-C', context.cwd)
+      for (const dir of context.addDirs ?? []) args.push('--add-dir', dir)
+      if (resumeId) args.push('resume', resumeId)
+      // PROMPT `-` makes codex read the prompt from stdin. As an argv entry a
+      // prompt starting with '-' parses as a flag, and one over 128 KiB fails
+      // the spawn with E2BIG on Linux (MAX_ARG_STRLEN).
+      args.push('-')
+      const prompt = flatPrompt(context.prompt, context.promptContext)
 
       debugLog('codex-proxy.spawn', {
         binary,
@@ -106,9 +101,16 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       })
 
       const proc = spawn(binary, args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: context.cwd || undefined,
+        stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
       })
+      // codex may exit before it reads the whole prompt (bad flag, auth
+      // failure); the exit handler reports the turn, so only log EPIPE here.
+      proc.stdin.on('error', (err) => {
+        debugLog('codex-proxy.stdinError', { turnId: context.turnId, err: String(err) })
+      })
+      proc.stdin.end(prompt)
 
       const pending: PendingTurn = {
         context,
@@ -173,6 +175,12 @@ export class CodexProxyRuntime implements ClaudeRuntime {
         if (pending.resolved) return
         pending.resolved = true
         this.turns.delete(context.turnId)
+        // spawn() reports a missing cwd as ENOENT on the codex binary itself.
+        const code = (err as NodeJS.ErrnoException).code
+        if (code === 'ENOENT' && context.cwd && !existsSync(context.cwd)) {
+          reject(new Error(`Project folder not found: ${context.cwd}`))
+          return
+        }
         reject(err)
       })
     })

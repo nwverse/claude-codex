@@ -48,6 +48,17 @@ versioning or publishing metadata.
 
 ### Failures you can see and act on
 
+- A turn in a GPT chat (the `codex-proxy` route) now hands its prompt to
+  `codex exec` on stdin instead of as the last argument. A message that
+  starts with `-` or `--` no longer fails as an unknown `codex` flag, and a
+  prompt over 128 KiB (a pasted log, a large injected context) no longer fails
+  with `spawn E2BIG` on Linux.
+- A message sent to steer a running turn in an `agent-http` or `agentapi`
+  chat no longer jumps ahead of the turn's own prompt. A steer that arrived
+  while the turn was still starting was posted before the prompt, possibly to
+  the unmanaged base URL instead of the turn's bridge, and was reported as
+  delivered. It now waits until the prompt is posted and goes to the turn's
+  bridge. A steer for a chat with no running turn is no longer posted.
 - A turn that fails after the computer slept for a minute or more since
   Claude last made progress in it says so in its error: roughly how long the
   computer slept, that this broke Claude's connection to the model, and that a
@@ -121,6 +132,12 @@ versioning or publishing metadata.
   not found, a name, roots or metadata it refuses), whose text the App
   matches; a bad project cursor or an empty `idempotencyKey` is an invalid
   request.
+- `thread/turns/list`, `thread/turns/items/list`, `thread/items/list`,
+  `thread/timeline/list`, `thread/name/set`, `thread/archive`,
+  `thread/goal/get` and `turn/interrupt` refuse an unknown thread with
+  `unknown thread: <id>` (`-32600`) too. They used to answer an empty page,
+  `{goal: null}` or `{}`; a rename or archive still sent its notification,
+  and an interrupt left the caller subscribed to a thread that did not exist.
 - Model process profiles that fail to load fail with one line of at most 300
   characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
   what is wrong. The message used to carry the JSON parser's excerpt of the
@@ -128,6 +145,17 @@ versioning or publishing metadata.
   `defaultModel` value that was not valid. A model change from the menu or
   `turn/settings/update` that fails on them is now an invalid request
   (`-32600`) like one from `turn/start`, so the toast shows the reason.
+- A `CLAUDE_CODEX_MCP_SERVERS` value (or the file it names) that is not valid
+  JSON fails with a message that names the source and says what is wrong,
+  quoting none of its text. The `CLAUDE_CODEX_MCP_SERVERS` server status in
+  the App and the debug log used to carry the JSON parser's excerpt of it,
+  which could include a credential; JSON wrapped in quotes was echoed whole
+  as a file that was not found.
+- `claude-codex-mode logs agent-http|agentapi` and `tail agent-http|agentapi`
+  show the pooled bridge log written to most recently. They used to show the
+  oldest one, so the log a failed bridge start pointed you to was usually
+  another bridge's.
+  They also find pooled logs when `CLAUDE_CODEX_STATE_DIR` contains a space.
 - A workflow agent that fails (one that stalled on every attempt, or hit an
   API error) ends its thread's turn as failed, with the reason the workflow
   reported, and counts as a failed subagent of its parent. It used to show as
@@ -138,9 +166,32 @@ versioning or publishing metadata.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.
+- `claude-codex-mode` force-kills (SIGKILL) a pooled bridge or an app-server
+  that is still running 3 seconds after SIGTERM. It used to send SIGTERM a
+  second time, then drop the bridge's pidfile anyway, which left a bridge
+  holding its port that `status`, `stop-bridges` and `prune-bridges` could no
+  longer see, and `set` reported the app-server stopped while it still ran.
+- An unexpected error the adapter does not catch now ends it with exit code 1
+  and the stack on stderr, logged once in `debug.jsonl`, so whatever started
+  it can start it again. The adapter used to log and re-throw the same error
+  forever, so it kept running in whatever state the error left it in, busy
+  writing thousands of `adapter.uncaughtException` lines a second to
+  `debug.jsonl`. Errors from a peer that went away (`EPIPE`, `ECONNRESET`,
+  `EBADF`) are still logged and ignored.
 
 ### App-server and protocol compatibility
 
+- Untracked symlinks show in the turn diff as `new file mode 120000` entries
+  whose content is the link target, as `git diff` shows them. The adapter no
+  longer reads through a link, so a file outside the workspace no longer leaks
+  into the diff and a link to a device such as `/dev/zero` no longer hangs it;
+  a dangling or directory link, an embedded repository or an unreadable file
+  no longer empties the untracked part of the diff.
+- With the `codex` shim on `PATH`, `codex app-server generate-ts` and
+  `generate-json-schema` (and so `npm run generate:schema`) go to the real
+  Codex CLI (`CODEX_REAL`). They used to start an adapter app-server on stdio
+  that never wrote the bindings; without a real codex the shim now exits 127
+  and says to set `CODEX_REAL`.
 - `thread/list` now filters by `searchTerm` (thread name or preview) and
   `excludedThreadIds`, and the exclusion applies before the page limit. A
   malformed or oversized (more than 100) `excludedThreadIds` returns
@@ -240,7 +291,10 @@ versioning or publishing metadata.
   in progress in the App.
 - The adapter stops Claude CLI processes a previous adapter on the same state
   dir left running, matching pid, start time and command line before
-  signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off).
+  signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off). Start times
+  are read in UTC and the C locale, so two adapters with a different `TZ`
+  (an App launch and a shell) no longer drop a live sibling's record or miss
+  a killed adapter's Claude CLI.
 - A second adapter started on the same state dir (a startup probe, another
   window) no longer fails the turns a running adapter is still working on.
   Each turn records the process that wrote it, by pid and start time, and
@@ -266,6 +320,13 @@ versioning or publishing metadata.
   explicit `--listen unix://PATH` or `proxy --sock PATH` still wins. Both
   commands read it, so set it where both run. The daemon makes the socket's
   folder private to the user, so give the socket a folder of its own.
+- `app-server proxy` takes `--sock=PATH` as well as `--sock PATH`; a `--sock`
+  with no path is an error instead of quietly using the default socket. A
+  bad `--listen` (`tcp://...`, `ws://host:abc`, or `--listen` with no value)
+  now fails with one line before the state database opens, instead of a
+  stack trace after it, or a silent `stdio://`. The unix daemon no longer
+  refuses to start over a pid file that is empty, holds `0`, or names a
+  process that is not listening on the socket.
 - With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
   Code processes one at a time: a new session waits until the previous
   launch has sent its first SDK message, has ended, or has held the slot for
@@ -641,6 +702,20 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- A deleted chat stays deleted and a rename sticks when a `turn/start`
+  arrives at the same time, for example from a second window on the same
+  chat. `turn/start` re-reads the thread after waiting on a running turn
+  instead of writing back the copy it read first, and a `turn/start` that
+  lands while `thread/delete` is ending the chat's turn fails with
+  `unknown thread` and starts nothing.
+- Streaming no longer stalls the adapter on every text, reasoning or command
+  output delta. Each delta used to read the whole turn, write it back and
+  fsync the state database before the delta reached the App, a few
+  milliseconds each on a long turn. The store now keeps a streaming turn in
+  memory and writes it about every 50 ms, and before any other write or read
+  of the state. Reads of that turn, such as the status check before each
+  delta, come from the copy in memory, so history, completion, a restart and
+  other processes still see every delta.
 - A forked chat shows the turns it was forked with on every read, as a Codex
   fork does: `thread/resume`, `thread/read`, `thread/turns/list`,
   `thread/items/list`, `thread/turns/items/list`, `thread/timeline/list` and
@@ -753,6 +828,12 @@ versioning or publishing metadata.
 
 ### Provider and multi-agent boundaries
 
+- Follow-up turns of a Codex (`gpt-*`) chat on the `codex-proxy` route run
+  in the thread's folder with its sandbox mode and extra writable roots
+  (`CLAUDE_CODEX_ADD_DIRS`) again. `codex exec resume` was run without `-C`,
+  `-s` and `--add-dir`, so from the second turn on Codex worked in the
+  adapter's own folder, dropped the extra roots and, in `read-only` and
+  `workspace-write` chats, used the sandbox of the user's Codex config.
 - `/workflows` runs turn workflows on with the CLI's `CLAUDE_CODE_WORKFLOWS`
   switch instead of `--settings`, which pinned launchers reject, and respect a
   user's `enableWorkflows: false`.
@@ -873,6 +954,14 @@ versioning or publishing metadata.
   chat"; a queued message or goal reports that and does not run. Profiles
   replace `CLAUDE_CODEX_MODELS` and `CLAUDE_CODEX_MODEL_ALIASES` and need
   the native runtime. Without a profiles file nothing changes.
+- `ANTHROPIC_CUSTOM_HEADERS` counts as a secret in model process profiles,
+  like a key whose name contains `TOKEN`, `KEY`, `SECRET`, `PASSWORD` or
+  `AUTH`. In a profile's `env` it must be a single `${VAR}` reference, and
+  its value is a placeholder in the profile fingerprint, so rotating a
+  gateway header credential keeps chats going. A profiles file with a
+  literal value there no longer loads (move the value to the 0600 env file
+  or a `${VAR}`). A chat that already had a conversation on a profile
+  setting it, before this change, needs a new chat once after updating.
 - Resuming a Claude session copies its transcript only into the config dir
   that turn's Claude Code runs from (a model profile's, else
   `CLAUDE_CONFIG_DIR` or `~/.claude`, or with `CLAUDE_CODEX_CLI` the
@@ -968,9 +1057,11 @@ versioning or publishing metadata.
 
 ### Validation and release gates
 
-- Default CI runs Biome checks, TypeScript typechecking, the Node test suite,
-  Rust workspace tests, and the pinned Rust protocol fixture drift gate.
-- Documentation changes should run `npm run docs:build`.
+- Default CI runs Biome checks, TypeScript typechecking, the VitePress docs
+  build, the Node test suite, Rust workspace tests, and the pinned Rust protocol
+  fixture drift gate.
+- The docs build no longer ignores dead links, so a link to a page that does not
+  exist fails CI.
 - Credentialed smoke and acceptance checks remain opt-in and must use
   credentials already owned by the local user or organization on the host.
 - `npm run check:app-upgrade -- --app <bundle>` checks a new Codex App build

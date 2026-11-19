@@ -1526,6 +1526,12 @@ test('threads carry the git info of their workspace without listing running git'
       const plain = await server.startThread()
       const resumed = await server.request('thread/resume', { threadId: plain, cwd: repo })
       assert.deepEqual(resumed.thread.gitInfo, later)
+      // A lookup that fails there drops the git info of the workspace it left.
+      const gone = await server.request('thread/resume', {
+        threadId: plain,
+        cwd: join(server.home, 'gone'),
+      })
+      assert.equal(gone.thread.gitInfo, null)
       const back = await server.request('thread/resume', { threadId: plain, cwd: server.home })
       assert.equal(back.thread.gitInfo, null)
     }, env)
@@ -2002,6 +2008,37 @@ test('review and compaction reject a running turn without losing its output', as
     assert.equal(
       thread.turns[0].items.find((item: any) => item.type === 'agentMessage')?.text,
       'Before. After.',
+    )
+  })
+})
+
+test('loaded thread pagination advances, terminates and validates its cursor', async () => {
+  await withServer(async (server) => {
+    assert.deepEqual(await server.request('thread/loaded/list'), { data: [], nextCursor: null })
+    const ids = [await server.startThread(), await server.startThread(), await server.startThread()]
+    const first = await server.request('thread/loaded/list', { limit: 2 })
+    assert.deepEqual(first, { data: ids.slice(0, 2), nextCursor: '2' })
+    const second = await server.request('thread/loaded/list', {
+      limit: 2,
+      cursor: first.nextCursor,
+    })
+    assert.deepEqual(second, { data: ids.slice(2), nextCursor: null })
+    assert.deepEqual([...first.data, ...second.data], ids)
+    assert.deepEqual(await server.request('thread/loaded/list', { limit: 0 }), {
+      data: ids.slice(0, 1),
+      nextCursor: '1',
+    })
+    assert.deepEqual(await server.request('thread/loaded/list'), { data: ids, nextCursor: null })
+    assert.deepEqual(await server.request('thread/loaded/list', { cursor: '3', limit: 2 }), {
+      data: [],
+      nextCursor: null,
+    })
+    await assert.rejects(
+      server.request('thread/loaded/list', { cursor: 'invalid' }),
+      (error: unknown) =>
+        error instanceof RpcError &&
+        error.code === -32600 &&
+        error.message.includes('invalid loaded thread cursor'),
     )
   })
 })
