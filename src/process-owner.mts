@@ -10,26 +10,30 @@ import { parseProcessRows, psEnv } from './cli-orphans.mjs'
 
 export interface ProcessOwner {
   pid: number
-  started: string
+  started: string | null
 }
 
-let self: ProcessOwner | null | undefined
+let self: ProcessOwner | undefined
 
-// This process, or null where ps cannot tell its start time (Windows).
-export function currentProcessOwner(): ProcessOwner | null {
+// Even where ps cannot read a start time, record the pid so other live
+// adapters know to leave this process alone.
+export function currentProcessOwner(): ProcessOwner {
   if (self === undefined) {
     const started = startTimes([process.pid])?.get(process.pid)
-    self = started ? { pid: process.pid, started } : null
+    self = { pid: process.pid, started: started ?? null }
   }
   return self
 }
 
-// Whether `owner` is another process that is still running. A process whose
-// start time cannot be read counts as gone, which is how every turn was
-// treated before turns recorded their server.
+// Whether `owner` is another process that is still running. A pid that
+// answers a signal but whose start time cannot be read (ps failed or timed
+// out) counts as running: a live owner must never be mistaken for a dead one.
+// It is gone when its pid is gone, or its start time differs from one read.
 export function otherProcessRunning(owner: ProcessOwner): boolean {
   if (owner.pid === process.pid || !signalable(owner.pid)) return false
-  return startTimes([owner.pid])?.get(owner.pid) === owner.started
+  if (!owner.started) return true
+  const started = startTimes([owner.pid])?.get(owner.pid)
+  return started === undefined ? signalable(owner.pid) : started === owner.started
 }
 
 function signalable(pid: number): boolean {

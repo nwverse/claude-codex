@@ -716,6 +716,13 @@ export class CodexClaudeAppServer {
   // Turns whose runtime run is scheduled or has not returned yet. A turn outside this
   // set has nothing left that would ever end it.
   private runtimeRuns = new Set<string>()
+  // Terminal writes that hit a busy or unavailable store. A new turn flushes
+  // its thread's pending outcomes before claiming, so the old row does not
+  // look like a live owner while its delayed retry is still waiting.
+  private pendingTurnEnds = new Map<
+    string,
+    { threadId: string; status: TurnStatus; error: unknown | null; attempt: number }
+  >()
   private subagentStateByTurn = new Map<string, ActiveSubagentState>()
   // Closes the message, reasoning and plan items a turn is still streaming,
   // so an interrupt that ends the turn from outside leaves none open.
@@ -2476,8 +2483,13 @@ export class CodexClaudeAppServer {
   private async threadArchive(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = this.knownThreadId(params)
     await this.stopThreadWork(peer, threadId)
-    for (const id of this.store.subagentTreeIds(threadId)) {
-      this.store.setArchived(id, true)
+    const archived = this.store.transaction(() => {
+      const tree = this.store.subagentTreeIds(threadId)
+      for (const id of tree) this.requireLocalOrIdle(id)
+      for (const id of tree) this.store.setArchived(id, true)
+      return tree
+    })
+    for (const id of archived) {
       // Its Claude session closes, scheduled jobs included; a later turn
       // resumes it.
       this.runtime.resetSession?.(id)
@@ -3303,9 +3315,11 @@ export class CodexClaudeAppServer {
     const beforeTurnId = stringOr(params.beforeTurnId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw unknownThread(threadId)
-    const index = this.store.historyTurns(threadId).findIndex((turn) => turn.id === beforeTurnId)
-    if (index < 0) throw invalidRequest(`unknown turn: ${beforeTurnId}`)
-    const dropped = this.rewindThread(thread, () => this.dropTurnsFrom(thread, index))
+    const dropped = this.rewindThread(thread, () => {
+      const index = this.store.historyTurns(threadId).findIndex((turn) => turn.id === beforeTurnId)
+      if (index < 0) throw invalidRequest(`unknown turn: ${beforeTurnId}`)
+      return this.dropTurnsFrom(thread, index)
+    })
     debugLog('thread.revert', { threadId, beforeTurnId, dropped })
     const kept = this.store.historyTurns(threadId)
     const last = kept.at(-1)
@@ -3325,30 +3339,31 @@ export class CodexClaudeAppServer {
   private rewindThread(thread: ThreadRecord, drop: () => number): number {
     if (this.activeTurnByThread.has(thread.id))
       throw invalidRequest(`cannot rewind thread ${thread.id} while a turn is running`)
-    const dropped = drop()
-    if (dropped === 0) return 0
-    if (thread.runtimeBackend === 'codex') {
-      // `codex exec resume` cannot truncate a session; only a full rewind is
-      // exact. A fork's Codex session starts with its own first turn.
-      if (this.store.listTurns(thread.id).length === 0)
-        this.store.updateCodexSessionId(thread.id, null)
-      return dropped
-    }
-    const remaining = this.store.historyTurns(thread.id)
-    this.runtime.resetSession?.(thread.id)
-    const point = this.claudeContextAfter(thread, remaining)
-    if (point) {
-      this.resumeClaudeAt(thread.id, point)
-      return dropped
-    }
-    if (remaining.length === 0) {
-      // A fork from before fork points goes back to its parent's session.
-      const parent = thread.forkedFromId ? this.store.getThread(thread.forkedFromId) : null
-      this.store.rewindClaudeSession(thread.id, parent?.claudeSessionId ?? null, null)
-      return dropped
-    }
-    // The remaining turns predate checkpoints: Claude keeps its context.
-    debugLog('thread.rewind.unanchored', { threadId: thread.id, dropped })
+    // Materialize any legacy inherited history before the transaction below.
+    this.store.historyTurns(thread.id)
+    const dropped = this.store.transaction(() => {
+      this.requireLocalOrIdle(thread.id)
+      const count = drop()
+      if (!count) return 0
+      if (thread.runtimeBackend === 'codex') {
+        // codex exec can rewind its rollout exactly only when dropping it all.
+        if (this.store.lastTurnRef(thread.id) === null)
+          this.store.updateCodexSessionId(thread.id, null)
+      } else {
+        const remaining = this.store.historyTurns(thread.id)
+        const point = this.claudeContextAfter(thread, remaining)
+        if (point) this.resumeClaudeAt(thread.id, point)
+        else if (remaining.length === 0) {
+          // A fork from before fork points goes back to its parent's session.
+          const parent = thread.forkedFromId ? this.store.getThread(thread.forkedFromId) : null
+          this.store.rewindClaudeSession(thread.id, parent?.claudeSessionId ?? null, null)
+        } else {
+          debugLog('thread.rewind.unanchored', { threadId: thread.id, dropped: count })
+        }
+      }
+      return count
+    })
+    if (dropped && thread.runtimeBackend !== 'codex') this.runtime.resetSession?.(thread.id)
     return dropped
   }
 
@@ -3434,7 +3449,11 @@ export class CodexClaudeAppServer {
 
   private async removeThread(peer: RpcPeer, threadId: string): Promise<void> {
     await this.stopThreadWork(peer, threadId)
-    for (const id of this.store.deleteThread(threadId)) {
+    const deleted = this.store.transaction(() => {
+      for (const id of this.store.subagentTreeIds(threadId)) this.requireLocalOrIdle(id)
+      return this.store.deleteThread(threadId)
+    })
+    for (const id of deleted) {
       this.runtime.resetSession?.(id)
       this.clearThreadState(id)
       this.pendingAutonomousTurns.delete(id)
@@ -3455,6 +3474,7 @@ export class CodexClaudeAppServer {
   // (that it launched, that it is, or that hang off it), before thread/delete
   // or thread/archive ends their threads.
   private async stopThreadWork(peer: RpcPeer, threadId: string): Promise<void> {
+    for (const id of this.store.subagentTreeIds(threadId)) this.requireLocalOrIdle(id)
     if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
     for (const entry of [...this.backgroundSubagents.values()]) {
       if (!entry.running) continue
@@ -3528,7 +3548,7 @@ export class CodexClaudeAppServer {
         diff: '',
         error: null,
       }
-      this.store.upsertTurn(turn)
+      this.claimSideTurn(turn)
       this.activeTurnByThread.set(threadId, turnId)
       this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
       this.notify(peer, {
@@ -3823,7 +3843,7 @@ export class CodexClaudeAppServer {
       diff: '',
       error: null,
     }
-    this.store.upsertTurn(turn)
+    this.claimSideTurn(turn)
     recordRunEvent('turn.started', {
       threadId,
       turnId,
@@ -3900,7 +3920,7 @@ export class CodexClaudeAppServer {
       diff: '',
       error: null,
     }
-    this.store.upsertTurn(turn)
+    this.claimSideTurn(turn)
     recordRunEvent('turn.started', {
       threadId,
       turnId,
@@ -4288,6 +4308,7 @@ export class CodexClaudeAppServer {
 
   private async startClaimedTurn(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
+    this.flushPendingTurnEnds(threadId)
     let thread = this.startableThread(threadId)
     const activeTurnId = this.activeTurnByThread.get(threadId)
     if (activeTurnId && this.userShells.get(activeTurnId)?.standalone) {
@@ -4344,10 +4365,12 @@ export class CodexClaudeAppServer {
       if (joined) return { turn: this.toLifecycleTurn(joined) }
       // Other requests ran while the input waited: take the thread as they
       // left it, so this turn's write keeps a rename and a delete holds.
+      this.flushPendingTurnEnds(threadId)
       thread = this.startableThread(threadId)
     }
     // A structured summary or title turn runs its model, mapped to the
     // summary model, for that turn alone; it never rebinds the thread's.
+    const initialThread = structuredClone(thread)
     const summaryTurn = params.outputSchema != null
     const requestedModel = modelFromParams(params, thread.model)
     // A helper thread on Claude maps a Codex model like thread/start does.
@@ -4398,12 +4421,6 @@ export class CodexClaudeAppServer {
     // App rule: auto-review
     const reviewer = approvalsReviewerFromParams(params)
     if (reviewer) thread.approvalsReviewer = reviewer
-    this.store.upsertThread(thread)
-    if (!hiddenPrompt && !resumed && !thread.preview && prompt) {
-      thread.preview = prompt.slice(0, 200)
-      thread.updatedAt = nowSeconds()
-      this.store.upsertThread(thread)
-    }
     const userItem: ThreadItem | null = hiddenPrompt ? null : turnInputItem(params, input)
     const initialItems: ThreadItem[] = userItem ? [userItem] : []
     const imageItems: ThreadItem[] = []
@@ -4443,7 +4460,45 @@ export class CodexClaudeAppServer {
       error: null,
       rootTurnId: rootTurnId.trim() ? rootTurnId : null,
     }
-    this.store.upsertTurn(turn)
+    if (!hiddenPrompt && !resumed && !thread.preview && prompt) {
+      thread.preview = prompt.slice(0, 200)
+      thread.updatedAt = nowSeconds()
+    }
+    // Claim before publishing a preview, a policy change, or a model run. A
+    // local side turn that crossed an await can still accept this input.
+    for (;;) {
+      // A turn that ended while this input waited may still have its
+      // refused terminal write pending; settle it so it is not taken for an
+      // owner in another process.
+      this.flushPendingTurnEnds(threadId)
+      const claim = this.store.claimTurn(turn, () => {
+        // Another process could have finished a turn or changed its model
+        // after we read this row. Never overwrite its session id or settings
+        // with that earlier snapshot.
+        const latest = this.store.getThread(threadId)
+        if (!latest) throw unknownThread(threadId)
+        if (!isDeepStrictEqual(latest, initialThread))
+          throw invalidRequest('the thread changed while starting the turn; retry the request')
+        this.store.upsertThread(thread)
+      })
+      if (claim.claimed) break
+      const ownedHere = this.activeTurnByThread.get(threadId) === claim.activeTurn.id
+      if (ownedHere && resumed) return { turn: this.toLifecycleTurn(claim.activeTurn) }
+      if (ownedHere && !hiddenPrompt && params.outputSchema == null) {
+        const joined = await this.joinRunningTurn(
+          peer,
+          threadId,
+          params,
+          workflowCommand?.type === 'list',
+        )
+        if (joined) return { turn: this.toLifecycleTurn(joined) }
+        // The local turn ended while this input waited to join it. Claim the
+        // next turn with the input instead of dropping it.
+        continue
+      }
+      if (ownedHere) throw invalidRequest(`thread ${threadId} already has an active turn`)
+      throw this.foreignTurnError(threadId)
+    }
     recordRunEvent('turn.started', {
       threadId,
       turnId,
@@ -7866,7 +7921,16 @@ export class CodexClaudeAppServer {
       diff: '',
       error: null,
     }
-    this.store.upsertTurn(turn)
+    try {
+      this.claimSideTurn(turn)
+    } catch (error) {
+      debugLog('turn.continuation_skipped', {
+        threadId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      this.checkIdle()
+      return
+    }
     recordRunEvent('turn.started', {
       threadId,
       turnId: turn.id,
@@ -8462,6 +8526,7 @@ export class CodexClaudeAppServer {
     // that replaced it: a queued message, a goal continuation or Claude's
     // own follow-up starts within a tick of the last turn ending.
     if (activeTurnId && requestedTurnId && requestedTurnId !== activeTurnId) return {}
+    if (!activeTurnId) this.requireLocalOrIdle(threadId)
     this.settleInterruptedTurn(peer, threadId, activeTurnId || requestedTurnId)
     // Persist the terminal state before asking the SDK to abort. A few SDK
     // versions deliver one or two buffered tool events during interrupt; the
@@ -10415,7 +10480,7 @@ export class CodexClaudeAppServer {
     // The client's view comes first: a status it never hears about leaves the
     // thread spinning. A stored status the write missed is repaired at startup.
     try {
-      this.store.updateThreadStatus(threadId, status)
+      if (!this.store.updateThreadStatus(threadId, status)) return
     } catch (error) {
       debugLog('thread.status.persist_failed', {
         threadId,
@@ -10845,6 +10910,48 @@ export class CodexClaudeAppServer {
     }
   }
 
+  // A standalone shell, review, compaction or continuation is also a turn.
+  private claimSideTurn(turn: TurnRecord): void {
+    this.flushPendingTurnEnds(turn.threadId)
+    const claim = this.store.claimTurn(turn)
+    if (claim.claimed) return
+    if (this.activeTurnByThread.get(turn.threadId) === claim.activeTurn.id)
+      throw invalidRequest(`thread ${turn.threadId} already has an active turn`)
+    throw this.foreignTurnError(turn.threadId)
+  }
+
+  private foreignTurnError(threadId: string): RpcError {
+    return invalidRequest(
+      `thread ${threadId} has an active turn in another adapter process; retry after it completes`,
+    )
+  }
+
+  private requireLocalOrIdle(threadId: string): void {
+    if (this.store.hasForeignActiveTurn(threadId)) throw this.foreignTurnError(threadId)
+  }
+
+  private flushPendingTurnEnds(threadId: string): void {
+    for (const [turnId, pending] of this.pendingTurnEnds) {
+      if (pending.threadId !== threadId) continue
+      if (this.store.getTurn(turnId)?.status === 'inProgress') {
+        this.store.completeTurn(turnId, pending.status, pending.error)
+      }
+      if (
+        !this.activeTurnByThread.has(threadId) &&
+        this.store.getThread(threadId)?.status.type === 'active'
+      ) {
+        this.store.updateThreadStatus(threadId, { type: 'idle' })
+      }
+      this.pendingTurnEnds.delete(turnId)
+      debugLog('turn.persist_recovered', {
+        threadId,
+        turnId,
+        attempt: pending.attempt,
+        flush: true,
+      })
+    }
+  }
+
   private retryTurnEnd(
     threadId: string,
     turnId: string,
@@ -10852,7 +10959,10 @@ export class CodexClaudeAppServer {
     error: unknown | null,
     attempt: number,
   ): void {
+    this.pendingTurnEnds.set(turnId, { threadId, status, error, attempt })
     const timer = setTimeout(() => {
+      // turn/start may already have flushed this outcome synchronously.
+      if (!this.pendingTurnEnds.has(turnId)) return
       try {
         if (this.store.getTurn(turnId)?.status === 'inProgress')
           this.store.completeTurn(turnId, status, error)
@@ -10861,13 +10971,16 @@ export class CodexClaudeAppServer {
           this.store.getThread(threadId)?.status.type === 'active'
         )
           this.store.updateThreadStatus(threadId, { type: 'idle' })
+        this.pendingTurnEnds.delete(turnId)
         debugLog('turn.persist_recovered', { threadId, turnId, attempt })
       } catch (storeError) {
         if (attempt < TURN_END_RETRY_ATTEMPTS) {
           this.retryTurnEnd(threadId, turnId, status, error, attempt + 1)
           return
         }
-        // Startup recovery still settles the row on the next launch.
+        // Startup recovery still settles the row on the next launch. Keep the
+        // pending outcome too, so a later turn can flush it after the store
+        // becomes writable again.
         debugLog('turn.persist_abandoned', {
           threadId,
           turnId,

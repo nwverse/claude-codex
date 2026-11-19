@@ -272,6 +272,10 @@ versioning or publishing metadata.
   (`-32600`) while a turn runs or is still starting on the thread. They used
   to start a second Claude run that took over the thread, and the running
   turn's remaining output was lost. (#240, #241)
+- Adapters sharing one state directory claim an adapter-managed turn in SQLite.
+  A window attached to another adapter can read the chat while a turn runs and
+  retry a message after it completes. A surviving adapter can start the next
+  turn after the previous owner exits. (#283)
 - A `turn/start` sent while another is still starting on the same thread, or
   a goal continuation that waited on it, joins that turn instead of opening a
   second run whose answer was dropped, and a late cleanup from an older turn
