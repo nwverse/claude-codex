@@ -57,6 +57,7 @@ function handle(message) {
       return reply({})
     case 'thread/read':
     case 'thread/resume':
+      if (p.model) models.set(p.threadId, p.model)
       return reply({ thread: { id: p.threadId, modelProvider: provider, turns: [{ id: 'turn-old' }] }, model: models.get(p.threadId) || 'unknown', modelProvider: provider })
     case 'thread/settings/update':
       if (p.model) models.set(p.threadId, p.model)

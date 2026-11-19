@@ -6,6 +6,7 @@ import {
   isAgModel,
 } from './harness-models.mjs'
 import { invalidRequest, RpcError, SERVER_ERROR } from './host-methods.mjs'
+import { permissionProfilePolicy } from './server-helpers.mjs'
 import type { SessionStore } from './store.mjs'
 import type { RpcPeer, ThreadRecord } from './types.mjs'
 import { debugLog, isCodexOpenAiModel } from './util.mjs'
@@ -281,6 +282,9 @@ export class CodexNativeBridge {
       delete outgoing.path
       delete outgoing.history
       outgoing.modelProvider = provider
+      // On some app-server versions a provider override selects its global
+      // default model unless the rollout's model is supplied alongside it.
+      outgoing.model ??= bareCodexModel(thread.model)
       if (outgoing.config)
         outgoing.config = { ...asRecord(outgoing.config), model_provider: provider }
     }
@@ -326,7 +330,7 @@ export class CodexNativeBridge {
         modelProvider: provider,
         cwd: thread.cwd,
         approvalPolicy: thread.approvalPolicy,
-        ...(thread.permissionProfileId
+        ...(permissionProfilePolicy(thread.permissionProfileId)
           ? { permissions: thread.permissionProfileId }
           : { sandbox: thread.sandboxMode }),
         ...(thread.approvalsReviewer ? { approvalsReviewer: thread.approvalsReviewer } : {}),
@@ -406,6 +410,7 @@ export class CodexNativeBridge {
     await child.request('thread/resume', {
       threadId: childId,
       excludeTurns: true,
+      model: bareCodexModel(thread.model),
       modelProvider: child.provider,
     })
     this.markLoaded(child, childId)
@@ -627,7 +632,8 @@ export class CodexNativeBridge {
 
   private childResult(result: unknown, threadId: string | null): unknown {
     const thread = threadId ? this.host.store.getThread(threadId) : null
-    if (!thread?.codexSessionId) return result
+    if (!thread?.codexSessionId || !result || typeof result !== 'object' || Array.isArray(result))
+      return result
     return this.inbound(
       asRecord(result),
       thread.id,

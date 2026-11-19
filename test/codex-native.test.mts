@@ -284,6 +284,12 @@ test('a native chat resumes on its original provider and adapter id after a rest
     const restore = app.childLog().find((entry) => entry.method === 'thread/resume')
     assert.equal(restore.provider, 'fixture_a')
     assert.equal(restore.params.modelProvider, 'fixture_a')
+    assert.equal(restore.params.model, 'claude-opus-5-5')
+    assert.equal(resumed.result.model, 'codex-ag:claude-opus-5-5')
+    assert.match(
+      seen.find((message) => message.method === 'item/agentMessage/delta').params.delta,
+      /fixture_a:claude-opus-5-5:/,
+    )
   } finally {
     await app.stop()
   }
