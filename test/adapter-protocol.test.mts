@@ -1259,10 +1259,11 @@ test('defaultSocketPath stays within the platform sun_path limit', async () => {
   delete process.env.CLAUDE_CODEX_SOCKET_PATH
   try {
     const socketPath = util.defaultSocketPath()
-    assert.ok(
-      socketPath.length <= util.socketPathLimit(),
-      `socket path ${socketPath.length} exceeds limit ${util.socketPathLimit()}`,
-    )
+    assert.ok(Buffer.byteLength(socketPath) <= util.socketPathLimit())
+    process.env.CODEX_HOME = '/' + '界'.repeat(31)
+    assert.equal(util.defaultSocketPath().startsWith(join(tmpdir(), 'ccx-')), true)
+    process.env.CLAUDE_CODEX_SOCKET_PATH = '/' + '界'.repeat(40)
+    assert.throws(() => util.defaultSocketPath(), /Unix socket path exceeds/)
   } finally {
     if (prev == null) delete process.env.CODEX_HOME
     else process.env.CODEX_HOME = prev

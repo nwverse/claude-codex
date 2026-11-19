@@ -85,10 +85,20 @@ export function socketPathLimit(): number {
 // the short temp-directory fallback for a path too long for a socket.
 export function defaultSocketPath(): string {
   const explicit = process.env.CLAUDE_CODEX_SOCKET_PATH?.trim()
-  if (explicit) return resolve(explicit)
+  if (explicit) return checkedSocketPath(resolve(explicit))
   const preferred = join(codexHome(), 'app-server-control', 'app-server-control.sock')
-  if (preferred.length <= socketPathLimit()) return preferred
-  return join(tmpdir(), `ccx-${stableHash(preferred).slice(0, 16)}.sock`)
+  if (Buffer.byteLength(preferred) <= socketPathLimit()) return preferred
+  return checkedSocketPath(join(tmpdir(), `ccx-${stableHash(preferred).slice(0, 16)}.sock`))
+}
+
+export function checkedSocketPath(path: string): string {
+  const limit = socketPathLimit()
+  if (Buffer.byteLength(path) > limit) {
+    throw new Error(
+      `Unix socket path exceeds ${limit} bytes: ${path}. Choose a shorter socket path.`,
+    )
+  }
+  return path
 }
 
 // Claude Code's signed 31-hash of a path's UTF-16 units in base 36: the

@@ -6,9 +6,15 @@ import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
-import { parseProxySockArg } from '../src/transports.mjs'
+import { parseListenUrl, parseProxySockArg } from '../src/transports.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
+
+test('explicit Unix listen and proxy paths use the UTF-8 byte limit', () => {
+  const path = '/' + '界'.repeat(40)
+  assert.throws(() => parseListenUrl(`unix://${path}`), /Unix socket path exceeds/)
+  assert.throws(() => parseProxySockArg(['--sock', path]), /Unix socket path exceeds/)
+})
 
 test('parseProxySockArg reads --sock PATH and --sock=PATH', () => {
   assert.equal(parseProxySockArg(['--sock=/a.sock']), '/a.sock')

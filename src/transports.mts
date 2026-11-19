@@ -4,7 +4,7 @@ import net from 'node:net'
 import readline from 'node:readline'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { RpcPeer, WireMessage } from './types.mjs'
-import { defaultSocketPath, ensureParent, newId, sleep } from './util.mjs'
+import { checkedSocketPath, defaultSocketPath, ensureParent, newId, sleep } from './util.mjs'
 import {
   authNotice,
   rejectUpgrade,
@@ -280,7 +280,7 @@ export function parseProxySockArg(args: string[]): string {
     index >= 0 ? args[index + 1] : inline !== undefined ? inline.slice('--sock='.length) : null
   if (value === null) return defaultSocketPath()
   if (!value || value.startsWith('-')) throw new Error('--sock needs a socket path')
-  return value
+  return checkedSocketPath(value)
 }
 
 // Throws `unsupported listen URL` for anything but unix:// and a valid ws://;
@@ -288,10 +288,9 @@ export function parseProxySockArg(args: string[]): string {
 export function parseListenUrl(
   listenUrl: string,
 ): { kind: 'unix'; path: string } | { kind: 'ws'; host: string; port: number } {
-  if (listenUrl === 'unix://') return { kind: 'unix', path: defaultSocketPath() }
   if (listenUrl.startsWith('unix://')) {
     const path = listenUrl.slice('unix://'.length)
-    return { kind: 'unix', path: path.length > 0 ? path : defaultSocketPath() }
+    return { kind: 'unix', path: path ? checkedSocketPath(path) : defaultSocketPath() }
   }
   if (listenUrl.startsWith('ws://')) {
     let url: URL
