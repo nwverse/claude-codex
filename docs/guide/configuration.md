@@ -346,7 +346,7 @@ no counterpart for: a write that sets one of those fails, and the App shows
 | Setting | Written by | For Claude threads |
 | --- | --- | --- |
 | `model`, `model_reasoning_effort` | the App | the model and effort of new threads |
-| `approval_policy`, `sandbox_mode` | Settings > Configuration | kept and read back; the App sends them with each new thread, where they set how Claude asks for permission |
+| `approval_policy`, `sandbox_mode` | Settings > Configuration | kept and read back; the App sends them with each new thread, where they set how Claude asks for permission. A thread started without a policy takes them too (unset: `on-request` with `workspace-write`, never Full access) |
 | `web_search` | Settings > Configuration | `disabled` takes Claude's WebSearch tool away; `cached`, `indexed` and `live` keep it, as Claude has the one kind of search. Unset, it is `disabled` with `CLAUDE_CODEX_WEBSEARCH=0` and `live` otherwise. On the `agent-http` and `agentapi` backends Claude keeps the tool whatever it says (see [Backends](/guide/backends)) |
 | `model_reasoning_summary` | Settings > Configuration | `none` hides Claude's thinking |
 | `sandbox_workspace_write.network_access` | Settings > Configuration | always on: Claude threads have no network sandbox, so turning it off fails. `config/read` still reports `sandbox_workspace_write` unset, as Codex does without the table, so Settings shows network access off: with it on, the App would take the default permissions for Custom (config.toml) instead of its Default permissions preset |

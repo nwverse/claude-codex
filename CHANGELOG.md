@@ -683,6 +683,13 @@ versioning or publishing metadata.
   permissions for its Default permissions preset only while that table is
   unset (or has network access off), and would otherwise preselect Custom
   (config.toml) in new chats.
+- **Behavior change:** a `thread/start` that names no approval policy or
+  sandbox, or only a permissions profile the adapter does not know, gets the
+  defaults `config/read` reports (`on-request` with `workspace-write` unless
+  Settings saved others) and asks before tools run, as a Codex thread does.
+  It used to get `never` with full access, so a client that left the fields
+  out ran every tool without asking. A thread kept without a policy, which
+  asks too, is now reported as `on-request` instead of `never`.
 - `web_search = "disabled"` saved in the App's settings takes WebSearch from
   Claude threads, including the summary `/compact` writes in a session of its
   own; `cached`, `indexed` and `live` keep it.

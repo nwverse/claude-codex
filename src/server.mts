@@ -1487,14 +1487,19 @@ export class CodexClaudeAppServer {
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
+      // A start that names no policy, or only a profile the adapter cannot
+      // resolve, gets what config/read reports, as Codex does: never Full
+      // Access by default.
       approvalPolicy:
         permissionProfile?.approvalPolicy ??
         normalizeApprovalPolicy(params.approvalPolicy) ??
-        'never',
+        normalizeApprovalPolicy(this.configOverrides.approval_policy) ??
+        'on-request',
       sandboxMode:
         permissionProfile?.sandboxMode ??
         normalizeSandboxMode(params.sandbox) ??
-        'danger-full-access',
+        normalizeSandboxMode(this.configOverrides.sandbox_mode) ??
+        'workspace-write',
       permissionProfileId: permissionProfile?.id ?? null,
       // Helper threads never ask the user anything.
       // App rule: auto-review
@@ -1566,9 +1571,9 @@ export class CodexClaudeAppServer {
       cwd: options.cwd,
       model: options.model,
       effort: leader.reasoningEffort,
-      // A leader without a policy asks before tools run. thread/start reads
-      // a missing one as never and full access, so pass the asking pair that
-      // runs the same: a started chat gets no more than its leader.
+      // A leader without a policy asks before tools run. Pass the leader's
+      // own policy, or the asking pair that runs the same, rather than the
+      // configured defaults: a started chat gets no more than its leader.
       approvalPolicy: leader.approvalPolicy ?? 'on-request',
       sandbox: leader.sandboxMode ?? 'workspace-write',
       permissions: leader.permissionProfileId,
@@ -9785,7 +9790,8 @@ export class CodexClaudeAppServer {
       runtimeWorkspaceRoots: [thread.cwd],
       instructionSources:
         thread.runtimeBackend === 'codex' ? [] : projectInstructions(thread.cwd).sources,
-      approvalPolicy: thread.approvalPolicy ?? 'never',
+      // A thread stored without a policy asks before tools run.
+      approvalPolicy: thread.approvalPolicy ?? 'on-request',
       // App rule: auto-review
       approvalsReviewer: thread.approvalsReviewer ?? 'user',
       sandbox: sandboxEnvelope(thread.sandboxMode, thread.cwd),
