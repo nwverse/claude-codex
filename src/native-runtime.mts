@@ -91,6 +91,7 @@ import {
 import { subagentItemsEnabled } from './subagent-items.mjs'
 import { readTaskResult } from './task-output.mjs'
 import { ToolInputPreviews } from './tool-input-preview.mjs'
+import { readsOnly } from './tool-items.mjs'
 import { isCommandPrompt } from './turn-context.mjs'
 import type {
   ClaudeRuntime,
@@ -1127,14 +1128,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (!session || !pending || pending.resolved) {
         // A background task asked between turns. There is no turn to surface
         // an approval in, so only the thread's standing policy can answer.
-        if (
-          session &&
-          !userOnly &&
-          toolName !== 'AskUserQuestion' &&
-          !plans(session.lastContext) &&
-          autoAllowsTools(session.lastContext)
-        ) {
-          return { behavior: 'allow' }
+        if (session && !userOnly && toolName !== 'AskUserQuestion' && !plans(session.lastContext)) {
+          if (autoAllowsTools(session.lastContext)) return { behavior: 'allow' }
+          if (readOnlyUnasked(session.lastContext)) return readOnlyDecision(toolName)
         }
         // Claude learns why, and the user hears of it under the thread's
         // last turn: nothing would show it otherwise.
@@ -1197,6 +1193,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (!userOnly && autoAllow) return { behavior: 'allow' }
       if (!userOnly && readsWithin(toolName, input, context.readableRoots))
         return { behavior: 'allow' }
+      // A read-only sandbox that never asks settles the rest without a card.
+      if (!userOnly && readOnlyUnasked(context)) return readOnlyDecision(toolName)
 
       const requestId = `${context.threadId}:${context.turnId}:${toolName}:${toolUseId}`
       const suggestions = permissionSuggestions(options.suggestions)
@@ -4445,24 +4443,55 @@ function plans(context: RuntimeTurnContext): boolean {
 }
 
 // Codex's approval policy says "never ask" (or the sandbox is wide open) and
-// no explicit permission mode overrides it: tools run without a prompt.
+// no explicit permission mode overrides it: tools run without a prompt. A
+// read-only sandbox that never asks runs only reads (readOnlyUnasked).
 function autoAllowsTools(context: RuntimeTurnContext): boolean {
   const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
   return (
     (configuredPermissionMode() === null &&
-      (context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access')) ||
+      (context.sandboxMode === 'danger-full-access' ||
+        (context.approvalPolicy === 'never' && context.sandboxMode !== 'read-only'))) ||
     mode === 'dontAsk'
   )
+}
+
+// A read-only sandbox in a thread that never asks, with no explicit
+// permission mode overriding it. Nobody approves a call there, and the
+// adapter has no OS sandbox to keep a command or an edit from writing, so
+// only the tools that read run; anything else fails back to Claude without
+// a card, as a sandbox failure does in Codex.
+function readOnlyUnasked(context: RuntimeTurnContext): boolean {
+  return (
+    configuredPermissionMode() === null &&
+    context.approvalPolicy === 'never' &&
+    context.sandboxMode === 'read-only'
+  )
+}
+
+function readOnlyDecision(
+  toolName: string,
+): { behavior: 'allow' } | { behavior: 'deny'; message: string } {
+  if (readsOnly(toolName)) return { behavior: 'allow' }
+  return {
+    behavior: 'deny',
+    message: `${toolName} is not allowed: the thread's sandbox is read-only`,
+  }
 }
 
 // Whether a turn whose thread asks for auto review should switch Claude Code
 // to auto mode. Plan mode, a never-ask policy and an env pin to auto already
 // settle every call without the user, so they skip quietly; a read-only
-// sandbox or an env pin to another mode keeps the user as the reviewer and
-// says why.
+// sandbox that asks or an env pin to another mode keeps the user as the
+// reviewer and says why.
 // App rule: auto-review
 function autoModeFor(context: RuntimeTurnContext): 'enter' | 'skip' | { reason: string } {
-  if (context.autoReview !== true || plans(context) || autoAllowsTools(context)) return 'skip'
+  if (
+    context.autoReview !== true ||
+    plans(context) ||
+    autoAllowsTools(context) ||
+    readOnlyUnasked(context)
+  )
+    return 'skip'
   const pinned = configuredPermissionMode()
   if (pinned === 'auto') return 'skip'
   if (pinned) return { reason: `CLAUDE_CODEX_PERMISSION_MODE pins Claude Code to ${pinned} mode` }

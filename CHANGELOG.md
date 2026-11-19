@@ -132,6 +132,12 @@ versioning or publishing metadata.
   not found, a name, roots or metadata it refuses), whose text the App
   matches; a bad project cursor or an empty `idempotencyKey` is an invalid
   request.
+- `thread/turns/list`, `thread/turns/items/list`, `thread/items/list`,
+  `thread/timeline/list`, `thread/name/set`, `thread/archive`,
+  `thread/goal/get` and `turn/interrupt` refuse an unknown thread with
+  `unknown thread: <id>` (`-32600`) too. They used to answer an empty page,
+  `{goal: null}` or `{}`; a rename or archive still sent its notification,
+  and an interrupt left the caller subscribed to a thread that did not exist.
 - Model process profiles that fail to load fail with one line of at most 300
   characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
   what is wrong. The message used to carry the JSON parser's excerpt of the
@@ -157,9 +163,22 @@ versioning or publishing metadata.
   workflow ran again after a stall ends as failed too, as soon as the next
   attempt starts, saying the workflow ran the agent again, instead of staying
   open. Claude Code's progress report does not keep that attempt's own error.
+- The `codex` shim no longer runs itself in an endless loop when its `PATH`
+  directory is a symlink, when it is on `PATH` twice (also as another version
+  of it), or when `CODEX_REAL` names a shim: it passes over every copy of
+  itself, runs the real Codex CLI later on `PATH`, or exits 127 and says to
+  set `CODEX_REAL`. `claude-codex-mode set` and `model` shell-quote the model
+  and bridge cwd they write to `runtime.env`, so `$`, quotes and backticks in
+  them are read back as written instead of being expanded or run each time
+  the shim sources the file, and a value with a line break is refused.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.
+- `claude-codex-mode` force-kills (SIGKILL) a pooled bridge or an app-server
+  that is still running 3 seconds after SIGTERM. It used to send SIGTERM a
+  second time, then drop the bridge's pidfile anyway, which left a bridge
+  holding its port that `status`, `stop-bridges` and `prune-bridges` could no
+  longer see, and `set` reported the app-server stopped while it still ran.
 - An unexpected error the adapter does not catch now ends it with exit code 1
   and the stack on stderr, logged once in `debug.jsonl`, so whatever started
   it can start it again. The adapter used to log and re-throw the same error
@@ -170,6 +189,12 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- Untracked symlinks show in the turn diff as `new file mode 120000` entries
+  whose content is the link target, as `git diff` shows them. The adapter no
+  longer reads through a link, so a file outside the workspace no longer leaks
+  into the diff and a link to a device such as `/dev/zero` no longer hangs it;
+  a dangling or directory link, an embedded repository or an unreadable file
+  no longer empties the untracked part of the diff.
 - With the `codex` shim on `PATH`, `codex app-server generate-ts` and
   `generate-json-schema` (and so `npm run generate:schema`) go to the real
   Codex CLI (`CODEX_REAL`). They used to start an adapter app-server on stdio
@@ -179,6 +204,12 @@ versioning or publishing metadata.
   `excludedThreadIds`, and the exclusion applies before the page limit. A
   malformed or oversized (more than 100) `excludedThreadIds` returns
   `invalidRequest`, for `thread/search` too.
+- A symlink under `.claude/rules` or `.claude/agents` that points back up the
+  tree (such as `a -> .`) no longer stalls the adapter. Starting, resuming or
+  forking a Claude thread in such a project used to block every other request
+  for seconds and then fail with `Maximum call stack size exceeded`. Each
+  folder is now read once, by its real path, and its rules and agents load as
+  usual.
 - `fs/watch` follows Codex: it keeps the path the client sent instead of its
   realpath, watches a file (such as `.git/HEAD`) through its directory so the
   watch survives git's lock-file rename and reports the file's own path, accepts
@@ -278,6 +309,12 @@ versioning or publishing metadata.
   are read in UTC and the C locale, so two adapters with a different `TZ`
   (an App launch and a shell) no longer drop a live sibling's record or miss
   a killed adapter's Claude CLI.
+- On a busy machine, a `claude-p` turn that times out or is interrupted stops
+  the processes it started in their own process group too. Listing the
+  process tree (`ps`) gave up after 1 s, which a loaded Mac with a thousand
+  or more processes often needs, and the stop then reached only the
+  `claude-p` process; the list now runs without blocking the adapter and
+  gets 10 s.
 - A second adapter started on the same state dir (a startup probe, another
   window) no longer fails the turns a running adapter is still working on.
   Each turn records the process that wrote it, by pid and start time, and
@@ -677,6 +714,17 @@ versioning or publishing metadata.
   the call Claude made hanging. A `turn/interrupt` naming a turn that already
   ended, a background agent's earlier run included, is ignored instead of
   stopping the turn or run that came after it.
+- A thread whose approval policy is `never` keeps a read-only sandbox
+  read-only: Read, Grep, Glob, LS and WebSearch run, and any other call is
+  refused without a card, with Claude told the sandbox is read-only. Before,
+  `never` approved every tool whatever the sandbox, so Bash and file edits ran
+  in a read-only thread. The `claude-p` backend no longer adds
+  `--dangerously-skip-permissions` there, so only the read tools it
+  pre-approves run. The summary `/compact` writes in place of compacting
+  Claude's session (on a Codex model, or when that compaction fails) now
+  declines any tool beyond its reads instead of approving it. `never` with
+  any other sandbox still runs every tool unasked: the adapter has no OS
+  sandbox to confine workspace-write.
 
 ### Trustworthy history and settings
 
@@ -736,6 +784,12 @@ versioning or publishing metadata.
   user, password, path (where a per-user server URL keeps its secret), query
   and fragment are replaced. Other values, such as a server's `command`, are
   still logged.
+- Writing a debug log line no longer creates the log's folder and reads the
+  file's size each time; the adapter logs every streaming notification, so
+  this was a mkdir and two stats on every delta. The folder is made once (and
+  again if it is removed), and the size is re-read at most once a second, so
+  rotation at `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` still notices lines other
+  adapter processes append.
 - Settings a Claude thread cannot honor are refused with `INVALID_REQUEST`
   instead of being saved and ignored, so the App shows "Couldn't update this
   setting": `model_verbosity`, a service tier other than the default, network
@@ -806,6 +860,12 @@ versioning or publishing metadata.
 
 ### Provider and multi-agent boundaries
 
+- Follow-up turns of a Codex (`gpt-*`) chat on the `codex-proxy` route run
+  in the thread's folder with its sandbox mode and extra writable roots
+  (`CLAUDE_CODEX_ADD_DIRS`) again. `codex exec resume` was run without `-C`,
+  `-s` and `--add-dir`, so from the second turn on Codex worked in the
+  adapter's own folder, dropped the extra roots and, in `read-only` and
+  `workspace-write` chats, used the sandbox of the user's Codex config.
 - `/workflows` runs turn workflows on with the CLI's `CLAUDE_CODE_WORKFLOWS`
   switch instead of `--settings`, which pinned launchers reject, and respect a
   user's `enableWorkflows: false`.
@@ -991,6 +1051,12 @@ versioning or publishing metadata.
   parent's turn with "FOREIGN KEY constraint failed" when the agent ends, or
   stops the adapter's shutdown halfway; the agent's end leaves nothing in
   the deleted thread.
+- A client that resumes a thread now follows all of its subagents and their
+  subagents. It used to follow only the first 50 children of each thread,
+  so a workflow with more agents left the rest without live updates there.
+  Finding a thread's subagents and the newest-first thread list use indexes
+  instead of reading every thread: with 20,000 threads a list page takes
+  about 1 ms instead of 25 ms.
 
 ### Rust-first protocol groundwork
 
@@ -1029,9 +1095,11 @@ versioning or publishing metadata.
 
 ### Validation and release gates
 
-- Default CI runs Biome checks, TypeScript typechecking, the Node test suite,
-  Rust workspace tests, and the pinned Rust protocol fixture drift gate.
-- Documentation changes should run `npm run docs:build`.
+- Default CI runs Biome checks, TypeScript typechecking, the VitePress docs
+  build, the Node test suite, Rust workspace tests, and the pinned Rust protocol
+  fixture drift gate.
+- The docs build no longer ignores dead links, so a link to a page that does not
+  exist fails CI.
 - Credentialed smoke and acceptance checks remain opt-in and must use
   credentials already owned by the local user or organization on the host.
 - `npm run check:app-upgrade -- --app <bundle>` checks a new Codex App build
@@ -1041,6 +1109,18 @@ versioning or publishing metadata.
   behaviors the adapter relies on are App rules in `src/app-compat.mts`, tagged
   in the code and kept in sync by `test/app-compat.test.mts`; an App build not
   yet checked gets a config warning. See `docs/reference/app-compat.md`.
+- `npm run doctor` checks the runtime the shim will run: it reads the
+  `runtime.env` that `claude-codex-mode set` writes, accepts `codex-proxy`
+  (and checks for the real `codex` CLI), and reports an unknown runtime type
+  as a failed check instead of crashing. It finds the adapter, shim and
+  `node_modules` from its own checkout whatever the working directory, checks
+  that the built adapter answers a startup probe, and names spawn errors such
+  as `ENOENT` instead of `exited null`. It reads quoted values, trailing
+  comments and a leading `~` in `runtime.env` as the shell does, fails the
+  runtime type check when a line it cannot evaluate sets the runtime, lists
+  the other lines it skipped, and says whether the type came from the file,
+  the environment or the default. It looks for the real `codex` as the shim
+  does for the native route and as the adapter does for `codex-proxy`.
 
 ### Still experimental or not yet included
 

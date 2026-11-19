@@ -129,7 +129,6 @@ import { recordRunEvent } from './run-registry.mjs'
 import { normalizeRuntimeType } from './runtime-config.mjs'
 import {
   acceptsAmendment,
-  addedFileDiff,
   addTokenBreakdowns,
   allSelectableModelOptions,
   approvalSessionKey,
@@ -138,14 +137,12 @@ import {
   autoReviewAction,
   buildSystemPromptAddendum,
   type CodexTurnError,
-  coerceStructuredValue,
   collaborationModeEnvelope,
   collaborationModeFromParams,
   collaborationModeSettings,
   commandArray,
   commandEnv,
   compactSummary,
-  conciseStructuredString,
   configEdits,
   configLayerMetadata,
   defaultSelectableModelId,
@@ -153,10 +150,7 @@ import {
   fallbackStructuredText,
   fileChangeFromTool,
   gitDiff,
-  gitUntrackedDiff,
   hasLegacyPermissionParams,
-  isGitWorkTree,
-  isNotAGitRepo,
   isSubagentToolName,
   listFiles,
   modelFromParams,
@@ -176,13 +170,11 @@ import {
   permissionProfileIdFromParams,
   permissionProfileList,
   permissionProfilePolicy,
-  personalityPromptCue,
   plainTurnError,
   projectMetadata,
   projectName,
   projectRoots,
   REVIEW_FALLBACK,
-  readConfigReasoningEffort,
   reasoningEffortFromParams,
   reasoningSummariesVisible,
   retryTurnError,
@@ -190,7 +182,6 @@ import {
   reviewPrompt,
   sandboxEnvelope,
   sandboxFromTurnParams,
-  simpleDiff,
   stringListFromEnv,
   stringOr,
   subagentEffortFromInput,
@@ -242,6 +233,7 @@ import {
   failedImageRead,
   imageReadPath,
   isExploreTool,
+  readsOnly,
   splitMcpToolName,
 } from './tool-items.mjs'
 import {
@@ -263,7 +255,6 @@ import type {
   DynamicToolCallResponse,
   ElicitationRequest,
   ElicitationResponse,
-  FileUpdateChange,
   GoalToolHandlers,
   ImageInput,
   JsonRpcId,
@@ -2234,7 +2225,7 @@ export class CodexClaudeAppServer {
   // The App pages a long thread from its newest turn, and loads a search
   // match by reading both ways from the match's turn.
   private threadTurnsList(params: Record<string, unknown>): unknown {
-    const threadId = stringOr(params.threadId, '')
+    const threadId = this.knownThreadId(params)
     const itemsView = turnItemsView(params.itemsView)
     const page = pageTurns(this.store.historyTurns(threadId), {
       cursor: params.cursor,
@@ -2245,7 +2236,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadItemsList(params: Record<string, unknown>): unknown {
-    return pageItems(this.store.historyTurns(stringOr(params.threadId, '')), {
+    return pageItems(this.store.historyTurns(this.knownThreadId(params)), {
       turnId: stringOr(params.turnId, '') || null,
       cursor: params.cursor,
       limit: pageLimit(params.limit),
@@ -2254,7 +2245,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadTimelineList(params: Record<string, unknown>): unknown {
-    return pageTimeline(this.store.historyTurns(stringOr(params.threadId, '')), {
+    return pageTimeline(this.store.historyTurns(this.knownThreadId(params)), {
       cursor: params.cursor,
       limit: pageLimit(params.limit),
     })
@@ -2360,6 +2351,7 @@ export class CodexClaudeAppServer {
   private threadTurnItemsList(params: Record<string, unknown>): unknown {
     const turnId = stringOr(params.turnId, '')
     const threadId = stringOr(params.threadId, '')
+    if (threadId && !this.store.getThread(threadId)) throw unknownThread(threadId)
     // A fork's inherited turns keep their ids, so the thread names which copy.
     const turn = threadId ? this.store.historyTurn(threadId, turnId) : this.store.getTurn(turnId)
     return {
@@ -2370,7 +2362,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadNameSet(params: Record<string, unknown>): unknown {
-    const threadId = stringOr(params.threadId, '')
+    const threadId = this.knownThreadId(params)
     const name = params.name == null ? null : String(params.name)
     this.store.updateThreadName(threadId, name)
     this.notifyThread(threadId, {
@@ -2381,7 +2373,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadArchive(params: Record<string, unknown>, archived: boolean): unknown {
-    const threadId = stringOr(params.threadId, '')
+    const threadId = this.knownThreadId(params)
     this.store.setArchived(threadId, archived)
     this.notifyThread(threadId, {
       method: archived ? 'thread/archived' : 'thread/unarchived',
@@ -2516,7 +2508,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadGoalGet(params: Record<string, unknown>): unknown {
-    return { goal: this.store.getGoal(stringOr(params.threadId, '')) }
+    return { goal: this.store.getGoal(this.knownThreadId(params)) }
   }
 
   private threadGoalClear(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -2529,6 +2521,14 @@ export class CodexClaudeAppServer {
     if (cleared)
       this.notifyThread(threadId, { method: 'thread/goal/cleared', params: { threadId } })
     return { cleared }
+  }
+
+  // The request's threadId, refused the way Codex refuses a thread it does
+  // not have, before a handler writes, notifies or answers an empty page.
+  private knownThreadId(params: Record<string, unknown>): string {
+    const threadId = stringOr(params.threadId, '')
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
+    return threadId
   }
 
   private goalThread(threadId: string): ThreadRecord {
@@ -4016,7 +4016,7 @@ export class CodexClaudeAppServer {
         addDirs: [],
         enableFileCheckpointing: false,
         outputFormat: null,
-        approvalPolicy: 'never',
+        approvalPolicy: 'on-request',
         sandboxMode: 'read-only',
         systemPromptAddendum: null,
         planMode: false,
@@ -4039,8 +4039,10 @@ export class CodexClaudeAppServer {
             throw new Error(event.result ?? 'compaction turn failed')
           }
         },
-        // Compaction never asks for approvals — it's read-only summarisation.
-        onPermissionRequest: async () => ({ decision: 'accept' }),
+        // The summary needs no tool beyond the reads allowed up front;
+        // anything else is refused, never approved. A decline, not a cancel,
+        // so Claude goes on writing the summary.
+        onPermissionRequest: async () => ({ decision: 'decline' }),
         // Compaction shouldn't ever invoke AskUserQuestion; if it does, return
         // an empty answer so the model proceeds with its summary.
         onUserInputRequest: async (event) => ({
@@ -5648,7 +5650,7 @@ export class CodexClaudeAppServer {
             // thread/tokenUsage/updated notification on the CHILD thread
             // (App's status bar reads from this) and roll the totals into
             // the parent thread so subagent costs aren't invisible.
-            if (parsed.usage && parsed.usage.totalTokens) {
+            if (parsed.usage?.totalTokens) {
               const breakdown: TokenUsageBreakdown = {
                 totalTokens: parsed.usage.totalTokens,
                 inputTokens: 0,
@@ -7844,6 +7846,10 @@ export class CodexClaudeAppServer {
       thread &&
       (thread.approvalPolicy === 'never' || thread.sandboxMode === 'danger-full-access')
     ) {
+      // A read-only sandbox that never asks runs reads alone and refuses the
+      // rest: nothing would confine another call to reading.
+      if (thread.sandboxMode === 'read-only' && !readsOnly(event.toolName))
+        return { decision: 'decline' }
       return { decision: 'accept' }
     }
     // App rule: mcp-tool-approval
@@ -8204,6 +8210,8 @@ export class CodexClaudeAppServer {
   private async turnInterrupt(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const requestedTurnId = stringOr(params.turnId, '')
+    // Subagent threads are stored too, so this check covers them.
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     this.subscribe(threadId, peer)
     // A background child has no runtime turn of its own; stop its task.
     const background = this.backgroundSubagents.get(threadId)
@@ -9914,7 +9922,7 @@ export class CodexClaudeAppServer {
     while (ancestorId && !seen.has(ancestorId)) {
       seen.add(ancestorId)
       const ancestor = this.store.getThread(ancestorId)
-      if (!ancestor || ancestor.threadSource !== 'subagent') break
+      if (ancestor?.threadSource !== 'subagent') break
       depth += 1
       ancestorId = ancestor.forkedFromId
     }
@@ -10266,7 +10274,7 @@ export class CodexClaudeAppServer {
   private finalizeActiveSubagentsForShutdown(message: string): void {
     for (const [turnId, state] of this.subagentStateByTurn.entries()) {
       const turn = this.store.getTurn(turnId)
-      if (!turn || turn.status !== 'inProgress') {
+      if (turn?.status !== 'inProgress') {
         this.subagentStateByTurn.delete(turnId)
         continue
       }
@@ -10580,22 +10588,7 @@ export class CodexClaudeAppServer {
   }
 
   private bindPeerToDescendants(peer: RpcPeer, rootThreadId: string): void {
-    const queue = [rootThreadId]
-    const seen = new Set<string>()
-    while (queue.length > 0) {
-      const parentId = queue.shift()
-      if (!parentId || seen.has(parentId)) continue
-      seen.add(parentId)
-      for (const child of this.store.listThreads({
-        includeEphemeral: true,
-        parentThreadId: parentId,
-        sortKey: 'created_at',
-        sortDirection: 'asc',
-      })) {
-        this.subscribe(child.id, peer)
-        queue.push(child.id)
-      }
-    }
+    for (const id of this.store.descendantThreadIds(rootThreadId)) this.subscribe(id, peer)
   }
 
   private loadPersistedConfig(): void {
