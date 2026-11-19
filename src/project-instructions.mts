@@ -333,28 +333,51 @@ function importsOf(text: string, base: string): string[] {
   return paths
 }
 
-// A rule's `paths` patterns, from a YAML list or a comma-separated value.
+// A rule can use a YAML sequence or a comma-separated scalar. A quoted
+// pattern may itself contain commas and hashes.
 function ruleGlobs(text: string): string[] {
-  const body = frontmatterBody(text)
-  if (body == null) return []
-  const lines = body.split('\n')
+  const lines = frontmatterBody(text)?.split(/\r?\n/)
+  if (!lines) return []
   const index = lines.findIndex((line) => /^paths\s*:/.test(line))
   if (index < 0) return []
-  const unquote = (value: string) => value.trim().replace(/^["']|["']$/g, '')
   const inline = (lines[index] ?? '').replace(/^paths\s*:/, '').trim()
-  if (inline)
-    return inline
-      .replace(/^\[|\]$/g, '')
-      .split(',')
-      .map(unquote)
-      .filter(Boolean)
+  if (inline && !inline.startsWith('#')) return rulePatternLine(inline, true)
+
   const globs: string[] = []
   for (const line of lines.slice(index + 1)) {
-    const item = /^\s*-\s*(.+)$/.exec(line)
-    if (!item) break
-    globs.push(unquote(item[1] ?? ''))
+    const item = line.trim()
+    if (!item || item.startsWith('#')) continue
+    if (!/^-(?:\s|$)/.test(item)) break
+    globs.push(...rulePatternLine(item.slice(1).trim(), false))
   }
-  return globs.filter(Boolean)
+  return globs
+}
+
+function rulePatternLine(line: string, inline: boolean): string[] {
+  const flow = inline && line.startsWith('[')
+  const values: string[] = []
+  let value = ''
+  let quote = ''
+  for (let i = flow ? 1 : 0; i < line.length; i++) {
+    const ch = line[i] ?? ''
+    if (quote) {
+      if (ch === quote && quote === "'" && line[i + 1] === "'") {
+        value += "'"
+        i++
+      } else if (ch === quote) quote = ''
+      else if (quote === '"' && ch === '\\' && /["\\]/.test(line[i + 1] ?? '')) {
+        value += line[++i]
+      } else value += ch
+    } else if ((ch === '"' || ch === "'") && !value.trim()) quote = ch
+    else if (ch === '#' && (i === 0 || /\s/.test(line[i - 1] ?? ''))) break
+    else if (flow && ch === ']' && /^\s*(?:#.*)?$/.test(line.slice(i + 1))) break
+    else if (inline && ch === ',') {
+      values.push(value.trim())
+      value = ''
+    } else value += ch
+  }
+  values.push(value.trim())
+  return values.filter(Boolean)
 }
 
 function frontmatterFields(text: string): { name?: string; description?: string } {

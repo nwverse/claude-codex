@@ -238,6 +238,57 @@ test('a bridged Claude Code folder brings CLAUDE.md files, rules, imports and sk
   }
 })
 
+test('scoped Claude rules keep their patterns across comments, empty items and CRLF', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'scoped-rules-'))
+  const cwd = join(root, 'workspace')
+  const rules = join(cwd, '.claude', 'rules')
+  const fixtures = [
+    {
+      name: 'block',
+      lines: [
+        'paths: # workspace',
+        '  # first pattern',
+        '  - "src/**" # source',
+        '',
+        '  - # empty',
+        '  - lib/**',
+      ],
+      expected: 'src/**, lib/**',
+    },
+    {
+      name: 'flow',
+      lines: ['paths: ["api/**/*.{ts,tsx}", "docs/section #2/**", assets/#icons/**] # end'],
+      expected: 'api/**/*.{ts,tsx}, docs/section #2/**, assets/#icons/**',
+    },
+  ]
+  try {
+    for (const fixture of fixtures) {
+      await write(
+        join(rules, fixture.name + '.md'),
+        ['---', ...fixture.lines, '---', 'Scoped body.'].join('\r\n'),
+      )
+    }
+    await withEnv(
+      {
+        HOME: join(root, 'user'),
+        CODEX_HOME: join(root, 'codex'),
+        CLAUDE_CODEX_CLAUDE_CONFIG_DIR: join(root, 'claude'),
+      },
+      async () => {
+        const prompt = projectInstructions(cwd).prompt
+        for (const fixture of fixtures) {
+          assert.ok(
+            prompt?.includes(join(rules, fixture.name + '.md') + ' (' + fixture.expected + ')'),
+          )
+        }
+        assert.doesNotMatch(prompt ?? '', /Scoped body\./)
+      },
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('links looping back under .claude/rules and .claude/agents are walked once', async () => {
   const root = await mkdtemp(join(tmpdir(), 'project-instructions-loop-'))
   const claudeHome = join(root, 'claude-home')
