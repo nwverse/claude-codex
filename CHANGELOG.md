@@ -937,6 +937,11 @@ versioning or publishing metadata.
   turn completes as interrupted; stopping a turn no longer wakes the thread to
   acknowledge the background agents Claude Code stopped with it; and
   `/workflows` lists the workflows Claude ran on its own.
+- Archiving a chat stops what still runs in it, as in Codex: its running turn
+  and background agents end as interrupted and its Claude session closes, so
+  an archived chat no longer spends tokens or edits files. The subagent
+  threads it spawned are archived with it and come back when it is
+  unarchived; its forks stay as they are.
 - A turn that ends while its background agents or workflows still run no
   longer marks the chat unread in the Codex App or sends a desktop
   notification; the turn the work reports back in does. Background Bash shells

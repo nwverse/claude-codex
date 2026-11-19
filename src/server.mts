@@ -1045,7 +1045,7 @@ export class CodexClaudeAppServer {
       case 'thread/name/set':
         return this.threadNameSet(asRecord(params))
       case 'thread/archive':
-        return this.threadArchive(asRecord(params), true)
+        return this.threadArchive(peer, asRecord(params))
       case 'thread/unsubscribe':
         return this.threadUnsubscribe(peer, asRecord(params))
       case 'thread/increment_elicitation':
@@ -1111,7 +1111,7 @@ export class CodexClaudeAppServer {
       case 'memory/status':
         return memoryStatus(asRecord(params))
       case 'thread/unarchive':
-        return this.historyForPeer(peer, this.threadArchive(asRecord(params), false))
+        return this.historyForPeer(peer, this.threadUnarchive(asRecord(params)))
       case 'thread/compact/start':
         return this.threadCompactStart(peer, asRecord(params))
       case 'thread/shellCommand':
@@ -2372,20 +2372,32 @@ export class CodexClaudeAppServer {
     return {}
   }
 
-  private threadArchive(params: Record<string, unknown>, archived: boolean): unknown {
+  // Like Codex, archiving a chat ends what still runs in it (its turn and
+  // background agents) and archives the subagent threads it spawned with it.
+  private async threadArchive(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = this.knownThreadId(params)
-    this.store.setArchived(threadId, archived)
-    this.notifyThread(threadId, {
-      method: archived ? 'thread/archived' : 'thread/unarchived',
-      params: { threadId },
-    })
-    if (!archived) {
-      const thread = this.store.getThread(threadId)
-      if (!thread) throw unknownThread(threadId)
-      return { thread: this.toThread(thread, this.store.historyTurns(threadId)) }
+    await this.stopThreadWork(peer, threadId)
+    for (const id of this.store.subagentTreeIds(threadId)) {
+      this.store.setArchived(id, true)
+      // Its Claude session closes, scheduled jobs included; a later turn
+      // resumes it.
+      this.runtime.resetSession?.(id)
+      this.pendingAutonomousTurns.delete(id)
+      this.notifyThread(id, { method: 'thread/archived', params: { threadId: id } })
+      this.clearThreadState(id)
     }
-    this.clearThreadState(threadId)
     return {}
+  }
+
+  private threadUnarchive(params: Record<string, unknown>): unknown {
+    const threadId = this.knownThreadId(params)
+    for (const id of this.store.subagentTreeIds(threadId)) {
+      this.store.setArchived(id, false)
+      this.notifyThread(id, { method: 'thread/unarchived', params: { threadId: id } })
+    }
+    const thread = this.store.getThread(threadId)
+    if (!thread) throw unknownThread(threadId)
+    return { thread: this.toThread(thread, this.store.historyTurns(threadId)) }
   }
 
   // Drops per-thread in-memory state (session-scoped approvals, token
@@ -3322,19 +3334,7 @@ export class CodexClaudeAppServer {
   }
 
   private async removeThread(peer: RpcPeer, threadId: string): Promise<void> {
-    if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
-    // Background agents go with the thread that launched them (or that they
-    // are, or that they hang off): their turns end before their threads do.
-    for (const entry of [...this.backgroundSubagents.values()]) {
-      if (!entry.running) continue
-      if (
-        entry.parentThreadId !== threadId &&
-        entry.context.childThreadId !== threadId &&
-        !this.isSubagentDescendant(entry.context.childThreadId, threadId)
-      )
-        continue
-      await this.stopBackgroundSubagent(entry)
-    }
+    await this.stopThreadWork(peer, threadId)
     for (const id of this.store.deleteThread(threadId)) {
       this.runtime.resetSession?.(id)
       this.clearThreadState(id)
@@ -3349,6 +3349,23 @@ export class CodexClaudeAppServer {
       this.subscribersByThread.delete(id)
       for (const target of targets.values())
         this.sendNotification(target, { method: 'thread/deleted', params: { threadId: id } })
+    }
+  }
+
+  // Ends a thread's running turn and the background agents that go with it
+  // (that it launched, that it is, or that hang off it), before thread/delete
+  // or thread/archive ends their threads.
+  private async stopThreadWork(peer: RpcPeer, threadId: string): Promise<void> {
+    if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
+    for (const entry of [...this.backgroundSubagents.values()]) {
+      if (!entry.running) continue
+      if (
+        entry.parentThreadId !== threadId &&
+        entry.context.childThreadId !== threadId &&
+        !this.isSubagentDescendant(entry.context.childThreadId, threadId)
+      )
+        continue
+      await this.stopBackgroundSubagent(entry)
     }
   }
 
@@ -7624,6 +7641,7 @@ export class CodexClaudeAppServer {
     const thread = this.store.getThread(threadId)
     if (
       !thread ||
+      thread.archived ||
       this.activeTurnByThread.has(threadId) ||
       this.runtime.hasPendingContinuation?.(threadId) !== true
     ) {
