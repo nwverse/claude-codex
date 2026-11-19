@@ -671,6 +671,12 @@ versioning or publishing metadata.
   included, and "Allow for this session" covers only that call.
 - When Claude Code withdraws a pending approval or question mid-turn, its card
   closes, the call is declined, and a late Cancel no longer interrupts the turn.
+- A turn that ends while an approval, question or MCP form waits now takes the
+  card down in every client that shows it (`serverRequest/resolved`), leaves
+  the thread idle instead of reporting it active again, and no longer leaves
+  the call Claude made hanging. A `turn/interrupt` naming a turn that already
+  ended, a background agent's earlier run included, is ignored instead of
+  stopping the turn or run that came after it.
 
 ### Trustworthy history and settings
 
