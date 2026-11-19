@@ -5764,16 +5764,18 @@ export class CodexClaudeAppServer {
             const output = exploreItemIds.has(itemId) ? capOutput(resultText) : resultText
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
+                // A shell exit notification adds a summary to the output already
+                // shown. A regular tool result may replace a partial stream.
+                const shellExitCode = event.commandExitCode
+                let aggregatedOutput = item.aggregatedOutput ?? output
+                if (shellExitCode !== undefined && output)
+                  aggregatedOutput = appendCommandOutput(item.aggregatedOutput, `\n${output}`)
+                else if (commandOutputSeen.has(itemId) && output) aggregatedOutput = output
                 return {
                   ...item,
                   status: event.isError ? 'failed' : 'completed',
-                  // The result has all of the output, where what streamed in
-                  // may have skipped some.
-                  aggregatedOutput:
-                    commandOutputSeen.has(itemId) && output
-                      ? output
-                      : (item.aggregatedOutput ?? output),
-                  exitCode: parsedExitCode,
+                  aggregatedOutput,
+                  exitCode: shellExitCode === undefined ? parsedExitCode : shellExitCode,
                   durationMs,
                 }
               }
