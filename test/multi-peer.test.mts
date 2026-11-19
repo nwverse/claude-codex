@@ -231,6 +231,29 @@ test('an approval left by an interrupted turn is not shown to a later follower',
   })
 })
 
+test('an interrupted turn takes its approval card down on every follower', {
+  timeout: 20_000,
+}, async () => {
+  await withServer(async (connect) => {
+    const a = connect('a')
+    const b = connect('b')
+    const threadId = await startThread(a)
+    await b.request('thread/resume', { threadId })
+    await a.request('turn/start', { threadId, input: textInput('please run approval bash') })
+    const isApproval = (message: any) => message.method === 'item/commandExecution/requestApproval'
+    const request = (await a.until(isApproval)).at(-1)
+    await b.until(isApproval)
+
+    await a.request('turn/interrupt', { threadId })
+    for (const peer of [a, b]) {
+      const resolved = (
+        await peer.until((message) => message.method === 'serverRequest/resolved')
+      ).at(-1)
+      assert.deepEqual(resolved.params, { threadId, requestId: request.id })
+    }
+  })
+})
+
 test('a client that closes a thread and opens it again gets its pending approval again', {
   timeout: 20_000,
 }, async () => {

@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type { PermissionDecision, RuntimeHandlers, UserInputAnswers } from '../src/types.mjs'
+import type {
+  ElicitationResponse,
+  PermissionDecision,
+  RuntimeHandlers,
+  UserInputAnswers,
+} from '../src/types.mjs'
 import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 type CardKind = 'command' | 'question' | 'mcp'
@@ -129,9 +134,10 @@ for (const kind of ['command', 'question', 'mcp'] as const) {
     const continued = new Promise<void>((resolve) => {
       resumeTurn = resolve
     })
+    let outcome: PermissionDecision | UserInputAnswers | undefined
     const runtime = scriptedRuntime(
       async (_context, handlers) => {
-        await askThroughCard(kind, handlers, controller.signal)
+        outcome = await askThroughCard(kind, handlers, controller.signal)
         await continued
         await handlers.onEvent({ type: 'text_delta', delta: 'The turn is still healthy.' })
         await handlers.onEvent({ type: 'completed', success: true })
@@ -149,6 +155,14 @@ for (const kind of ['command', 'question', 'mcp'] as const) {
         )
         await app.request('turn/interrupt', { threadId, turnId })
         assert.equal((await app.turnCompleted(turnId)).status, 'interrupted')
+        // The card comes down with the turn, and Claude's call returns.
+        await app.waitFor(() =>
+          app
+            .notified('serverRequest/resolved')
+            .find((message) => message.requestId === request.id && message.threadId === threadId),
+        )
+        await app.waitFor(() => outcome)
+        assert.deepEqual(outcome, kind === 'question' ? { answers: {} } : { decision: 'cancel' })
         await app.respond(
           request.id,
           kind === 'mcp' ? { action: 'accept', content: {} } : { decision: 'accept' },
@@ -165,3 +179,50 @@ for (const kind of ['command', 'question', 'mcp'] as const) {
     })
   })
 }
+
+test('interrupting a turn with an open MCP form leaves the thread idle', async () => {
+  const controller = new AbortController()
+  let outcome: ElicitationResponse | undefined
+  const runtime = scriptedRuntime(
+    async (_context, handlers) => {
+      assert.ok(handlers.onElicitationRequest)
+      outcome = await handlers.onElicitationRequest(
+        {
+          serverName: 'fixture',
+          message: 'Which branch?',
+          mode: 'form',
+          requestedSchema: { type: 'object', properties: { branch: { type: 'string' } } },
+          url: null,
+          elicitationId: null,
+        },
+        controller.signal,
+      )
+    },
+    // The SDK withdraws the server's elicitation when the query closes.
+    { interrupt: async () => controller.abort() },
+  )
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread({ approvalPolicy: 'untrusted', model: 'sonnet' })
+    const turnId = await app.startTurn(threadId, 'Ask the MCP server for a form')
+    try {
+      const request = await app.waitFor(() =>
+        app.messages.find((message) => message.method === 'mcpServer/elicitation/request'),
+      )
+      await app.request('turn/interrupt', { threadId, turnId })
+      assert.equal((await app.turnCompleted(turnId)).status, 'interrupted')
+      await app.waitFor(() =>
+        app
+          .notified('serverRequest/resolved')
+          .find((message) => message.requestId === request.id && message.threadId === threadId),
+      )
+      assert.deepEqual(await app.waitFor(() => outcome), { action: 'cancel' })
+      await new Promise((resolve) => setImmediate(resolve))
+      const statuses = app
+        .notified('thread/status/changed')
+        .filter((message) => message.threadId === threadId)
+      assert.equal(statuses.at(-1)?.status.type, 'idle')
+    } finally {
+      controller.abort()
+    }
+  })
+})

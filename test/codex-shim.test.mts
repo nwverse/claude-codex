@@ -13,7 +13,7 @@ const shim = resolve('scripts/codex-shim')
 // developer's PATH can stand in for the real one.
 async function minimalPath(dir: string): Promise<string> {
   await mkdir(dir)
-  for (const tool of ['bash', 'awk', 'dirname', 'basename']) {
+  for (const tool of ['bash', 'awk', 'head', 'grep']) {
     const found = spawnSync('sh', ['-c', `command -v ${tool}`], { encoding: 'utf8' })
     assert.equal(found.status, 0, `${tool} not found`)
     await symlink(found.stdout.trim(), join(dir, tool))
