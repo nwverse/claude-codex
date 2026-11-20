@@ -23,7 +23,8 @@ Protocol and server:
 - `thread-history.mts` — paged history views: `thread/turns/list`,
   `thread/items/list`, `thread/timeline/list`, searches and fork turns.
 - `fs-watch.mts` — `fs/watch` the Codex way: non-recursive, debounced
-  `fs/changed` under the requested path, following a file across renames.
+  `fs/changed` under the requested path, following a file across renames and
+  symlinks.
 - `types.mts` — shared protocol/runtime types.
 - `app-compat.mts` — App rules: Codex App behavior the adapter relies on beyond
   the protocol schema. Code that depends on one is tagged `// App rule: <id>`;
