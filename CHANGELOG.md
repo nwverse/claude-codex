@@ -17,6 +17,10 @@ versioning or publishing metadata.
 - A native Codex chat keeps its active sidebar state when another adapter opens
   the same state directory. A later startup clears the activity marker if the
   adapter that ran the native turn has exited.
+- A native `codex app-server` child that exits on its own (a crash) now takes
+  the rest of its process group with it, as a stopped one does, so helpers it
+  started, such as MCP servers that ignore stdin EOF, no longer run on after
+  every crash. (#334)
 
 ### `ws://` listener authentication
 
@@ -262,6 +266,20 @@ versioning or publishing metadata.
   reconnect, holding their handles, and a terminal without a pty even outlived
   the adapter. A stopping adapter now ends the terminals still open, and
   `process/kill` follows up with SIGKILL when a process ignores SIGTERM.
+- A stopping adapter (launchd stop, idle exit, the stdio pipe closing) sends
+  each running `command/exec` and `process/spawn` process group SIGTERM once
+  and SIGKILLs what is left after at most 1 s, before it exits. A command
+  that ignored SIGTERM used to outlive the adapter, and one that handled it
+  got a second SIGTERM as the clients disconnected. (#334)
+- A `process/spawn` without a pty runs in its own process group, as
+  `command/exec` does: `process/kill`, `timeoutMs` (60 s by default for a
+  non-interactive process) and a stopping adapter now end what it started,
+  not only its own process, with SIGKILL for what ignores SIGTERM, so its
+  `process/exited` comes and its handle is free again. A terminal that
+  reaches `timeoutMs` is stopped as `process/kill` stops it, shell session
+  included, instead of losing only its pty bridge. For `command/exec` too,
+  the SIGKILL now comes as soon as the command exits if that is before the
+  1 s grace ends, and never later. (#334)
 - A terminal with a TTY (`process/spawn` with `tty`) reports `process/exited`
   as soon as its command exits, after the rest of its output, with the real
   exit code (128+N for a signal, 127 when the command cannot start). It used

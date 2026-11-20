@@ -126,7 +126,7 @@ import {
   sessionApproval,
   sessionSuggestionsEnabled,
 } from './permission-suggestions.mjs'
-import { signalProcessGroup, stopProcessGroup } from './process-group.mjs'
+import { stopProcessGroup } from './process-group.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -549,22 +549,29 @@ const PTY_BRIDGE_STOP_GRACE_MS = 2_000
 
 // Stops a command/exec or process/spawn process. The pty bridge behind a
 // terminal ends its shell's session itself, told to or once its stdin closes;
-// SIGKILL follows if it has not exited by then.
-function stopClientProcess(child: ChildProcess): void {
+// SIGKILL follows if it has not exited by then. Settles once it has exited or
+// been sent SIGKILL.
+function stopClientProcess(child: ChildProcess): Promise<void> {
   // Exited, though a background child may still hold its pipes open and so
   // its handle: its pid may belong to another process by now.
-  if (child.exitCode !== null || child.signalCode !== null) return
-  if (!(child as any).__isPtyBridge) {
-    stopProcessGroup(child)
-    return
-  }
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+  if (!(child as any).__isPtyBridge) return stopProcessGroup(child)
   if (child.stdin?.writable) {
     // A bridge that has just exited fails the write.
     child.stdin.on('error', () => {})
     child.stdin.end(`${JSON.stringify({ action: 'kill' })}\n`)
   }
-  const kill = setTimeout(() => child.kill('SIGKILL'), PTY_BRIDGE_STOP_GRACE_MS)
-  kill.unref()
+  return new Promise((resolve) => {
+    const kill = setTimeout(() => {
+      child.kill('SIGKILL')
+      resolve()
+    }, PTY_BRIDGE_STOP_GRACE_MS)
+    kill.unref()
+    child.once('exit', () => {
+      clearTimeout(kill)
+      resolve()
+    })
+  })
 }
 
 // Drops a process's own entry only: a client that disconnected freed its id,
@@ -922,7 +929,7 @@ export class CodexClaudeAppServer {
       for (const [id, child] of processes)
         if (this.processOwners.get(child) === peer.id) {
           processes.delete(id)
-          stopClientProcess(child)
+          void stopClientProcess(child)
         }
   }
 
@@ -930,11 +937,10 @@ export class CodexClaudeAppServer {
     if (this.stopped) return
     this.stopped = true
     const nativeStopped = this.codexBridge?.stop()
-    // command/exec runs in its own process group, out of reach of a signal to
-    // the adapter's group (launchd job stop, Ctrl-C), and a terminal has no
-    // timeout: end what is still running.
-    for (const child of this.commandProcesses.values()) signalProcessGroup(child, 'SIGTERM')
-    for (const child of this.processHandles.values()) stopClientProcess(child)
+    // command/exec and process/spawn run in process groups of their own, out
+    // of reach of a signal to the adapter's group (launchd job stop, Ctrl-C),
+    // and a terminal has no timeout: end what is still running.
+    const processesStopped = this.stopClientProcesses()
     this.stopCommandsListener()
     this.sleepMonitor.stop?.()
     this.idleSleep.stop()
@@ -960,12 +966,25 @@ export class CodexClaudeAppServer {
         await this.runtime.stop()
       } finally {
         try {
+          // Both, even when the native children's stop fails; then its error.
+          await Promise.allSettled([nativeStopped, processesStopped])
           await nativeStopped
         } finally {
           this.store.close()
         }
       }
     }
+  }
+
+  // Each command/exec and process/spawn process, stopped once: taken out of
+  // the maps first, so the clients that disconnect as the adapter goes do not
+  // signal them again. Settles when every one has exited or been sent SIGKILL,
+  // which process.exit() would otherwise drop with its timer.
+  private stopClientProcesses(): Promise<unknown> {
+    const children = [...this.commandProcesses.values(), ...this.processHandles.values()]
+    this.commandProcesses.clear()
+    this.processHandles.clear()
+    return Promise.all(children.map(stopClientProcess))
   }
 
   // Background agents keep running (and Claude may still answer them) after
@@ -9403,7 +9422,7 @@ export class CodexClaudeAppServer {
     if (timeoutMs != null && timeoutMs > 0) {
       timeout = setTimeout(() => {
         timedOut = true
-        stopProcessGroup(child)
+        void stopProcessGroup(child)
       }, timeoutMs)
     }
 
@@ -9427,8 +9446,6 @@ export class CodexClaudeAppServer {
       child.once('exit', (code, signal) => {
         if (timeout) clearTimeout(timeout)
         forgetProcess(this.commandProcesses, processId, child)
-        // A child forked as the group was signalled can have missed it.
-        if (timedOut) signalProcessGroup(child, 'SIGKILL')
         const finish = () => {
           clearTimeout(drain)
           if (settled) return
@@ -9472,7 +9489,7 @@ export class CodexClaudeAppServer {
     const processId = stringOr(params.processId, '')
     const child = this.commandProcesses.get(processId)
     if (!child) throw invalidRequest(`unknown command process: ${processId}`)
-    stopProcessGroup(child)
+    void stopProcessGroup(child)
     return {}
   }
 
@@ -9527,6 +9544,9 @@ export class CodexClaudeAppServer {
         cwd,
         env: commandEnv(params.env),
         stdio: 'pipe',
+        // Its own process group, as for command/exec, so a kill, timeout or
+        // stop ends what it started too.
+        detached: process.platform !== 'win32',
       })
     }
     this.processHandles.set(processHandle, child)
@@ -9603,7 +9623,10 @@ export class CodexClaudeAppServer {
     const defaultTimeout = isInteractive ? 0 : 60_000
     const timeoutMs =
       params.timeoutMs == null ? defaultTimeout : numberOr(params.timeoutMs, defaultTimeout)
-    const timeout = timeoutMs > 0 ? setTimeout(() => child.kill('SIGTERM'), timeoutMs) : null
+    // Stopped as process/kill stops it: the group with SIGKILL to follow, or
+    // the pty bridge's own stop of its shell's session.
+    const timeout =
+      timeoutMs > 0 ? setTimeout(() => void stopClientProcess(child), timeoutMs) : null
 
     child.once('error', (error) => {
       debugLog('process.spawn.error', {
@@ -9690,7 +9713,7 @@ export class CodexClaudeAppServer {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
     if (!child) throw invalidRequest(`unknown process handle: ${processHandle}`)
-    stopClientProcess(child)
+    void stopClientProcess(child)
     return {}
   }
 
