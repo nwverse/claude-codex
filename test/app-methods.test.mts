@@ -393,6 +393,69 @@ test('a new thread reads the permission defaults another adapter just tightened'
   })
 })
 
+test('a custom permissions profile stores the explicit policy fields that come with it', async () => {
+  const seen: unknown[] = []
+  const runtime = scriptedRuntime(async (context, handlers) => {
+    const { decision } = await handlers.onPermissionRequest(
+      {
+        type: 'permission_request',
+        requestId: `ask-${seen.length}`,
+        toolUseId: `tool-${seen.length}`,
+        toolName: 'Bash',
+        input: { command: 'rm -rf build' },
+      },
+      new AbortController().signal,
+    )
+    seen.push([context.approvalPolicy, context.sandboxMode, decision])
+    await handlers.onEvent({ type: 'completed', success: true })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const fullAccess = { approvalPolicy: 'never', sandbox: 'danger-full-access', model: 'sonnet' }
+    const custom = { permissions: 'locked-down', approvalPolicy: 'on-request' }
+    const stored = (threadId: string) => {
+      const thread = app.store.getThread(threadId)
+      return [thread?.approvalPolicy, thread?.sandboxMode, thread?.permissionProfileId]
+    }
+    const threadId = await app.startThread(fullAccess)
+    // The turn that moves a Full Access thread to the profile asks, and so
+    // does the next turn, which names no policy.
+    const turns = [{ ...custom, sandboxPolicy: { type: 'readOnly' } }, {}]
+    for (const [index, extra] of turns.entries()) {
+      const turnId = await app.startTurn(threadId, 'clean the build', extra)
+      const card = await app.waitFor(
+        () =>
+          app.messages.filter(
+            (message) => message.method === 'item/commandExecution/requestApproval',
+          )[index],
+      )
+      await app.respond(card.id, { decision: 'decline' })
+      await app.turnCompleted(turnId)
+    }
+    const asked = ['on-request', 'read-only', 'decline']
+    assert.deepEqual(seen, [asked, asked])
+    assert.deepEqual(stored(threadId), ['on-request', 'read-only', 'locked-down'])
+
+    // Thread settings and a resume store them the same way.
+    const updated = await app.startThread(fullAccess)
+    await app.request('thread/settings/update', {
+      threadId: updated,
+      ...custom,
+      sandboxPolicy: { type: 'readOnly' },
+    })
+    assert.deepEqual(stored(updated), ['on-request', 'read-only', 'locked-down'])
+    // A policy the adapter cannot read leaves the stored one as it was.
+    await app.request('thread/settings/update', {
+      threadId: updated,
+      permissions: 'locked-down',
+      approvalPolicy: 'granular',
+    })
+    assert.deepEqual(stored(updated), ['on-request', 'read-only', 'locked-down'])
+    const resumed = await app.startThread(fullAccess)
+    await app.request('thread/resume', { threadId: resumed, ...custom, sandbox: 'read-only' })
+    assert.deepEqual(stored(resumed), ['on-request', 'read-only', 'locked-down'])
+  })
+})
+
 test('a new thread waits for a malformed settings file to be repaired', async () => {
   await withServer(async (server) => {
     await server.request('config/batchWrite', {

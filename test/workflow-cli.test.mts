@@ -301,6 +301,48 @@ test('workflow CLI shows help before validating subcommand options', async () =>
   assert.match(io.stdoutText(), /workflow ingest-github --github-json PATH/)
 })
 
+test('workflow CLI refuses an option value that starts with -- unless it is written --name=value', async () => {
+  const statePath = await tempStatePath()
+  const run = async (...args: string[]) => {
+    const io = captureIo()
+    assert.equal(await runWorkflowCli([...args, '--state', statePath], io), 0)
+    return io.stdoutText()
+  }
+  const refused = (args: string[], message: string) =>
+    assert.rejects(() => runWorkflowCli(args, captureIo()), {
+      name: 'WorkflowCliInputError',
+      message,
+    })
+  const prompt = '--dry-run first, then migrate'
+  await refused(
+    ['enqueue', '--state', statePath, '--id', 't1', '--prompt', prompt],
+    '--prompt needs a value; to pass one that starts with "--", write --prompt=VALUE',
+  )
+  // Bare at the end, or empty, used to be saved as the prompt "true".
+  await refused(['enqueue', '--state', statePath, '--prompt'], '--prompt needs a value')
+  await refused(['enqueue', '--state', statePath, '--prompt', ''], 'missing required --prompt')
+  await assert.rejects(readFile(statePath), { code: 'ENOENT' })
+  // --help still wins over an option missing its value.
+  const help = captureIo()
+  assert.equal(await runWorkflowCli(['enqueue', '--prompt', '--help'], help), 0)
+  assert.match(help.stdoutText(), /Usage:/)
+
+  assert.equal(
+    jsonOf<EnqueueOutput>(await run('enqueue', '--id', 't1', `--prompt=${prompt}`)).task.prompt,
+    prompt,
+  )
+  await run('schedule', '--worker', 'w1')
+  const error = '--- a/x +++ b/x hunk failed'
+  await refused(
+    ['fail', '--state', statePath, '--task', 't1', '--error', error],
+    '--error needs a value; to pass one that starts with "--", write --error=VALUE',
+  )
+  await run('fail', '--task', 't1', `--error=${error}`)
+  const task = jsonOf<StatusOutput>(await run('status')).state.tasks[0]
+  assert.equal(task?.prompt, prompt)
+  assert.equal(task?.lastError, error)
+})
+
 test('workflow CLI health reports stale leases and run registry lag', async () => {
   const statePath = await tempStatePath()
   const runLogPath = join(await mkdtemp(join(tmpdir(), 'claude-codex-workflow-log-')), 'runs.jsonl')
