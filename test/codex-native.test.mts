@@ -858,7 +858,7 @@ test('a native claim for a turn Codex never announced ends when the idle child s
   }
 })
 
-test('a turn Codex announces late leaves another adapter’s claim alone', async () => {
+test('a turn Codex announces late is stopped and leaves another adapter’s claim alone', async () => {
   const first = startAdapter({
     env: { CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '500', FAKE_LATE_TURN: '1' },
   })
@@ -875,12 +875,17 @@ test('a turn Codex announces late leaves another adapter’s claim alone', async
     })
     assert.equal(started.error, undefined, JSON.stringify(started.error))
     await second.reader.until((message) => message.method?.endsWith('requestApproval'))
-    // The first child now announces, and ends, the compaction's turn.
+    // The first child now announces the compaction's turn; the first adapter
+    // stops it.
     assert.equal((await first.request('thread/goal/get', { threadId })).error, undefined)
+    const ended = await first.reader.until(
+      (message) => message.method === 'turn/completed' && message.params.turn.id === 'turn-late',
+    )
+    assert.equal(ended.params.turn.status, 'interrupted')
     assert.ok(
-      first.reader.received.some(
-        (message) => message.method === 'turn/started' && message.params.turn.id === 'turn-late',
-      ),
+      first
+        .childLog()
+        .some((entry) => entry.method === 'turn/interrupt' && entry.params.turnId === 'turn-late'),
     )
     assert.equal(nativeOwner(first.home, threadId), second.proc.pid)
     const listed = await second.request('thread/list', {})

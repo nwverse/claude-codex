@@ -653,7 +653,21 @@ export class CodexNativeBridge {
   private recordActiveTurn(threadId: string, turnId: string, provider: string): void {
     if (this.activeTurns.get(threadId)?.turnId === turnId) return
     this.activeTurns.set(threadId, { turnId, provider })
-    this.host.store.startNativeTurnActivity(threadId)
+    if (this.host.store.startNativeTurnActivity(threadId)) return
+    // Codex announced it after the claim lapsed, and another adapter's turn
+    // runs on the rollout now. It is stopped; it stays tracked until Codex
+    // reports it ended.
+    const childId = this.host.store.getThread(threadId)?.codexSessionId
+    const child = this.children.get(provider)
+    debugLog('codexBridge.lateTurnInterrupted', { threadId, turnId })
+    if (!child || !childId) return
+    child.request('turn/interrupt', { threadId: childId, turnId }).catch((error: unknown) => {
+      debugLog('codexBridge.lateTurnInterruptFailed', {
+        threadId,
+        turnId,
+        message: error instanceof Error ? error.message : String(error),
+      })
+    })
   }
 
   // The sidebar record follows the conversation.

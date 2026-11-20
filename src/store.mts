@@ -1443,10 +1443,11 @@ export class SessionStore {
     return { pid: Number(row.pid), started: row.started }
   }
 
-  startNativeTurnActivity(threadId: string): void {
-    // A turn Codex announces late can find another adapter's turn running on
-    // the claim it took meanwhile; that one keeps the claim and the status.
-    if (!this.claimNativeTurn(threadId)) return
+  // Whether this adapter holds the claim for the turn. A turn Codex announces
+  // late can find another adapter's turn running on the claim it took
+  // meanwhile; that one keeps the claim and the status.
+  startNativeTurnActivity(threadId: string): boolean {
+    if (!this.claimNativeTurn(threadId)) return false
     // An earlier status event may already carry waitingOnApproval or other flags.
     this.db
       .prepare(`
@@ -1454,6 +1455,7 @@ export class SessionStore {
                            THEN status_json ELSE ? END, updated_at = ?
       WHERE id = ?`)
       .run(JSON.stringify({ type: 'active', activeFlags: [] }), nowSeconds(), threadId)
+    return true
   }
 
   // A status other than active ends this adapter's claim, unless it still
