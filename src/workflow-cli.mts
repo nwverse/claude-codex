@@ -31,6 +31,7 @@ export async function runWorkflowCli(
     writeHelp(io.stdout)
     return 0
   }
+  if (parsed.error) throw new WorkflowCliInputError(parsed.error)
   const store = new WorkflowStateStore(statePath(parsed))
   const clock = () => new Date(stringOption(parsed, 'now') ?? Date.now())
   const updateTask = (edit: (state: WorkflowState, now: Date) => WorkflowState) =>
@@ -187,10 +188,33 @@ function upsertTask(state: WorkflowState, task: WorkflowTask): WorkflowState {
 
 interface ParsedArgs {
   readonly values: ReadonlyMap<string, string>
+  // Why the first value option given without a value is refused; thrown only
+  // after --help is handled.
+  readonly error: string | null
 }
+
+// Options that always take a value. A value that starts with `--` is refused
+// rather than read as the next option or saved as `true`; `--name=value`
+// passes one (a prompt such as `--dry-run first`, an error that is a diff).
+const VALUE_OPTIONS = new Set([
+  'state',
+  'now',
+  'id',
+  'prompt',
+  'priority',
+  'max-attempts',
+  'worker',
+  'ttl-ms',
+  'task',
+  'error',
+  'reason',
+  'run-log',
+  'github-json',
+])
 
 function parseArgs(args: readonly string[]): ParsedArgs {
   const values = new Map<string, string>()
+  let error: string | null = null
   for (let index = 0; index < args.length; index += 1) {
     const raw = args[index] ?? ''
     if (!raw.startsWith('--')) continue
@@ -199,15 +223,21 @@ function parseArgs(args: readonly string[]): ParsedArgs {
       values.set(raw.slice(2, inline), raw.slice(inline + 1))
       continue
     }
+    const name = raw.slice(2)
     const next = args[index + 1]
-    if (next && !next.startsWith('--')) {
-      values.set(raw.slice(2), next)
+    if (next !== undefined && !next.startsWith('--')) {
+      values.set(name, next)
       index += 1
+    } else if (VALUE_OPTIONS.has(name)) {
+      error ??=
+        next === undefined
+          ? `--${name} needs a value`
+          : `--${name} needs a value; to pass one that starts with "--", write --${name}=VALUE`
     } else {
-      values.set(raw.slice(2), 'true')
+      values.set(name, 'true')
     }
   }
-  return { values }
+  return { values, error }
 }
 
 function statePath(args: ParsedArgs): string {
@@ -252,6 +282,8 @@ function writeHelp(output: Pick<NodeJS.WriteStream, 'write'>): void {
   workflow complete --task ID [--state PATH]
   workflow fail --task ID --error TEXT [--state PATH]
   workflow block --task ID --reason TEXT [--state PATH]
+
+A value that starts with "--" needs the --name=VALUE form.
 `)
 }
 

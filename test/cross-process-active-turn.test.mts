@@ -198,6 +198,53 @@ test('a concurrent session update survives a turn claim and its rejected turn is
   })
 })
 
+test('input to the thread of a running background agent is not blamed on another process', async () => {
+  const runtime = scriptedRuntime(async (context, handlers) => {
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'agent-bg',
+      toolName: 'Agent',
+      input: { description: 'Background', prompt: 'survey', run_in_background: true },
+    })
+    await runtime.listener?.onTaskEvent(context.threadId, {
+      type: 'task_started',
+      taskId: 'bg-task',
+      toolUseId: 'agent-bg',
+      taskType: 'local_agent',
+      description: 'Background',
+      subagentType: null,
+      prompt: 'survey',
+      backgrounded: true,
+    })
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-bg',
+      content: 'Async agent launched successfully.\nagentId: bg-task',
+      structured: { isAsync: true, status: 'async_launched', agentId: 'bg-task', prompt: 'survey' },
+    })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'launched' })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const parent = await app.startThread({ cwd: app.home })
+    await app.turnCompleted(await app.startTurn(parent, 'launch an agent'))
+    const child = app
+      .notified('thread/started')
+      .map((params) => params.thread.id)
+      .find((id) => id !== parent)
+    assert.ok(child)
+    // The agent's own turn on its thread is this process's, though no turn
+    // of the server runs there.
+    for (const [method, params] of [
+      ['turn/start', { input: textInput('how is it going?') }],
+      ['thread/shellCommand', { command: 'true' }],
+      ['review/start', { target: { type: 'uncommittedChanges' } }],
+    ] as const) {
+      const reply = await app.call(method, { threadId: child, ...params })
+      assert.match(reply.error?.message ?? '', /this agent is still working/, method)
+    }
+  })
+})
+
 test('a second adapter cannot replace, rewind, interrupt, or archive an active turn', {
   timeout: 20_000,
 }, async () => {

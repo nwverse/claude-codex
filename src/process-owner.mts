@@ -36,6 +36,17 @@ export function otherProcessRunning(owner: ProcessOwner): boolean {
   return started === undefined ? signalable(owner.pid) : started === owner.started
 }
 
+// When the process with this pid started, in ms since the epoch to the whole
+// second ps prints, or null when ps cannot tell: the process is gone, or ps
+// is missing, has no lstart (BusyBox), timed out or printed a date that does
+// not parse.
+export function processStartTime(pid: number): number | null {
+  const started = startTimes([pid])?.get(pid)
+  // In the C locale and UTC, lstart reads "Mon Oct 12 02:52:58 2026".
+  const time = started === undefined ? Number.NaN : Date.parse(`${started} UTC`)
+  return Number.isFinite(time) ? time : null
+}
+
 function signalable(pid: number): boolean {
   try {
     process.kill(pid, 0)

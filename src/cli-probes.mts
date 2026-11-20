@@ -98,17 +98,27 @@ export async function daemonProbe(args: readonly string[]): Promise<ProbeResult 
 
 // Whether a server accepts connections on the unix socket. The connection
 // closes before it sends anything, so the server sees no client.
-export function listening(socketPath: string): Promise<boolean> {
+export async function listening(socketPath: string): Promise<boolean> {
+  return (await socketAccepts(socketPath)) === true
+}
+
+// Like listening, but null when the answer is unsure: no connection within
+// a second (a busy server, or this process stalled) or an unexpected error.
+// Only false means nothing listens: the connection was refused, or no socket
+// is there.
+export function socketAccepts(socketPath: string): Promise<boolean | null> {
   return new Promise((resolve) => {
     const socket = connect(socketPath)
-    const done = (result: boolean) => {
+    const done = (result: boolean | null) => {
       clearTimeout(timer)
       socket.destroy()
       resolve(result)
     }
-    const timer = setTimeout(() => done(false), 1000)
+    const timer = setTimeout(() => done(null), 1000)
     socket.once('connect', () => done(true))
-    socket.once('error', () => done(false))
+    socket.once('error', (error: NodeJS.ErrnoException) =>
+      done(error.code === 'ECONNREFUSED' || error.code === 'ENOENT' ? false : null),
+    )
   })
 }
 

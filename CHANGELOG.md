@@ -281,6 +281,16 @@ versioning or publishing metadata.
   `isFile`, `isDirectory` and the times still describe its target, and a
   dangling link returns the link's own metadata instead of failing with
   `ENOENT`; a missing path or a symlink loop still fails. (#271)
+- `fs/watch` on a symlinked file reports changes to the file it points to
+  again, under the link's path, and follows the link when it is re-pointed.
+  Since #267 it only noticed the link itself being replaced.
+  A file whose directory does not exist yet (`.git/HEAD` before `git init`)
+  is watched from the nearest existing folder, as Codex does, instead of
+  failing with `ENOENT`. (#333)
+- `fs/readDirectory` lists a symlink as the file or folder it points to, as
+  `fs/getMetadata` and Codex do, and leaves out a dangling link. Linked files
+  such as `CLAUDE.md -> AGENTS.md` and linked package folders used to show as
+  neither. (#333)
 - `fs/copy` keeps symlink targets as written, so a relative link in a
   recursive copy stays relative instead of pointing back into the source
   tree, and writing through the copy no longer changes the source. (#270)
@@ -288,6 +298,14 @@ versioning or publishing metadata.
   (`-32600`) while a turn runs or is still starting on the thread. They used
   to start a second Claude run that took over the thread, and the running
   turn's remaining output was lost. (#240, #241)
+- Deleting or archiving a chat interrupts a turn the user runs directly on
+  one of its subagent threads, as it does the chat's own turn. A deleted
+  thread's turn used to keep the adapter busy for good: the daemon never
+  idle-exited and the keep-awake guard stayed on. A review, compaction or
+  Claude follow-up no longer starts on a chat that `thread/delete` is
+  removing (nor a review or compaction on an archived chat), and the App
+  hears nothing more of a deleted thread, such as a `turn/completed` still
+  marked `inProgress`. (#328)
 - Startup recovery streams the completed history and rechecks a turn before
   repairing its activity markers. A report another adapter finished while
   recovery was scanning stays in the conversation.
@@ -295,6 +313,10 @@ versioning or publishing metadata.
   A window attached to another adapter can read the chat while a turn runs and
   retry a message after it completes. A surviving adapter can start the next
   turn after the previous owner exits. (#283)
+- A message, shell command or review sent to the thread of a subagent that is
+  still working is refused with "this agent is still working; message it from
+  its parent chat or wait for it to report", instead of naming an active turn
+  in another adapter process that does not exist. (#335)
 - A `turn/start` sent while another is still starting on the same thread, or
   a goal continuation that waited on it, joins that turn instead of opening a
   second run whose answer was dropped, and a late cleanup from an older turn
@@ -398,6 +420,14 @@ versioning or publishing metadata.
   with continuation turns, token and time budgets and goal tools for Claude;
   steer errors in Codex's wording; `thread/queue/*`; and a `turn/start` that
   races a running turn joins it instead of orphaning it.
+- A queued message that starts after the App disconnected is no longer killed
+  by the unix daemon's idle exit 15 s into its turn, with the message already
+  gone from the queue; nor is any other turn that starts while the daemon
+  counts down, such as Claude answering a background agent's report. The
+  daemon exits once nothing runs. (#335)
+- After an interrupt, the queue stays held until `thread/queue/start` or the
+  user's next message. A `!` shell command, review or compaction in between
+  used to send the next queued message on its own. (#335)
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.
@@ -463,6 +493,18 @@ versioning or publishing metadata.
   stack trace after it, or a silent `stdio://`. The unix daemon no longer
   refuses to start over a pid file that is empty, holds `0`, or names a
   process that is not listening on the socket.
+- A unix daemon that takes more than 10 seconds to start no longer gets a
+  second daemon beside it. A second `--listen unix://` used to take it for
+  stale after 10 seconds and start too; one of the two then removed the
+  other's socket, and the daemon left without one kept the state database and
+  its Claude runtime open and never exited. The process the pid file names now
+  gets up to 60 seconds from the file's date to start listening, unless it
+  started after the file was written (a reused pid); when `ps` cannot report
+  its start time, the 10 seconds still apply. Meanwhile a second daemon says
+  `app-server already starting` (or `already running`) and exits 0. A daemon
+  removes a socket at its path only when the socket refuses a connection, so
+  of two daemons that do start, the one that binds second leaves the socket
+  to the first and exits. (#329)
 - With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
   Code processes one at a time: a new session waits until the previous
   launch has sent its first SDK message, has ended, or has held the slot for
@@ -1268,6 +1310,10 @@ versioning or publishing metadata.
   entries the same task id and priority as REST exports. A pull request
   queued before gets a new `github-pull-request-N-*` id on its next ingest.
   (#272)
+- An option value that starts with `--`, such as `--prompt "--dry-run
+  first"` or an `--error` holding a diff, is refused with a hint to write
+  `--name=value`, which keeps it as given. It used to be saved as `true`, as
+  was a value option given last without a value. (#333)
 
 ### Rust-first protocol groundwork
 
