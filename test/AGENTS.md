@@ -19,8 +19,16 @@ Tests run with the built-in `node:test` runner against compiled output. See the
 ```bash
 npm test            # builds, then runs node --test dist/test/*.mjs, 2 min per test
 npm run build       # if you want to compile without running
-node --test dist/test/adapter-daemon.test.mjs   # a single suite, after a build
+# a single suite, after a build
+node --test --import ./dist/test/support/hermetic-env.mjs dist/test/adapter-daemon.test.mjs
 ```
+
+`npm test` preloads `support/hermetic-env.mts` into every suite. It drops the
+`ANTHROPIC_*`, `CLAUDE*` and `CODEX_*` variables of the calling shell, so a
+shell or Claude Code chat that exports `CLAUDE_CODEX_HOME`, `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR` cannot have the suites write into a live adapter home or
+read that shell's Claude config. Pass the same `--import` when you run
+`node --test` yourself.
 
 ## Conventions
 

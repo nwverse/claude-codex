@@ -70,11 +70,14 @@ test('isPathInside accepts strict descendants only', () => {
 test('defaultSocketPath takes CLAUDE_CODEX_SOCKET_PATH over CODEX_HOME', () => {
   const keys = ['CODEX_HOME', 'CLAUDE_CODEX_SOCKET_PATH'] as const
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+  const cwd = process.cwd()
   process.env.CODEX_HOME = '/tmp/codex-home'
   try {
     process.env.CLAUDE_CODEX_SOCKET_PATH = '/run/claude-codex/app-server.sock'
     assert.equal(defaultSocketPath(), '/run/claude-codex/app-server.sock')
-    // A relative path resolves against the working directory.
+    // A relative path resolves against the working directory. Use a short
+    // one: a deep checkout's is too long for a socket path under it.
+    process.chdir(process.platform === 'darwin' ? '/tmp' : tmpdir())
     process.env.CLAUDE_CODEX_SOCKET_PATH = ' run/app-server.sock '
     assert.equal(defaultSocketPath(), resolve('run/app-server.sock'))
     // Blank means unset.
@@ -84,6 +87,7 @@ test('defaultSocketPath takes CLAUDE_CODEX_SOCKET_PATH over CODEX_HOME', () => {
       join('/tmp/codex-home', 'app-server-control', 'app-server-control.sock'),
     )
   } finally {
+    process.chdir(cwd)
     for (const key of keys) {
       const value = previous[key]
       if (value == null) delete process.env[key]

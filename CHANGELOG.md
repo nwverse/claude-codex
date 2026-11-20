@@ -1314,6 +1314,17 @@ versioning or publishing metadata.
   a busy machine, `npm run build` clears `dist/test` so a deleted suite stops
   running, and a hung test fails after 2 minutes instead of holding
   `npm test` (CI jobs stop after 20).
+- `npm test` preloads `test/support/hermetic-env.mts` into every suite, not
+  only the `adapter-*` ones, so no suite and no adapter it starts gets the
+  shell's `ANTHROPIC_*`, `CLAUDE*` or `CODEX_*` variables. Run from a shell or
+  chat that exports `CLAUDE_CODEX_HOME` (as `claude-codex-isolated` does), the
+  suites wrote dozens of mock threads, debug and run logs, and an
+  `approval_policy = never`, `danger-full-access` default into that live
+  adapter home. An MCP test no longer reads `~/.codex/config.toml` or writes
+  to the debug log in `~/.codex/claude-codex-adapter` (#330).
+- The relative `CLAUDE_CODEX_SOCKET_PATH` test passes in a checkout deeper
+  than about 84 bytes, and the `app-server daemon version` test runs on macOS
+  instead of skipping under its long temp folder (#330).
 - The mock adapter suites, once one `adapter.test.mts`, run as parallel
   `adapter-*` suites, and tests that failed on a busy machine or with the
   long macOS temp folder pass there (#130, #193, #213, #214). Biome is 2.6,
