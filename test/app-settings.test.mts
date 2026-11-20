@@ -8,6 +8,7 @@ import { INVALID_REQUEST } from '../src/host-methods.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
 import { summarizeRpcParams } from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
+import { dottedKeyParts } from '../src/toml.mjs'
 import type { ClaudeRuntime, RpcPeer, RuntimeTurnContext } from '../src/types.mjs'
 
 // What the Codex App's settings write with config/value/write and
@@ -451,6 +452,103 @@ test('a write the App MCP settings cannot hold fails and changes nothing', async
   }
 })
 
+// The write App 26.1111 sends to save a changed server: one edit per changed
+// field, and per changed entry of its env or headers, with quoted keys.
+function saveFields(name: string, fields: Array<[string[], unknown]>): Record<string, unknown> {
+  const quote = (key: string) => `"${key.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
+  return {
+    edits: fields.map(([path, value]) => ({
+      keyPath: ['mcp_servers', ...[name, ...path].map(quote)].join('.'),
+      value,
+      mergeStrategy: 'replace',
+    })),
+    filePath: null,
+    expectedVersion: null,
+  }
+}
+
+test('a server the App MCP settings save field by field, with quoted keys, is edited', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'app-mcp-fields-'))
+  try {
+    await withServer(root, appServersOn, async ({ request, send }) => {
+      await request(
+        'config/batchWrite',
+        saveServer(root, 'edited', {
+          command: '/bin/old',
+          args: ['--a'],
+          env: { KEEP: '1', DROP: '2' },
+        }),
+      )
+      await request(
+        'config/batchWrite',
+        saveFields('edited', [
+          [['args'], ['--b']],
+          [['env', 'DROP'], null],
+          [['env', 'ADD'], '3'],
+          [['env', 'DOTTED.NAME'], '4'],
+        ]),
+      )
+      assert.deepEqual((await request('config/read', {})).config.mcp_servers.edited, {
+        command: '/bin/old',
+        args: ['--b'],
+        env: { KEEP: '1', ADD: '3', 'DOTTED.NAME': '4' },
+      })
+      // Moved from a command to a URL: the entry has neither between the
+      // first two edits, and is checked once all of them are made.
+      await request(
+        'config/batchWrite',
+        saveFields('edited', [
+          [['command'], null],
+          [['url'], 'https://example.com/mcp'],
+          [['args'], null],
+          [['env'], null],
+        ]),
+      )
+      assert.deepEqual((await request('config/read', {})).config.mcp_servers.edited, {
+        url: 'https://example.com/mcp',
+      })
+      // A field edit that leaves the entry unusable, or a key that does not
+      // parse, still fails and changes nothing.
+      for (const [params, message] of [
+        [saveFields('edited', [[['url'], null]]), /needs either a command or a url/],
+        [saveFields('missing', [[['url'], 'https://example.com/mcp']]), /no MCP server named/],
+        [
+          {
+            edits: [{ keyPath: 'mcp_servers."edited', value: 1, mergeStrategy: 'replace' }],
+            filePath: null,
+          },
+          /invalid config key/,
+        ],
+      ] as const) {
+        const response = await send('config/batchWrite', params)
+        assert.equal(response.error?.code, INVALID_REQUEST, JSON.stringify(params))
+        assert.match(response.error?.message ?? '', message)
+      }
+      assert.deepEqual((await request('config/read', {})).config.mcp_servers.edited, {
+        url: 'https://example.com/mcp',
+      })
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('dottedKeyParts reads plain and TOML-quoted keys', () => {
+  assert.deepEqual(dottedKeyParts('mcp_servers.local.env.THIRD'), [
+    'mcp_servers',
+    'local',
+    'env',
+    'THIRD',
+  ])
+  assert.deepEqual(dottedKeyParts('mcp_servers."a.b"."say \\"hi\\" \\\\"'), [
+    'mcp_servers',
+    'a.b',
+    'say "hi" \\',
+  ])
+  for (const bad of ['', 'a.', '.a', 'a..b', '"a', '"a"b', 'a"b', '"\\n"'])
+    assert.equal(dottedKeyParts(bad), null, bad)
+})
+
 test('an MCP server or field named __proto__ is refused instead of dropped unseen', async () => {
   const root = await mkdtemp(join(tmpdir(), 'app-mcp-proto-'))
   // Built as params arrive over the wire: JSON.parse makes __proto__ an own
@@ -601,6 +699,28 @@ test('config writes keep credentials out of the debug log', async () => {
         mergeStrategy: 'replace',
         filePath: null,
       })
+      // The keys App 26.1111 quotes when it saves a server field by field.
+      await app.send('config/batchWrite', {
+        edits: [
+          {
+            keyPath: 'mcp_servers."local"."env"."FIFTH"',
+            value: 'env-value-20',
+            mergeStrategy: 'replace',
+          },
+          // A quoted path that does not parse is redacted whole.
+          {
+            keyPath: 'mcp_servers."local"."env"."BROKEN',
+            value: 'env-value-22',
+            mergeStrategy: 'replace',
+          },
+          {
+            keyPath: 'mcp_servers."remote"."url"',
+            value: 'https://example.com/u/url-path-21',
+            mergeStrategy: 'replace',
+          },
+        ],
+        filePath: null,
+      })
       // A credential-named key anywhere in a config value.
       await app.request('config/batchWrite', {
         edits: [
@@ -677,6 +797,9 @@ test('config writes keep credentials out of the debug log', async () => {
       'arg-value-16',
       'query-value-18',
       'url-path-19',
+      'env-value-20',
+      'url-path-21',
+      'env-value-22',
     ]
     assert.deepEqual(
       secrets.filter((secret) => log.includes(secret)),

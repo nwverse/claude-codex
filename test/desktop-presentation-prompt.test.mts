@@ -373,6 +373,13 @@ test('desktop prompt names the App tools its instructions mention and Claude lac
     }),
     "# Tool availability\nThis thread does not have the Codex App tools the instructions above mention: `list_threads`. Don't search for them or say you used them, and don't write the directives that report their results, such as `::created-thread`. When a request needs one, do what you can with your own tools and ask the user to do the rest in the Codex App.",
   )
+  // App 26.1111 names delete_thread among its thread tools.
+  assert.match(
+    appToolAvailabilityNote('Use `delete_thread` only when the user asks to delete a thread.', {
+      available: new Set(['create_thread', 'automation_update', 'create_worktree']),
+    }) ?? '',
+    /mention: `delete_thread`\./,
+  )
   assert.equal(appToolAvailabilityNote(null), null)
 })
 

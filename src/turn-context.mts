@@ -247,6 +247,8 @@ const APP_TOOLS = [
   'set_thread_title',
   'set_thread_pinned',
   'set_thread_archived',
+  // From App 26.1111.
+  'delete_thread',
   'list_archived_threads',
   'list_projects',
   'list_artifacts',
