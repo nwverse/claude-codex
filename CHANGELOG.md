@@ -118,11 +118,6 @@ versioning or publishing metadata.
   error code and details are unchanged, and refusals such as usage limits, an
   overloaded API or a Claude Code start that a retry cannot fix are left
   alone.
-- The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`) no longer fails a
-  turn over quiet that is not a stall. The wait is paused while the turn waits
-  on the user (an approval, a question, an MCP elicitation or a client dynamic
-  tool call), and time the computer spent asleep does not count; after either,
-  the wait starts over.
 - Opt-in `CLAUDE_CODEX_PREVENT_IDLE_SLEEP=1` keeps a Mac from idle-sleeping
   while Claude works: the adapter holds `caffeinate -i -w <adapter pid>` while
   any turn, background agent or other background work runs, and stops it once
@@ -318,9 +313,11 @@ versioning or publishing metadata.
   `watchId already exists: <id>`. Watch ids are per connection, and a closed
   connection's watches are dropped.
 - A `command/exec` that hits `timeoutMs` now stops its whole process group
-  (SIGTERM, then SIGKILL after 1 s) and reports `exitCode` 124. The reply comes
+  and reports `exitCode` 124: SIGTERM, then SIGKILL for what is left as soon
+  as the command exits or after 1 s, whichever comes first. The reply comes
   when the command exits plus at most a 2 s output drain, so a backgrounded
   child no longer holds it. `command/exec/terminate` stops the group too.
+  (#268, #334)
 - Streamed `command/exec` output (`streamStdoutStderr` or `tty`) now honors
   `outputBytesCap`, including its 1,000,000-byte default, as Codex does: each
   stream is cut at the cap, the delta that reaches it carries `capReached:
@@ -330,23 +327,21 @@ versioning or publishing metadata.
   terminals (`process/spawn`) and `command/exec` processes it started are
   stopped, as `codex app-server` does, and their handles are free again at
   once; other clients keep theirs. They used to run on after every App
-  reconnect, holding their handles, and a terminal without a pty even outlived
-  the adapter. A stopping adapter now ends the terminals still open, and
-  `process/kill` follows up with SIGKILL when a process ignores SIGTERM.
-- A stopping adapter (launchd stop, idle exit, the stdio pipe closing) sends
-  each running `command/exec` and `process/spawn` process group SIGTERM once
-  and SIGKILLs what is left after at most 1 s, before it exits. A command
-  that ignored SIGTERM used to outlive the adapter, and one that handled it
-  got a second SIGTERM as the clients disconnected. (#334)
+  reconnect, holding their handles. `process/kill` follows up with SIGKILL
+  when a process ignores SIGTERM. (#300)
+- A stopping adapter (launchd stop, idle exit, the stdio pipe closing) ends
+  the terminals and commands still running, before it exits: it sends each
+  `command/exec` and `process/spawn` process group SIGTERM once and SIGKILLs
+  what is left after at most 1 s. A terminal without a pty used to outlive
+  the adapter, as did a command that ignored SIGTERM, and one that handled
+  it got a second SIGTERM as the clients disconnected. (#300, #334)
 - A `process/spawn` without a pty runs in its own process group, as
-  `command/exec` does: `process/kill`, `timeoutMs` (60 s by default for a
-  non-interactive process) and a stopping adapter now end what it started,
-  not only its own process, with SIGKILL for what ignores SIGTERM, so its
-  `process/exited` comes and its handle is free again. A terminal that
-  reaches `timeoutMs` is stopped as `process/kill` stops it, shell session
-  included, instead of losing only its pty bridge. For `command/exec` too,
-  the SIGKILL now comes as soon as the command exits if that is before the
-  1 s grace ends, and never later. (#334)
+  `command/exec` does: `process/kill` and `timeoutMs` (60 s by default for a
+  non-interactive process) now end what it started, not only its own
+  process, with SIGKILL for what ignores SIGTERM, so its `process/exited`
+  comes and its handle is free again. A terminal that reaches `timeoutMs` is
+  stopped as `process/kill` stops it, shell session included, instead of
+  losing only its pty bridge. (#334)
 - A stopping adapter refuses `command/exec`, `process/spawn`, `turn/start`,
   `review/start` and `thread/compact/start` with "server stopped". A `unix://`
   or `ws://` client still connected while it waited for process groups could
@@ -623,9 +618,6 @@ versioning or publishing metadata.
   `~/.claude.json` at once, which can corrupt it
   (anthropics/claude-code#28847). A `SessionStart` hook does not hold the
   gate. Without the switch nothing changes.
-- The App's "/" popup offers Claude Code's built-in skills (`/simplify`,
-  `/code-review`, …) from the list the CLI reports, and a picked one runs as
-  the CLI's slash command.
 - Every client request the Codex App can send now has a handler. New real
   ones: `project/*`, `thread/delete` (with its subagents), `thread/rollback`
   and `thread/revert` that also rewind Claude's session, `thread/search` and
@@ -1192,10 +1184,11 @@ versioning or publishing metadata.
 - A `config/batchWrite` is all or nothing: one refused edit leaves the
   settings as they were. Keys earlier versions saved but never honored are
   dropped from the adapter's settings when it starts.
-- The App's `/` popup lists every command Claude Code reports for a folder,
-  not only its built-in skills: the user's and the project's
-  `.claude/commands`, plugin commands and skills (`plugin:name`) and MCP
-  prompts. Picking one runs it as `/name args`. The list is kept per folder
+- The App's `/` popup lists every command Claude Code reports for a folder:
+  its built-in skills (`/simplify`, `/code-review`, …), the user's and the
+  project's `.claude/commands`, plugin commands and skills (`plugin:name`)
+  and MCP prompts. Picking one runs it as the CLI's slash command,
+  `/name args`. The list is kept per folder
   from the last chat session there (`supportedCommands()` when a turn starts,
   then each `commands_changed`), so a folder shows them after its first
   Claude turn; `skills/changed` makes the App refetch it. Names the App uses
@@ -1206,7 +1199,7 @@ versioning or publishing metadata.
   from `.claude/skills` keeps its own entry. Each folder gets its own
   `SKILL.md` per command, so a `/deploy` in two projects no longer shows the
   description of whichever reported last; the files of commands a folder no
-  longer reports, and of folders no longer kept, are removed.
+  longer reports, and of folders no longer kept, are removed. (#86, #106)
 - A message that runs a Claude Code command (`/name args`, typed or picked)
   runs it also when the App sends context with it. Claude Code runs a
   command only from the last text block of a message, so that block is now
@@ -1339,13 +1332,16 @@ versioning or publishing metadata.
 - The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`, default 30
   minutes, now documented) waits for inactivity instead of a fixed deadline:
   a subagent's output and tool heartbeats, task progress and workflow agents
-  starting or finishing all start it over. It used to fail every workflow
-  that ran past 30 minutes, however busy, and interrupt the whole Claude
-  session, which ended every workflow agent and unrelated background agent
-  with it. When it does give up, the turn is stopped as an interrupt would
-  stop it, which keeps background work earlier turns left running; while
-  background agents the turn itself handed off still run, only its own stuck
-  agents and workflows stop and those agents keep going.
+  starting or finishing all start it over. The wait is paused while the turn
+  waits on the user (an approval, a question, an MCP elicitation or a client
+  dynamic tool call), and time the computer spent asleep does not count;
+  after either, the wait starts over. It used to fail every workflow that
+  ran past 30 minutes, however busy, and interrupt the whole Claude session,
+  which ended every workflow agent and unrelated background agent with it.
+  When it does give up, the turn is stopped as an interrupt would stop it,
+  which keeps background work earlier turns left running; while background
+  agents the turn itself handed off still run, only its own stuck agents and
+  workflows stop and those agents keep going. (#102, #105)
 - An interrupt while a session idles no longer leaves its earlier idle timer
   running, which could close the session (and its background agents) on the
   old deadline although they kept reporting progress.
@@ -1550,6 +1546,16 @@ versioning or publishing metadata.
   `body-parser`, `qs` and `proxy-addr`, `hono`, `@hono/node-server`,
   `ip-address`, `fast-uri`), which the adapter does not load. The Claude Agent
   SDK stays at 0.3.322. (#340)
+- SECURITY.md asks for security problems as regular GitHub issues that
+  describe the problem and its impact without secrets or a ready-to-run
+  exploit; it no longer points to a private reporting channel the project
+  does not offer. The configuration guide says to keep
+  `CLAUDE_CODEX_DEBUG_LOG` in a folder only you can write to, not `/tmp`,
+  as the log is appended through a symbolic link at its path. The
+  `CLAUDE_CODEX_ALLOWED_TOOLS` docs say that a thread switched to read-only
+  or plan mode keeps its previous list while background work keeps its
+  Claude Code process running, and that Claude Code runs Agent (Task) calls
+  in plan mode without asking. (#352)
 
 ### Validation and release gates
 
