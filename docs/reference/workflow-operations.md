@@ -63,6 +63,10 @@ npm run workflow -- fail --task task-id --error "Verification failed"
 npm run workflow -- block --task task-id --reason "Needs a missing credential"
 ```
 
+A value that starts with `--`, such as a diff or a CLI error line, needs the
+`--name=value` form (`--error="--- a/x ..."`); given as a separate argument it
+is refused, so it is never read as another option.
+
 ## Health signals
 
 `npm run workflow -- health` reports:
