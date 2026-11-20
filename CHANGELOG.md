@@ -258,6 +258,14 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- Codex App 26.1111 is a verified build, checked against the App rules from
+  its bundle (`docs/reference/app-compat.md` notes what changed). The adapter
+  still reports app-server `0.163.0-alpha.10.2`, which turns on five of
+  26.1111's new gates, all served, and keeps off those whose features Claude
+  threads cannot serve, such as saving diagnostics through `feedback/save`.
+  The 0.169 protocol's `account/securitySetup/read`, `thread/guardianReview`
+  and `thread/prepareApprovedPlan`, which the App never sends, answer method
+  not found. (#347)
 - Codex App 26.1111 names itself `Codex Desktop` in `initialize` instead of
   `codex_desktop`. The adapter takes either name for the desktop App, so it
   reports an App build missing from the verified list again (a

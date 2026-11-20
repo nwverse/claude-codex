@@ -137,9 +137,39 @@ test('the codex shim reports the same compat version as the adapter', () => {
   }
 })
 
-test('the adapter reports the Codex version of the baseline App', () => {
-  // So every gate the baseline App knows is on; check:app-upgrade checks
-  // what each one needs.
+// Semver precedence of two versions such as 0.163.0-alpha.10.2: negative
+// when a comes first.
+function compareVersions(a: string, b: string): number {
+  const parse = (version: string) => {
+    const [core = '', pre] = version.split(/-(.*)/s)
+    const parts = (text: string) =>
+      text.split('.').map((part) => (/^\d+$/.test(part) ? Number(part) : part))
+    return { core: parts(core) as number[], pre: pre ? parts(pre) : [] }
+  }
+  const left = parse(a)
+  const right = parse(b)
+  for (let i = 0; i < 3; i += 1)
+    if (left.core[i] !== right.core[i]) return (left.core[i] ?? 0) - (right.core[i] ?? 0)
+  if (left.pre.length === 0 || right.pre.length === 0) return right.pre.length - left.pre.length
+  for (let i = 0; i < Math.max(left.pre.length, right.pre.length); i += 1) {
+    const x = left.pre[i]
+    const y = right.pre[i]
+    if (x === y) continue
+    if (x === undefined) return -1
+    if (y === undefined) return 1
+    if (typeof x === 'number' && typeof y === 'number') return x - y
+    if (typeof x === 'number') return -1
+    if (typeof y === 'number') return 1
+    return x < y ? -1 : 1
+  }
+  return 0
+}
+
+test('the adapter reports no newer a Codex version than the baseline App has', () => {
+  // A newer one would turn on gates no verified App build was checked with.
+  // It may be older: 26.1111 ships Codex 0.169.0-alpha.11.1, and the
+  // default stays at 26.1013's, whose gates the adapter serves
+  // (docs/reference/app-compat.md says which 26.1111 gates that keeps off).
   const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
   const saved = {
     CLAUDE_CODEX_COMPAT_VERSION: process.env.CLAUDE_CODEX_COMPAT_VERSION,
@@ -148,11 +178,19 @@ test('the adapter reports the Codex version of the baseline App', () => {
   delete process.env.CLAUDE_CODEX_COMPAT_VERSION
   delete process.env.CODEX_SHIM_COMPAT_VERSION
   try {
-    assert.equal(`codex-cli ${codexCompatVersion()}`, baseline.codexVersion)
+    const shipped = (baseline.codexVersion as string).replace(/^codex-cli /, '')
+    assert.ok(
+      compareVersions(codexCompatVersion(), shipped) <= 0,
+      `${codexCompatVersion()} is newer than ${shipped}`,
+    )
   } finally {
     for (const [name, value] of Object.entries(saved))
       if (value !== undefined) process.env[name] = value
   }
+  assert.ok(compareVersions('0.163.0-alpha.10.2', '0.169.0-alpha.11.1') < 0)
+  assert.ok(compareVersions('0.163.0-alpha.10.2', '0.163.0-alpha.11') < 0)
+  assert.ok(compareVersions('0.163.0', '0.163.0-alpha.11') > 0)
+  assert.equal(compareVersions('0.163.0-alpha.10.2', '0.163.0-alpha.10.2'), 0)
 })
 
 test('unverifiedAppWarning only speaks up for an unlisted desktop build', () => {

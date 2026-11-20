@@ -17,7 +17,11 @@ export interface AppRule {
 }
 
 // App builds every rule below was checked against.
-export const VERIFIED_APP_VERSIONS: readonly string[] = ['26.930.21537', '26.1013.40934']
+export const VERIFIED_APP_VERSIONS: readonly string[] = [
+  '26.930.21537',
+  '26.1013.40934',
+  '26.1111.21308',
+]
 
 // initialize.clientInfo.name of the desktop App: "Codex Desktop" from 26.1111,
 // "codex_desktop" before. Its other app-server clients (the LaTeX preview,
@@ -43,7 +47,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'prediction-provider',
-    app: 'Predicts the next composer message only for a thread whose modelProvider is openai: 26.1013 in a thread/fork with experimentalPredictionMode (experimentalPredictionForkMode gate), 26.1111 after a thread/resume with thread/sample (threadSample gate) and a ChatGPT sign-in. 26.1111 uses experimentalPredictionForkMode for an adaptive title refresh instead, which checks no provider: behind a Statsig experiment, every 5th completed turn of a chat whose title it generated, it forks the chat ephemeral, with experimentalPredictionMode, excludeTurns and no model, and asks the fork for a new title in a turn without an outputSchema.',
+    app: 'Predicts the next composer message only for a thread whose modelProvider is openai: 26.1013 in a thread/fork with experimentalPredictionMode (experimentalPredictionForkMode gate); 26.1111 only with thread/sample after a thread/resume and with a ChatGPT sign-in (threadSample gate; below it, it predicts nothing and forks nothing). 26.1111 uses experimentalPredictionForkMode for an adaptive title refresh instead, which checks no provider: behind a Statsig experiment, every 5th completed turn of a chat whose title it generated, it forks the chat ephemeral, with experimentalPredictionMode, excludeTurns and no model, and asks the fork for a new title in a turn without an outputSchema.',
     adapter:
       "Reports modelProvider claude-code for every thread, so the App never predicts the next message of a Claude thread. A title-refresh fork of a Claude chat is an ephemeral fork on the chat's model (see helper-thread-model).",
     verify:
@@ -558,19 +562,35 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   // An access-key option in the Bedrock sign-in form, which signs in with
   // account/login/start; account/read already reports a Bedrock account.
   bedrockAccessKeysLogin: ['account/login/start'],
+  // 26.1111: the App no longer retries a turn that failed with
+  // serverOverloaded on a timer of its own, leaving retries to the server;
+  // the Claude CLI retries an overloaded API before a turn fails.
+  capacityErrorRetries: [],
+  // 26.1111: with the App's computer-use audio on, its main process pages
+  // model/list for models that take audio input, which no Claude model does.
+  computerAudio: ['model/list'],
   diagnostics: ['server/diagnostics'],
   // 26.1013 forks only a thread whose modelProvider is openai for composer
   // predictions, and every thread here reports claude-code. 26.1111 forks any
   // chat for its adaptive title refresh (rule prediction-provider), an
   // ephemeral fork the adapter keeps on the chat's model.
   experimentalPredictionForkMode: ['thread/fork'],
+  // 26.1111: saving diagnostics on a local connection goes through
+  // feedback/save, which the adapter refuses as it has no feedback bundle;
+  // the default version keeps this gate off (see app-compat.md).
+  feedbackSave: ['feedback/save'],
   gatewayOAuth: [
     'account/gatewayOAuth/read',
     'account/gatewayOAuth/login',
     'account/gatewayOAuth/cancel',
   ],
+  // 26.1111: a Google Cloud sign-in in onboarding (off at the default).
+  gcpSetup: ['account/gcp/setup'],
   guardianV2DecisionsComparison: [],
   incrementalTools: [],
+  // 26.1111: daybreakEnabled on thread/start, only for a config whose
+  // model_provider is openai; the adapter's is claude-code.
+  initialDaybreakEnabled: ['thread/start'],
   instantInterrupt: [],
   // Whether a configured application requirement still lets the App set up
   // its search MCP (see searchMcpClient).
@@ -581,6 +601,8 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   // Reviews a turn that failed with codexErrorInfo
   // misalignmentPolicyViolation, which no turn here reports.
   misalignmentReviewTarget: [],
+  // 26.1111: a model provider sign-in in onboarding (off at the default).
+  modelProviderSetup: ['modelProvider/list', 'modelProvider/config/write'],
   multiAgentWaitToolConfig: [],
   outputTokenReplay: [],
   preserveForkPrefix: [],
@@ -618,7 +640,13 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   // thread/fork with beforeTurnId.
   threadForkBeforeTurn: ['thread/fork'],
   // thread/items/list with an { itemId } cursor.
+  // 26.1111: origin (user or automatic) on goal changes, which the adapter
+  // ignores.
+  threadGoalProvenance: ['thread/goal/set', 'thread/goal/clear'],
   threadItemAnchors: ['thread/items/list'],
+  // 26.1111: the memory summary of a thread, else read from
+  // <CODEX_HOME>/memories (off at the default).
+  threadMemorySummary: ['thread/memory/read'],
   threadQueue: [
     'thread/queue/add',
     'thread/queue/list',
@@ -627,7 +655,15 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
     'thread/queue/reorder',
     'thread/queue/start',
   ],
+  // 26.1111: the App writes a thread's read state with
+  // thread/readState/update only after thread/read returned a readState,
+  // which a Claude thread never does; the update answers -32601 by design
+  // (rule thread-read-state).
+  threadReadState: [],
   threadRevert: ['thread/revert'],
+  // 26.1111: composer predictions with thread/sample, only for a thread
+  // whose modelProvider is openai (off at the default).
+  threadSample: ['thread/sample', 'thread/sample/cancel'],
   threadTimeline: ['thread/timeline/list'],
   turnApprovalsReviewer: ['turn/settings/update'],
   // parentTurnId and rootTurnId on turn/start; the turn reports its

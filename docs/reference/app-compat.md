@@ -239,9 +239,9 @@ On macOS the App's LaTeX preview, a separate app-server client, needs
 or `/var/tmp`; below that it says LaTeX previews need a newer Codex. The
 default meets both. Raising the default for a newer App changes
 `DEFAULT_CODEX_COMPAT_VERSION` in `src/util.mts` and the matching default in
-`scripts/codex-shim`; tests keep the two equal and the default at the
-baseline's `codexVersion`, and check:app-upgrade lists what each gate it
-turns on needs.
+`scripts/codex-shim`; tests keep the two equal and the default no newer
+than the baseline's `codexVersion`, and check:app-upgrade lists what each
+gate it turns on needs.
 
 `GATED_METHODS` in `src/app-compat.mts` maps each gate to the requests it adds
 or changes, and `test/app-compat.test.mts` checks that the adapter answers
@@ -274,7 +274,9 @@ A Claude chat has no read state: its `thread/read` carries no `readState`,
 and `thread/readState/update` gets `-32601`, as from a Codex without its state
 database (rule `thread-read-state`); a native Codex chat's read state is its
 Codex child's, which answers both. `thread/prediction/request` gets `-32601`
-too, since Codex does not implement it either.
+too, since Codex does not implement it either, and so do three requests of
+the 0.169 protocol that App 26.1111 never sends: `account/securitySetup/read`,
+`thread/guardianReview` and `thread/prepareApprovedPlan`.
 
 ### What the gates change
 

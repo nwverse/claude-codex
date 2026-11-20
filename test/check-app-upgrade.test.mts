@@ -130,3 +130,27 @@ test('check:app-upgrade reports a bundle without the desktop client name', () =>
     rmSync(app, { recursive: true, force: true })
   }
 })
+
+test('check:app-upgrade lists a request the adapter answers -32601 by design apart', () => {
+  // thread/readState/update answers "method not found" as a Codex without its
+  // state database does, under App rule thread-read-state.
+  const app = bundle('26.1199.2', {
+    '.vite/build/main.js': [
+      `o=${gateTable('"')};`,
+      'let ef="0.141.0",eg="codex-app-server-version-unsupported:";',
+      'x({minRequiredVersion:ef});send({clientInfo:{name:"Codex Desktop",version:c}});',
+      'r.sendRequest("thread/readState/update",{threadId:e});',
+    ].join(''),
+  })
+  try {
+    const { status, out } = check(app)
+    assert.equal(status, 0, out)
+    assert.match(
+      out,
+      /-32601 by design:\n {4}thread\/readState\/update \(by design, rule thread-read-state\)/,
+    )
+    assert.doesNotMatch(out, /problem:/)
+  } finally {
+    rmSync(app, { recursive: true, force: true })
+  }
+})

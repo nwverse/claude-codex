@@ -1558,6 +1558,13 @@ export class CodexClaudeAppServer {
         throw new RpcError('durable thread read state unavailable', undefined, METHOD_NOT_FOUND)
       // Codex itself answers this with method not found; no App build sends it.
       case 'thread/prediction/request':
+      // Requests of the 0.169 protocol that App 26.1111 never sends, for
+      // features Claude threads do not have (a ChatGPT account's security
+      // setup, guardian reviews on demand, an approved plan carried into a
+      // new thread): answered as by a Codex without them.
+      case 'account/securitySetup/read':
+      case 'thread/guardianReview':
+      case 'thread/prepareApprovedPlan':
         throw methodNotFound(method)
       default: {
         const result = hostMethod(method, asRecord(params))
