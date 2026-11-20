@@ -9221,16 +9221,26 @@ export class CodexClaudeAppServer {
   }
 
   private async fsReadDirectory(params: Record<string, unknown>): Promise<unknown> {
-    const { readdir } = await import('node:fs/promises')
+    const { readdir, stat } = await import('node:fs/promises')
     const path = stringOr(params.path, process.cwd())
     const entries = await readdir(path, { withFileTypes: true })
-    return {
-      entries: entries.map((entry) => ({
-        fileName: entry.name,
-        isDirectory: entry.isDirectory(),
-        isFile: entry.isFile(),
-      })),
-    }
+    // Like Codex, a symlink is listed as what it resolves to, as in
+    // fs/getMetadata, and one that resolves to nothing (dangling, a loop) is
+    // left out.
+    const listed = await Promise.all(
+      entries.map(async (entry) => {
+        let type: { isDirectory(): boolean; isFile(): boolean } = entry
+        if (entry.isSymbolicLink()) {
+          try {
+            type = await stat(join(path, entry.name))
+          } catch {
+            return []
+          }
+        }
+        return [{ fileName: entry.name, isDirectory: type.isDirectory(), isFile: type.isFile() }]
+      }),
+    )
+    return { entries: listed.flat() }
   }
 
   private async fsGetMetadata(params: Record<string, unknown>): Promise<unknown> {
