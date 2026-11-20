@@ -4018,7 +4018,10 @@ function derivePermissionMode(
   if (envOverride) return envOverride
   if (planMode) return 'plan'
   if (sandboxMode === 'danger-full-access' || approvalPolicy === 'never') return 'default'
-  if (approvalPolicy === 'on-failure') return 'acceptEdits'
+  // acceptEdits runs edits in the workspace without canUseTool, so only a
+  // sandbox that lets the workspace be written takes it; anywhere else an
+  // edit asks.
+  if (approvalPolicy === 'on-failure' && sandboxMode === 'workspace-write') return 'acceptEdits'
   return 'default'
 }
 

@@ -180,6 +180,55 @@ for (const kind of ['command', 'question', 'mcp'] as const) {
   })
 }
 
+for (const kind of ['command', 'mcp'] as const) {
+  test(`a turn that ends on its own declines a background agent's open ${kind} card without stopping it`, async () => {
+    let finishMainLoop: () => void = () => {}
+    const mainLoop = new Promise<void>((resolve) => {
+      finishMainLoop = resolve
+    })
+    let outcome: PermissionDecision | UserInputAnswers | undefined
+    let interrupts = 0
+    const runtime = scriptedRuntime(
+      async (_context, handlers) => {
+        // A background agent asks; the main loop does not wait on its card.
+        void askThroughCard(kind, handlers, new AbortController().signal).then((decision) => {
+          outcome = decision
+        })
+        await mainLoop
+        await handlers.onEvent({ type: 'text_delta', delta: 'Started a background agent.' })
+        await handlers.onEvent({ type: 'completed', success: true })
+      },
+      {
+        interrupt: async () => {
+          interrupts++
+        },
+      },
+    )
+    await withInProcessApp(runtime, async (app) => {
+      const threadId = await app.startThread({ approvalPolicy: 'untrusted', model: 'sonnet' })
+      const turnId = await app.startTurn(threadId, 'Launch a background agent')
+      try {
+        const request = await app.waitFor(() =>
+          app.messages.find((message) => message.method === cardMethod(kind)),
+        )
+        finishMainLoop()
+        assert.equal((await app.turnCompleted(turnId)).status, 'completed')
+        await app.waitFor(() =>
+          app
+            .notified('serverRequest/resolved')
+            .find((message) => message.requestId === request.id && message.threadId === threadId),
+        )
+        // Declined, not cancelled: Claude Code takes a cancel for the user's
+        // and stops the agent, though nobody stopped anything.
+        assert.deepEqual(await app.waitFor(() => outcome), { decision: 'decline' })
+        assert.equal(interrupts, 0)
+      } finally {
+        finishMainLoop()
+      }
+    })
+  })
+}
+
 test('interrupting a turn with an open MCP form leaves the thread idle', async () => {
   const controller = new AbortController()
   let outcome: ElicitationResponse | undefined

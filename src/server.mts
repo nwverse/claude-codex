@@ -1764,9 +1764,13 @@ export class CodexClaudeAppServer {
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
     if (permissionProfileId) {
       thread.permissionProfileId = permissionProfileId
-      if (permissionProfile?.approvalPolicy)
-        thread.approvalPolicy = permissionProfile.approvalPolicy
-      if (permissionProfile?.sandboxMode) thread.sandboxMode = permissionProfile.sandboxMode
+      // A custom profile has no policy the adapter knows: the explicit fields
+      // set it, as on thread/start.
+      const approvalPolicy =
+        permissionProfile?.approvalPolicy ?? normalizeApprovalPolicy(params.approvalPolicy)
+      if (approvalPolicy) thread.approvalPolicy = approvalPolicy
+      const sandboxMode = permissionProfile?.sandboxMode ?? normalizeSandboxMode(params.sandbox)
+      if (sandboxMode) thread.sandboxMode = sandboxMode
     } else {
       if (hasLegacyPermissionParams(params)) thread.permissionProfileId = null
       if (typeof params.approvalPolicy === 'string')
@@ -3213,10 +3217,12 @@ export class CodexClaudeAppServer {
     else if (hasLegacyPermissionParams(params)) thread.permissionProfileId = null
     if (permissionProfile?.approvalPolicy) thread.approvalPolicy = permissionProfile.approvalPolicy
     if (permissionProfile?.sandboxMode) thread.sandboxMode = permissionProfile.sandboxMode
-    if (typeof params.approvalPolicy === 'string' && !permissionProfile)
+    // A custom profile has no policy the adapter knows: the explicit fields
+    // set it.
+    if (typeof params.approvalPolicy === 'string' && !permissionProfile?.approvalPolicy)
       thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
     const sandboxMode = sandboxFromTurnParams(params)
-    if (sandboxMode && !permissionProfile) thread.sandboxMode = sandboxMode
+    if (sandboxMode && !permissionProfile?.sandboxMode) thread.sandboxMode = sandboxMode
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     // App rule: auto-review
     thread.approvalsReviewer =
@@ -4399,9 +4405,14 @@ export class CodexClaudeAppServer {
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
     if (permissionProfileId) {
       thread.permissionProfileId = permissionProfileId
-      if (permissionProfile?.approvalPolicy)
-        thread.approvalPolicy = permissionProfile.approvalPolicy
-      if (permissionProfile?.sandboxMode) thread.sandboxMode = permissionProfile.sandboxMode
+      // A custom profile has no policy the adapter knows: the explicit fields
+      // set it, as they do for this turn (runtimeTurnContext), so the stored
+      // policy the approvals read and later turns run on is the same.
+      const approvalPolicy =
+        permissionProfile?.approvalPolicy ?? normalizeApprovalPolicy(params.approvalPolicy)
+      if (approvalPolicy) thread.approvalPolicy = approvalPolicy
+      const sandboxMode = permissionProfile?.sandboxMode ?? sandboxFromTurnParams(params)
+      if (sandboxMode) thread.sandboxMode = sandboxMode
     } else {
       if (hasLegacyPermissionParams(params)) thread.permissionProfileId = null
       if (typeof params.approvalPolicy === 'string')
@@ -5425,6 +5436,13 @@ export class CodexClaudeAppServer {
       acceptRuntimeEvents &&
       this.store.turnStatus(turn.id) === 'inProgress' &&
       this.activeTurnByThread.get(thread.id) === turn.id
+    // What an approval the turn no longer waits on answers. A turn the user
+    // stopped (Stop, or Cancel on another card) stops Claude's call with it;
+    // after a turn that ended on its own the call is only declined, so a
+    // background agent that asked as the turn finished keeps running.
+    const endedTurnDecision = (): PermissionDecision => ({
+      decision: this.store.turnStatus(turn.id) === 'interrupted' ? 'cancel' : 'decline',
+    })
     let resumedAtCheckpoint = false
     const runtimeTurn = this.runtime.runTurn(
       context,
@@ -6426,7 +6444,7 @@ export class CodexClaudeAppServer {
           }
         },
         onPermissionRequest: async (event, signal) => {
-          if (!turnIsActive()) return { decision: 'cancel' }
+          if (!turnIsActive()) return endedTurnDecision()
           completeMessage()
           // The request can overtake the finished call; the approval must
           // show the whole change, not the part that streamed.
@@ -6480,7 +6498,7 @@ export class CodexClaudeAppServer {
               signal,
             ),
           )
-          if (!turnIsActive()) return { decision: 'cancel' }
+          if (!turnIsActive()) return endedTurnDecision()
           if (decision.decision === 'decline' || decision.decision === 'cancel')
             declineToolItem(event.toolUseId)
           if (decision.decision === 'cancel') {
@@ -8315,8 +8333,10 @@ export class CodexClaudeAppServer {
       // The App could not answer: refuse this call and let Claude go on.
       return { decision: 'decline' }
     }
-    if (response.action === 'decline') return { decision: 'decline' }
-    if (response.action !== 'accept') return { decision: 'cancel' }
+    // A card its turn's end took down has no answer: as with a command card,
+    // the call is declined. Only the user's Cancel stops the turn.
+    if (response.action === 'cancel') return { decision: 'cancel' }
+    if (response.action !== 'accept') return { decision: 'decline' }
     const meta = response._meta
     const persist =
       meta && typeof meta === 'object' ? (meta as Record<string, unknown>).persist : null
