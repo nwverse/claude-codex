@@ -52,7 +52,9 @@ keeps native sidebar entries. Re-enable it to reopen them.
 Adapters that share a state directory never run a native chat at the same
 time. While one runs a turn or changes the chat, the others refuse to start,
 steer, interrupt, compact, review, roll back, revert, inject into, set the goal
-of, archive or delete it, until that ends or the adapter exits. Continuing one
+of, archive or delete it, until that ends or the adapter exits. Archiving or
+deleting a chat also ends the turns of the subagent threads it spawned, so it
+is refused while one of them runs in another adapter. Continuing one
 native chat from two adapters in turn is not supported yet: each adapter's
 Codex child keeps the conversation it loaded, so it does not see turns the
 other adapter added later and continues from what it saw. Use one adapter per

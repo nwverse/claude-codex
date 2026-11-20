@@ -43,6 +43,20 @@ versioning or publishing metadata.
   the rest of its process group with it, as a stopped one does, so helpers it
   started, such as MCP servers that ignore stdin EOF, no longer run on after
   every crash. (#334)
+- Archiving or deleting a native Codex chat now also interrupts the turns of
+  the subagent threads it spawned, and is refused while one of them runs in
+  another adapter. Such a turn used to run on in the deleted chat and keep the
+  adapter busy for good: its idle Codex child never stopped and the daemon
+  never idle-exited. (#344)
+- A native turn Codex accepted but has not announced yet (a shell command,
+  review or compaction) now keeps the Codex child and the daemon up. A small
+  `CLAUDE_CODEX_NATIVE_IDLE_MS` could stop the child in that gap and end the
+  compaction it had just begun. (#344)
+- An inline native review is tracked from Codex's answer, which carries its
+  turn: it holds the chat until Codex ends it, and archive or delete
+  interrupts it even before Codex announces it. The adapter used to wait for
+  the announcement for `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` at most and then
+  let the chat go while the review still ran. (#344)
 
 ### `ws://` listener authentication
 

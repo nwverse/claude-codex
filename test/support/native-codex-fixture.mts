@@ -7,7 +7,7 @@ const provider = (process.argv.findLast((arg) => arg.startsWith('model_provider=
 const log = (entry) => fs.appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify({ provider, ...entry }) + '\\n')
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n')
 log({event:'spawn', argv:process.argv.slice(2),pid:process.pid})
-process.on('exit', () => log({event:'exit'}))
+process.on('exit', () => log({event:'exit',pid:process.pid}))
 if (process.env.FAKE_IGNORE_TERM) {
   process.on('SIGTERM', () => {})
   setInterval(() => {}, 1000)
@@ -17,6 +17,9 @@ const waiting = new Map()
 // With FAKE_LATE_TURN, a compaction's turn is announced only when
 // thread/goal/get arrives, and runs until it is interrupted.
 let lateTurn = null
+// With FAKE_SUBAGENT, each turn spawns a subagent thread whose turn runs
+// until it is interrupted. With FAKE_REVIEW_TURN, review/start answers with
+// its turn, as codex 0.163 does, and runs it until it is interrupted.
 let next = 0
 let buffer = ''
 process.stdin.setEncoding('utf8')
@@ -71,6 +74,9 @@ function handle(message) {
     case 'thread/compact/start':
       if (process.env.FAKE_LATE_TURN) lateTurn = p.threadId
       return reply({})
+    case 'review/start':
+      if (!process.env.FAKE_REVIEW_TURN) return reply({})
+      return reply({turn:{id:'turn-review',status:'inProgress',items:[]},reviewThreadId:p.threadId})
     case 'thread/goal/get':
       if (lateTurn) {
         const turn = { id: 'turn-late', status: 'inProgress', items: [] }
@@ -89,6 +95,11 @@ function handle(message) {
       reply({ turn: { id: turnId, status: 'inProgress', items: [] } })
       send({ method: 'turn/started', params: { threadId: p.threadId, turn: { id: turnId, status: 'inProgress', items: [] } } })
       send({method:'thread/status/changed',params:{threadId:p.threadId,status:{type:'active',activeFlags:['waitingOnApproval']}}})
+      if (process.env.FAKE_SUBAGENT) {
+        const agent = provider + '-agent-' + turnId
+        send({method:'thread/started',params:{thread:{id:agent,parentThreadId:p.threadId,modelProvider:provider,agentNickname:'Scout'}}})
+        send({method:'turn/started',params:{threadId:agent,turn:{id:'turn-'+agent,status:'inProgress',items:[]}}})
+      }
       const requestId = 900 + next
       waiting.set(requestId, (result) => {
         send({ method: 'serverRequest/resolved', params: { threadId: p.threadId, requestId } })

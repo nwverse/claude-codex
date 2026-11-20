@@ -148,8 +148,15 @@ export class CodexNativeBridge {
     this.host = host
   }
 
+  // A turn Codex accepted but has yet to announce counts: stopping the child
+  // then would end a compaction or review it just began.
   busy(): boolean {
-    return this.requestsInFlight > 0 || this.activeTurns.size > 0 || this.pendingRequests.size > 0
+    return (
+      this.requestsInFlight > 0 ||
+      this.activeTurns.size > 0 ||
+      this.unannounced.size > 0 ||
+      this.pendingRequests.size > 0
+    )
   }
 
   async stop(): Promise<void> {
@@ -229,6 +236,13 @@ export class CodexNativeBridge {
     }
     const thread = this.owned(threadId)
     if (!thread || (!thread.codexSessionId && !startsTurn)) return NOT_ROUTED
+    // Archive and delete take the chat's subagent threads with them, and only
+    // the adapter running a subagent's turn can stop it.
+    const stopsWork = method === 'thread/archive' || method === 'thread/delete'
+    if (stopsWork) {
+      for (const id of this.host.store.subagentTreeIds(threadId))
+        if (this.host.store.hasForeignNativeTurn(id)) throw foreignTurnError(id)
+    }
     if (method === 'thread/fork') {
       // A description fork needs its native parent's conversation. The App's
       // default summary model can belong to a different provider.
@@ -256,24 +270,19 @@ export class CodexNativeBridge {
         // Keep the local sidebar record until the owner of the rollout accepts the change.
         const child = this.child(thread.nativeCodexProvider as string)
         const childId = thread.codexSessionId as string
-        const active = this.activeTurns.get(threadId)
-        const stopsWork = method === 'thread/archive' || method === 'thread/delete'
-        if (stopsWork && active) {
-          try {
-            await child.request('turn/interrupt', { threadId: childId, turnId: active.turnId })
-          } catch (error) {
-            if (this.activeTurns.get(threadId) === active) throw error
-          }
-        }
+        if (stopsWork) await this.interruptTree(threadId)
         const result = asRecord(
           await child.request(method, this.inbound(params, thread.id, childId, child.provider)),
         )
-        if (stopsWork) {
-          this.activeTurns.delete(threadId)
-          this.clearUnannounced(threadId)
-          this.finishThreadRequests(threadId)
-          this.loaded.get(child.provider)?.ids.delete(childId)
+        // Read again: a subagent thread the child announced meanwhile goes too.
+        const tree = stopsWork ? this.host.store.subagentTreeIds(threadId) : []
+        for (const id of tree) {
+          this.activeTurns.delete(id)
+          this.clearUnannounced(id)
+          this.finishThreadRequests(id)
+          if (id !== threadId) this.settleClaim(id)
         }
+        if (stopsWork) this.loaded.get(child.provider)?.ids.delete(childId)
         const local = await this.host.finishMirror(peer, method, params)
         if (method === 'thread/unarchive') {
           const history = asRecord(result.thread)
@@ -284,7 +293,7 @@ export class CodexNativeBridge {
         }
         if (method === 'thread/delete') {
           this.adapterIdByChild.delete(thread.codexSessionId as string)
-          this.turnStarts.delete(threadId)
+          for (const id of tree) this.turnStarts.delete(id)
         }
         return local
       }
@@ -294,8 +303,16 @@ export class CodexNativeBridge {
         ANNOUNCED_TURN.has(method) &&
         (this.turnStarts.get(threadId) ?? 0) === startsBefore &&
         (stringField(asRecord(result).reviewThreadId) ?? threadId) === threadId
-      )
-        this.awaitTurn(threadId, thread.nativeCodexProvider as string)
+      ) {
+        // Codex answers a review with its turn, as it does turn/start. Not
+        // announced yet, so it has not ended either.
+        const turn = asRecord(asRecord(result).turn)
+        const turnId = stringField(turn.id)
+        const provider = thread.nativeCodexProvider as string
+        if (turnId && turn.status === 'inProgress')
+          this.recordActiveTurn(threadId, turnId, provider)
+        else this.awaitTurn(threadId, provider)
+      }
       if (method === 'thread/settings/update') return NOT_ROUTED
       if (model && (method === 'turn/start' || method === 'thread/resume')) {
         const current = this.host.store.getThread(threadId)
@@ -317,6 +334,24 @@ export class CodexNativeBridge {
     }
   }
 
+  // Interrupts the native turns of the thread and of the subagent threads it
+  // spawned. A turn that ended meanwhile is no failure.
+  private async interruptTree(threadId: string): Promise<void> {
+    for (const id of this.host.store.subagentTreeIds(threadId)) {
+      const active = this.activeTurns.get(id)
+      const childId = this.host.store.getThread(id)?.codexSessionId
+      if (!active || !childId) continue
+      try {
+        await this.child(active.provider).request('turn/interrupt', {
+          threadId: childId,
+          turnId: active.turnId,
+        })
+      } catch (error) {
+        if (this.activeTurns.get(id) === active) throw error
+      }
+    }
+  }
+
   // Codex answers a shell command, review or compaction before it announces
   // the turn. The claim waits for that, for a while: a child that exits or
   // stops first, or never announces it, leaves nothing running.
@@ -325,6 +360,7 @@ export class CodexNativeBridge {
     const timer = setTimeout(() => {
       this.unannounced.delete(threadId)
       this.settleClaim(threadId)
+      this.host.checkIdle()
     }, turnWaitMs())
     timer.unref()
     this.unannounced.set(threadId, { provider, timer })
@@ -369,7 +405,6 @@ export class CodexNativeBridge {
       this.idleTimer = null
       if (this.busy()) return this.scheduleIdleStop()
       for (const child of this.children.values()) void child.stop()
-      this.releaseUnannounced()
       debugLog('codexBridge.idleStop', {})
     }, ms)
     this.idleTimer.unref()
@@ -672,6 +707,12 @@ export class CodexNativeBridge {
 
   // The sidebar record follows the conversation.
   private track(threadId: string, method: string, params: Record<string, unknown>): void {
+    // Before the record check: the turn of a thread deleted meanwhile still
+    // ends here, or the adapter would stay busy for good.
+    if (method === 'turn/completed') {
+      this.endTurn(threadId, params)
+      return
+    }
     const thread = this.host.store.getThread(threadId)
     if (!thread) return
     switch (method) {
@@ -680,23 +721,6 @@ export class CodexNativeBridge {
         this.turnStarts.set(threadId, (this.turnStarts.get(threadId) ?? 0) + 1)
         this.clearUnannounced(threadId)
         if (turnId) this.recordActiveTurn(threadId, turnId, thread.nativeCodexProvider as string)
-        return
-      }
-      case 'turn/completed': {
-        const turnId = stringField(asRecord(params.turn).id)
-        if (turnId) this.startingTurns.get(threadId)?.add(turnId)
-        const active = this.activeTurns.get(threadId)
-        if (!active || active.turnId === turnId) {
-          this.activeTurns.delete(threadId)
-          this.clearUnannounced(threadId)
-          this.host.store.updateNativeThreadStatus(
-            threadId,
-            { type: 'idle' },
-            this.holdsClaim(threadId),
-          )
-        }
-        if (turnId) this.finishThreadRequests(threadId, turnId)
-        this.host.checkIdle()
         return
       }
       case 'thread/status/changed': {
@@ -718,6 +742,23 @@ export class CodexNativeBridge {
         return
       }
     }
+  }
+
+  private endTurn(threadId: string, params: Record<string, unknown>): void {
+    const turnId = stringField(asRecord(params.turn).id)
+    if (turnId) this.startingTurns.get(threadId)?.add(turnId)
+    const active = this.activeTurns.get(threadId)
+    if (!active || active.turnId === turnId) {
+      this.activeTurns.delete(threadId)
+      this.clearUnannounced(threadId)
+      this.host.store.updateNativeThreadStatus(
+        threadId,
+        { type: 'idle' },
+        this.holdsClaim(threadId),
+      )
+    }
+    if (turnId) this.finishThreadRequests(threadId, turnId)
+    this.host.checkIdle()
   }
 
   private onServerRequest(
