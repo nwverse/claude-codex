@@ -359,6 +359,18 @@ versioning or publishing metadata.
   removing (nor a review or compaction on an archived chat), and the App
   hears nothing more of a deleted thread, such as a `turn/completed` still
   marked `inProgress`. (#328)
+- A turn, review or compaction the App starts just before it deletes,
+  archives or interrupts it no longer starts Claude a moment later, and the
+  App no longer hears its `turn/started` after its `turn/completed` or the
+  chat's `thread/deleted`. (#341)
+- While `thread/archive` waits for the turns in a chat and its subagent
+  threads to stop, a turn, review, compaction or shell command started there
+  is refused with `thread <id> is being archived` instead of running on in
+  the archived chat, and queued messages stay queued. A message queued on a
+  subagent thread of a chat being deleted now goes with it instead of failing
+  with `unknown thread`. Deleting or archiving a chat ends its turns before
+  its background agents, so a turn on a subagent thread can no longer launch
+  an agent that keeps running in the archived chat. (#341)
 - Startup recovery streams the completed history and rechecks a turn before
   repairing its activity markers. A report another adapter finished while
   recovery was scanning stays in the conversation.
