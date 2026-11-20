@@ -195,7 +195,8 @@ these gates of App 26.1013 are newly on:
   `instantInterrupt`, `outputTokenReplay` and `preserveForkPrefix`, which only
   let a Codex feature key through in the config the App sends.
 
-App 26.1111 ships Codex `0.169.0-alpha.11.1`, still accepts `0.141.0` and up,
+App 26.1111 ships Codex `0.169.0-alpha.11.1` (26.1111.71704: `0.169.1`, with
+the same app-server protocol and gates), still accepts `0.141.0` and up,
 and adds gates. At the default version these of them are on:
 
 - `threadReadState`: on any host but its hosted `durable` one, the App reads

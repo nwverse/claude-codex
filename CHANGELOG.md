@@ -270,6 +270,12 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- Codex App 26.1111.71704 is a verified build too, and the upgrade baseline.
+  Its Codex, `0.169.1`, has the same app-server protocol as 26.1111.21308's,
+  its gates are unchanged, and the one new method-shaped name in its scripts,
+  `project/settings`, is the path of a ChatGPT project's settings page, not
+  an app-server request; like Codex, the adapter answers it with method not
+  found. (#354)
 - Codex App 26.1111 is a verified build, checked against the App rules from
   its bundle (`docs/reference/app-compat.md` notes what changed). The adapter
   still reports app-server `0.163.0-alpha.10.2`, which turns on five of
