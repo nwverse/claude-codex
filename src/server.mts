@@ -603,6 +603,16 @@ function queuedInput(value: unknown): UserInput[] {
   return input
 }
 
+// A queued message was edited after its dispatch read it. The turn's claim
+// rolls back, and the dispatch starts again with what is stored now.
+class QueuedSubmissionChanged extends Error {
+  readonly current: QueuedSubmission
+  constructor(current: QueuedSubmission) {
+    super(`queued submission ${current.id} changed while its turn started`)
+    this.current = current
+  }
+}
+
 function isEmptyInput(input: UserInput[]): boolean {
   const { textPrompt, images } = extractImageInputs(input)
   return !textPrompt.trim() && images.length === 0 && !textFromInput(input).trim()
@@ -3036,8 +3046,11 @@ export class CodexClaudeAppServer {
     return thread
   }
 
-  private saveQueue(threadId: string, items: QueuedSubmission[]): void {
-    this.store.saveQueue(threadId, items)
+  private mutateQueue(
+    threadId: string,
+    body: (items: QueuedSubmission[]) => QueuedSubmission[],
+  ): void {
+    this.store.mutateQueue(threadId, body)
     this.notifyThread(threadId, { method: 'thread/queue/changed', params: { threadId } })
   }
 
@@ -3056,7 +3069,7 @@ export class CodexClaudeAppServer {
       input: queuedInput(params.input),
       clientUserMessageId: nullIfEmpty(stringOr(params.clientUserMessageId, '')),
     }
-    this.saveQueue(threadId, [...this.store.listQueue(threadId), submission])
+    this.mutateQueue(threadId, (items) => [...items, submission])
     if (!this.activeTurnByThread.has(threadId) && !this.queueHeld(threadId))
       setImmediate(() => this.startFollowUp(threadId))
     return { queuedSubmission: submission }
@@ -3073,14 +3086,15 @@ export class CodexClaudeAppServer {
     this.queueThread(threadId)
     this.subscribe(threadId, peer)
     const id = stringOr(params.queuedSubmissionId, '')
-    const updated: QueuedSubmission = {
-      ...this.queuedSubmission(threadId, id),
-      input: queuedInput(params.input),
-    }
-    this.saveQueue(
-      threadId,
-      this.store.listQueue(threadId).map((entry) => (entry.id === id ? updated : entry)),
-    )
+    const input = queuedInput(params.input)
+    let updated: QueuedSubmission | undefined
+    this.mutateQueue(threadId, (items) => {
+      const current = items.find((entry) => entry.id === id)
+      if (!current) throw invalidRequest(`unknown queued submission: ${id}`)
+      const next = { ...current, input }
+      updated = next
+      return items.map((entry) => (entry.id === id ? next : entry))
+    })
     return { queuedSubmission: updated }
   }
 
@@ -3089,11 +3103,13 @@ export class CodexClaudeAppServer {
     this.queueThread(threadId)
     this.subscribe(threadId, peer)
     const id = stringOr(params.queuedSubmissionId, '')
-    const items = this.store.listQueue(threadId)
-    const rest = items.filter((entry) => entry.id !== id)
-    if (rest.length === items.length) return { deleted: false }
-    this.saveQueue(threadId, rest)
-    return { deleted: true }
+    let deleted = false
+    this.mutateQueue(threadId, (items) => {
+      const rest = items.filter((entry) => entry.id !== id)
+      deleted = rest.length !== items.length
+      return rest
+    })
+    return { deleted }
   }
 
   private threadQueueReorder(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -3103,15 +3119,17 @@ export class CodexClaudeAppServer {
     const order = Array.isArray(params.queuedSubmissionIds)
       ? params.queuedSubmissionIds.filter((id): id is string => typeof id === 'string')
       : []
-    const byId = new Map(this.store.listQueue(threadId).map((entry) => [entry.id, entry]))
-    const reordered: QueuedSubmission[] = []
-    for (const id of order) {
-      const entry = byId.get(id)
-      if (!entry) continue
-      byId.delete(id)
-      reordered.push(entry)
-    }
-    this.saveQueue(threadId, [...reordered, ...byId.values()])
+    this.mutateQueue(threadId, (items) => {
+      const byId = new Map(items.map((entry) => [entry.id, entry]))
+      const reordered: QueuedSubmission[] = []
+      for (const id of order) {
+        const entry = byId.get(id)
+        if (!entry) continue
+        byId.delete(id)
+        reordered.push(entry)
+      }
+      return [...reordered, ...byId.values()]
+    })
     return {}
   }
 
@@ -3158,25 +3176,32 @@ export class CodexClaudeAppServer {
   }
 
   // Runs one queued submission as a regular user turn. The submission leaves
-  // the queue only once its turn exists, so a rejected start keeps it.
+  // the queue in the turn's claim transaction, so a rejected start keeps it
+  // and a crash cannot commit a claimed turn without its dequeue. It never
+  // joins a running turn: that would run it and leave it queued to run again.
   private async dispatchQueued(
     peer: RpcPeer,
     threadId: string,
     submission: QueuedSubmission,
   ): Promise<unknown> {
-    const result = await this.turnStart(peer, {
-      ...this.followUpParams(threadId),
-      input: submission.input,
-      ...(submission.clientUserMessageId
-        ? { clientUserMessageId: submission.clientUserMessageId }
-        : {}),
-      _emitUserMessage: true,
-    })
-    this.saveQueue(
-      threadId,
-      this.store.listQueue(threadId).filter((entry) => entry.id !== submission.id),
-    )
-    return result
+    for (let current = submission; ; ) {
+      try {
+        const result = await this.turnStart(peer, {
+          ...this.followUpParams(threadId),
+          input: current.input,
+          ...(current.clientUserMessageId
+            ? { clientUserMessageId: current.clientUserMessageId }
+            : {}),
+          _emitUserMessage: true,
+          _queuedSubmission: current,
+        })
+        this.notifyThread(threadId, { method: 'thread/queue/changed', params: { threadId } })
+        return result
+      } catch (error) {
+        if (!(error instanceof QueuedSubmissionChanged)) throw error
+        current = error.current
+      }
+    }
   }
 
   // Settings for a turn the adapter starts on the user's behalf: whatever the
@@ -3224,6 +3249,8 @@ export class CodexClaudeAppServer {
       if (head) {
         void this.dispatchQueued(peer, threadId, head).catch((error) => {
           debugLog('queue.dispatch.failed', { threadId, error: String(error) })
+          // A turn of this process started first; the queue goes on when it ends.
+          if (this.activeTurnByThread.has(threadId)) return
           this.notify(peer, {
             method: 'error',
             params: { threadId, turnId: null, willRetry: false, error: turnErrorOf(error) },
@@ -4532,6 +4559,8 @@ export class CodexClaudeAppServer {
       resumed ??
       stripQuietTurnHeartbeat(skillLinksToCommand(textPrompt || textFromInput(input)))
     const workflowCommand = hiddenPrompt || resumed ? null : parseWorkflowCommand(prompt)
+    // A queued message runs as a turn of its own (see dispatchQueued).
+    const queued = params._queuedSubmission as QueuedSubmission | undefined
     // Like Codex, input that arrives while a turn is running joins that turn.
     // A turn/start can race a turn the adapter has just opened itself (for a
     // background agent's or workflow's report); a second turn would orphan
@@ -4542,7 +4571,7 @@ export class CodexClaudeAppServer {
       const runningTurnId = this.activeTurnByThread.get(threadId)
       const running = runningTurnId ? this.store.getTurn(runningTurnId) : null
       if (running?.status === 'inProgress') return { turn: this.toLifecycleTurn(running) }
-    } else if (!hiddenPrompt && params.outputSchema == null) {
+    } else if (!hiddenPrompt && params.outputSchema == null && !queued) {
       const joined = await this.joinRunningTurn(
         peer,
         threadId,
@@ -4674,11 +4703,23 @@ export class CodexClaudeAppServer {
         if (!isDeepStrictEqual(latest, initialThread))
           throw invalidRequest('the thread changed while starting the turn; retry the request')
         this.store.upsertThread(thread)
+        if (queued) {
+          const items = this.store.listQueue(threadId)
+          const stored = items.find((entry) => entry.id === queued.id)
+          if (!stored) throw invalidRequest(`unknown queued submission: ${queued.id}`)
+          // An edit since the dispatch read it must not run the old input.
+          if (!isDeepStrictEqual(stored, queued)) throw new QueuedSubmissionChanged(stored)
+          // The turn and its dequeue commit or roll back together in claimTurn.
+          this.store.saveQueue(
+            threadId,
+            items.filter((entry) => entry.id !== queued.id),
+          )
+        }
       })
       if (claim.claimed) break
       const ownedHere = this.activeTurnByThread.get(threadId) === claim.activeTurn.id
       if (ownedHere && resumed) return { turn: this.toLifecycleTurn(claim.activeTurn) }
-      if (ownedHere && !hiddenPrompt && params.outputSchema == null) {
+      if (ownedHere && !hiddenPrompt && params.outputSchema == null && !queued) {
         const joined = await this.joinRunningTurn(
           peer,
           threadId,
@@ -5590,6 +5631,7 @@ export class CodexClaudeAppServer {
         _imageInputs: _images,
         _promptContext: _context,
         _emitUserMessage: _emit,
+        _queuedSubmission: _queued,
         ...rest
       } = params
       this.lastTurnParamsByThread.set(thread.id, rest)

@@ -6,14 +6,14 @@ import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { SessionStore } from '../src/store.mjs'
-import type { ThreadItem, ThreadRecord, TurnStatus } from '../src/types.mjs'
+import type { ClaudeRuntime, ThreadItem, ThreadRecord, TurnStatus } from '../src/types.mjs'
 import { type InProcessApp, scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 const text = (value: string) => [{ type: 'text', text: value, text_elements: [] }]
 
 // Turns whose prompt starts with "[hold]" run until the test releases them (or
 // they are interrupted); every other turn answers at once.
-function holdingRuntime() {
+function holdingRuntime(extra: Partial<ClaudeRuntime> = {}) {
   const prompts: string[] = []
   const releases = new Map<string, () => void>()
   const runtime = scriptedRuntime(
@@ -29,6 +29,7 @@ function holdingRuntime() {
       interrupt: async () => {
         for (const release of releases.values()) release()
       },
+      ...extra,
     },
   )
   return { runtime, prompts, releases }
@@ -286,5 +287,83 @@ test('a hold the stored turns cannot give comes from the newest turn', async () 
       prompts.some((prompt) => prompt.includes('message')),
       false,
     )
+  })
+})
+
+// A dispatch that passed the idle check, as startFollowUp's does, before a
+// turn of this process became active.
+const dispatchQueued = (app: InProcessApp, threadId: string, submission: unknown) => {
+  const server = app.server as unknown as {
+    dispatchQueued(peer: unknown, threadId: string, submission: unknown): Promise<unknown>
+    peerForThread(threadId: string): unknown
+  }
+  return server.dispatchQueued(server.peerForThread(threadId), threadId, submission)
+}
+
+test('a queued message never joins a running turn, so it runs once, as its own turn', async () => {
+  const steered: string[] = []
+  // A runtime that takes steering, so joining the running turn would succeed.
+  const { runtime, prompts, releases } = holdingRuntime({
+    steer: async (_threadId, prompt) => {
+      steered.push(prompt)
+      return true
+    },
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    const first = await app.startTurn(threadId, '[hold] first')
+    const releaseFirst = await app.waitFor(() => releases.get(first))
+    await app.request('thread/queue/add', { threadId, input: text('queued once') })
+    const [head] = app.store.listQueue(threadId)
+    assert.ok(head)
+    await assert.rejects(dispatchQueued(app, threadId, head), /already has an active turn/)
+    assert.deepEqual(steered, [])
+    assert.deepEqual(
+      app.store.listQueue(threadId).map((entry) => entry.id),
+      [head.id],
+    )
+
+    releaseFirst()
+    await app.turnCompleted(first)
+    await app.waitFor(() =>
+      prompts.some((prompt) => prompt.includes('queued once')) ? true : undefined,
+    )
+    await app.waitFor(() => (app.server.hasActiveTurns() ? undefined : true))
+    await delay(50)
+    assert.equal(prompts.filter((prompt) => prompt.includes('queued once')).length, 1)
+    assert.deepEqual(app.store.listQueue(threadId), [])
+  })
+})
+
+test('a queued message edited while its turn starts runs as edited', async () => {
+  const { runtime, prompts, releases } = holdingRuntime()
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    const turnId = await app.startTurn(threadId, '[hold] until the user stops this')
+    await app.waitFor(() => releases.get(turnId))
+    const { queuedSubmission } = await app.request('thread/queue/add', {
+      threadId,
+      input: text('old text'),
+    })
+    await app.request('turn/interrupt', { threadId, turnId })
+    await app.turnCompleted(turnId)
+    // The dispatch read the message before this edit landed.
+    const [stale] = app.store.listQueue(threadId)
+    await app.request('thread/queue/update', {
+      threadId,
+      queuedSubmissionId: queuedSubmission.id,
+      input: text('new text'),
+    })
+
+    await dispatchQueued(app, threadId, stale)
+    await app.waitFor(() =>
+      prompts.some((prompt) => prompt.includes('new text')) ? true : undefined,
+    )
+    await app.waitFor(() => (app.server.hasActiveTurns() ? undefined : true))
+    assert.equal(
+      prompts.some((prompt) => prompt.includes('old text')),
+      false,
+    )
+    assert.deepEqual(app.store.listQueue(threadId), [])
   })
 })

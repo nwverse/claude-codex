@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync } from 'node:fs'
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -13,6 +13,27 @@ const releaseFile = join(home, 'release-turn')
 const runLog = join(home, 'model-runs.jsonl')
 
 const store = new SessionStore(join(home, 'state.sqlite'))
+const queueBarrier = process.env.CLAUDE_CODEX_TEST_QUEUE_BARRIER === '1'
+const queueBarrierSkip = Number(process.env.CLAUDE_CODEX_TEST_QUEUE_BARRIER_SKIP ?? '0')
+const queueBarrierArm = join(home, 'queue-barrier-armed')
+const queueBarrierRelease = join(home, 'release-queue-read')
+const listQueue = store.listQueue.bind(store)
+let queueBarrierReads = 0
+let queueBarrierUsed = false
+store.listQueue = (threadId) => {
+  const items = listQueue(threadId)
+  if (!queueBarrier || queueBarrierUsed || !existsSync(queueBarrierArm)) return items
+  queueBarrierReads += 1
+  if (queueBarrierReads <= queueBarrierSkip) return items
+  queueBarrierUsed = true
+  writeFileSync(join(home, `queue-read-${process.pid}`), 'ready')
+  const waiting = new Int32Array(new SharedArrayBuffer(4))
+  for (let attempt = 0; attempt < 1000 && !existsSync(queueBarrierRelease); attempt += 1) {
+    Atomics.wait(waiting, 0, 0, 10)
+  }
+  if (!existsSync(queueBarrierRelease)) throw new Error('timed out waiting to release queue read')
+  return items
+}
 store.recoverStaleInProgressTurns()
 const runtime: ClaudeRuntime = {
   runTurn: async (context, handlers) => {

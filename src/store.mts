@@ -2571,6 +2571,14 @@ export class SessionStore {
     return row ? (JSON.parse(row.items_json) as QueuedSubmission[]) : []
   }
 
+  // The write lock makes the read-modify-write one operation across every
+  // adapter sharing this store. Callers must keep the mutation synchronous.
+  mutateQueue(threadId: string, body: (items: QueuedSubmission[]) => QueuedSubmission[]): void {
+    this.transaction(() => {
+      this.saveQueue(threadId, body(this.listQueue(threadId)))
+    })
+  }
+
   saveQueue(threadId: string, items: QueuedSubmission[]): void {
     if (items.length === 0) {
       this.db.prepare('DELETE FROM thread_queues WHERE thread_id = ?').run(threadId)
