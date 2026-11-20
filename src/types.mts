@@ -713,9 +713,7 @@ export interface SubagentOutputEvent {
 }
 
 export type RuntimeEvent =
-  // null: the thread's session left no transcript to resume, and the turn
-  // starts a new one.
-  | { type: 'session'; claudeSessionId: string | null }
+  | { type: 'session'; claudeSessionId: string }
   // Claude wrote a top-level transcript entry; the newest one of a turn is
   // where a rewind back to that turn resumes.
   | { type: 'checkpoint'; claudeSessionId: string; messageUuid: string }

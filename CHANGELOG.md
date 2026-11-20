@@ -833,18 +833,22 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
-- A Claude chat whose session transcript is gone, for example because Claude
-  Code deleted sessions older than its `cleanupPeriodDays` (30 days by
-  default), continues in a new Claude session, and a notice says the earlier
-  conversation could not be found. Since #324 such a chat, and every fork of
-  it, failed each message with `Cannot resume Claude session …: its
-  transcript is missing`. The chat drops the lost session id right away, so a
-  new session that fails to start does not leave it bound. (#327)
-- Renaming a chat's workspace folder to a name with the same Claude Code
-  project folder (`my_project` or `my project` to `my-project`) keeps its
-  conversation: the transcript is already where Claude Code looks. Since #324
-  every later turn failed with `Cannot relocate a Claude session between
-  workspaces with the same transcript directory`. (#327)
+- A Claude chat keeps its conversation when its workspace folder is moved or
+  renamed. The adapter looks for the transcript under the workspace it last
+  recorded, in the chat's own Claude config folder, and resumes an
+  independent copy for the new path, or the transcript itself when the new
+  name maps to the same Claude Code project folder (`my_project` to
+  `my-project`). It used to start a new session silently and send Claude only
+  the newest message. When the transcript cannot be found, for example after
+  Claude Code deleted sessions older than its `cleanupPeriodDays` (30 days by
+  default), the chat continues in a new Claude session and a notice says the
+  earlier conversation could not be found. A Claude config folder that is
+  missing or cannot be read fails the turn instead, and the chat keeps its
+  session for when the folder is back. (#324, #327)
+- A fork whose first turn failed before Claude Code started still forks its
+  parent's Claude session on its next turn. It used to resume the parent's
+  session itself and write the fork's conversation into the parent's
+  transcript. (#327)
 - A deleted chat stays deleted and a rename sticks when a `turn/start`
   arrives at the same time, for example from a second window on the same
   chat. `turn/start` re-reads the thread after waiting on a running turn

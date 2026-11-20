@@ -1598,6 +1598,16 @@ export class SessionStore {
       .run(checkpoint.sessionId, checkpoint.messageUuid, turnId)
   }
 
+  // Whether one of the thread's own turns has a checkpoint in Claude session
+  // `sessionId`: the thread has written to that session itself.
+  turnsWroteSession(threadId: string, sessionId: string): boolean {
+    return (
+      this.db
+        .prepare('SELECT 1 FROM turns WHERE thread_id = ? AND claude_session_id = ? LIMIT 1')
+        .get(threadId, sessionId) !== undefined
+    )
+  }
+
   turnCheckpoint(turnId: string): ClaudeCheckpoint | null {
     const row = this.db
       .prepare('SELECT claude_session_id, claude_message_uuid FROM turns WHERE id = ?')

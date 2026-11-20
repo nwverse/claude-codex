@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import {
+  accessSync,
   chmodSync,
   closeSync,
   constants,
@@ -13,12 +14,54 @@ import {
   realpathSync,
   rmSync,
   type Stats,
+  statSync,
 } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { newId, projectSlugs } from './util.mjs'
 
 export const CLAUDE_SESSION_UUID = /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i
+
+function failure(path: string, error: unknown): string {
+  return `${path}: ${(error as NodeJS.ErrnoException).code ?? String(error)}`
+}
+
+// A transcript lookup: the file, or null when nothing is there. A lookup that
+// cannot tell (EACCES, EPERM, EIO) is added to `failures`.
+export function transcriptStat(path: string, failures: string[]): Stats | null {
+  try {
+    const stat = statSync(path)
+    return stat.isFile() ? stat : null
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') failures.push(failure(path, error))
+    return null
+  }
+}
+
+// A Claude session starts over only when its transcript is certainly gone:
+// the CLI's config folder is readable, its projects folder is readable or
+// was never created, and no lookup failed. A folder that is away or cannot
+// be read (an unmounted volume, a privacy block) fails the turn instead, and
+// the chat keeps its session for when the folder is back.
+export function assertTranscriptGone(id: string, root: string, failures: string[]): void {
+  const problems = [...failures]
+  const projects = join(root, 'projects')
+  for (const dir of [root, projects]) {
+    if (problems.length) break
+    try {
+      if (dir === projects && !lstatSync(dir, { throwIfNoEntry: false })) break
+      if (!statSync(dir).isDirectory()) problems.push(`${dir}: not a folder`)
+      else accessSync(dir, constants.R_OK | constants.X_OK)
+    } catch (error) {
+      problems.push(failure(dir, error))
+    }
+  }
+  if (problems.length)
+    throw new Error(
+      `Cannot resume Claude session ${id}: its transcript could not be read (${problems[0]}). The chat keeps its session; send the message again once that folder is available.`,
+    )
+}
 
 // Also resolve a renamed directory's surviving parent, e.g. /tmp -> /private/tmp.
 function physicalPath(path: string): string {

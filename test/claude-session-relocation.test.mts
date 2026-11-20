@@ -99,7 +99,7 @@ test('a moved workspace whose transcript is gone starts a new session', async ()
   }
 })
 
-test('relocation stays in the bound configuration and refuses unrelated or ambiguous copies', async () => {
+test('relocation stays in the bound configuration and never overwrites a different destination', async () => {
   const f = await fixture()
   try {
     // Neither the profile's configuration nor the recorded workspace has the
@@ -117,6 +117,51 @@ test('relocation stays in the bound configuration and refuses unrelated or ambig
     assert.equal(await readFile(f.file(f.oldDir), 'utf8'), f.original)
     assert.equal(await readFile(f.file(f.newDir), 'utf8'), f.original + 'different\n')
   } finally {
+    await rm(f.base, { recursive: true, force: true })
+  }
+})
+
+test('relocation refuses a recorded workspace with more than one transcript', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const f = await fixture()
+  try {
+    // The workspace was recorded through a link to its parent: its old
+    // transcript may be under either name, and here it is under both.
+    await symlink(f.base, join(f.base, 'link'))
+    const linked = join(f.base, 'link', 'old')
+    const other = join(f.config, 'projects', projectSlugs(linked)[0] as string)
+    await mkdir(other, { mode: 0o700 })
+    await writeFile(f.file(other), f.original, { mode: 0o600 })
+    assert.throws(() => sdkResumeSessionId(f.id, f.cwd, f.config, 'same-model', linked), /found 2/)
+    assert.equal(await stat(f.newDir).catch(() => null), null)
+  } finally {
+    await rm(f.base, { recursive: true, force: true })
+  }
+})
+
+test('a transcript that is only out of reach is not taken for gone', async () => {
+  const f = await fixture('workspace', 'workspace')
+  const resume = () => sdkResumeSessionId(f.id, f.cwd, f.config, 'same-model', f.cwd)
+  try {
+    assert.equal(resume(), f.id)
+    // The config folder is away, as on a volume that is not mounted.
+    await rename(f.config, `${f.config}.away`)
+    assert.throws(resume, /transcript could not be read .*ENOENT/)
+    await rename(`${f.config}.away`, f.config)
+    if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+      await chmod(f.newDir, 0o000)
+      assert.throws(resume, /transcript could not be read .*EACCES/)
+      await chmod(f.newDir, 0o700)
+      await rename(join(f.config, 'projects'), join(f.base, 'projects'))
+      await symlink(join(f.base, 'elsewhere'), join(f.config, 'projects'))
+      assert.throws(resume, /transcript could not be read .*ENOENT/)
+      await rm(join(f.config, 'projects'))
+      await rename(join(f.base, 'projects'), join(f.config, 'projects'))
+    }
+    assert.equal(resume(), f.id)
+  } finally {
+    await chmod(f.newDir, 0o700).catch(() => {})
     await rm(f.base, { recursive: true, force: true })
   }
 })
@@ -151,12 +196,11 @@ test('relocation refuses a mismatched session identity and linked or writable tr
   }
 })
 
-const LOST_SESSION = '0b5c3a52-6a7e-4d0c-9a49-3f0e6a1b2c3d'
-const MISSING_NOTICE = /could not find this chat's earlier conversation/
+const MISSING_NOTICE = /earlier Claude conversation of this chat could not be found/
 
 // Claude Code as the SDK starts it for each turn: the options it was given,
-// and the frames it answers with, or the error it fails with before its
-// session starts.
+// and the session it answers in, whose transcript it writes as the CLI does,
+// or the error it fails with before any session starts.
 function claudeCode(launches: Array<Record<string, unknown>>, runs: Array<string | Error>) {
   const runtime = new NativeClaudeRuntime()
   Reflect.set(runtime, 'sdk', {
@@ -164,11 +208,14 @@ function claudeCode(launches: Array<Record<string, unknown>>, runs: Array<string
       launches.push(options)
       const run = runs.shift()
       if (run instanceof Error || run === undefined) throw run ?? new Error('no run scripted')
+      const config = (options.env as NodeJS.ProcessEnv).CLAUDE_CONFIG_DIR as string
+      await writeTranscript(config, options.cwd as string, run)
       yield { type: 'system', subtype: 'init', session_id: run }
       yield {
         type: 'assistant',
         parent_tool_use_id: null,
         session_id: run,
+        uuid: randomUUID(),
         message: {
           id: `${run}-reply`,
           role: 'assistant',
@@ -181,28 +228,42 @@ function claudeCode(launches: Array<Record<string, unknown>>, runs: Array<string
   return runtime
 }
 
-async function withLostSession(
+async function writeTranscript(config: string, cwd: string, sessionId: string) {
+  const dir = join(config, 'projects', projectSlugs(cwd)[0] as string)
+  await mkdir(dir, { recursive: true, mode: 0o700 })
+  const record = { type: 'user', sessionId, message: { role: 'user', content: 'hi' } }
+  await writeFile(join(dir, `${sessionId}.jsonl`), `${JSON.stringify(record)}\n`, { mode: 0o600 })
+}
+
+interface ClaudeChat {
+  threadId: string
+  sessionId: string
+  config: string
+  launches: Array<Record<string, unknown>>
+}
+
+// A Claude chat bound to a session, whose transcript is in the Claude config
+// folder or, with `transcript` false, gone.
+async function withClaudeChat(
+  transcript: boolean,
   runs: Array<string | Error>,
-  body: (
-    app: InProcessApp,
-    threadId: string,
-    launches: Array<Record<string, unknown>>,
-  ) => Promise<void>,
+  body: (app: InProcessApp, chat: ClaudeChat) => Promise<void>,
 ) {
-  const base = await realpath(await mkdtemp(join(tmpdir(), 'cc-missing-')))
+  const base = await realpath(await mkdtemp(join(tmpdir(), 'cc-session-')))
   const cwd = join(base, 'workspace')
   const config = join(base, 'claude')
+  const sessionId = randomUUID()
   await mkdir(cwd)
   await mkdir(join(config, 'projects'), { recursive: true, mode: 0o700 })
+  if (transcript) await writeTranscript(config, cwd, sessionId)
   const launches: Array<Record<string, unknown>> = []
   try {
     await withInProcessApp(
       claudeCode(launches, runs),
       async (app) => {
         const threadId = await app.startThread({ cwd })
-        // A session whose transcript Claude Code has since deleted.
-        app.store.updateClaudeSessionId(threadId, LOST_SESSION, cwd)
-        await body(app, threadId, launches)
+        app.store.updateClaudeSessionId(threadId, sessionId, cwd)
+        await body(app, { threadId, sessionId, config, launches })
       },
       { env: { CLAUDE_CONFIG_DIR: config } },
     )
@@ -211,31 +272,78 @@ async function withLostSession(
   }
 }
 
+function missingNotices(app: InProcessApp) {
+  return app.notified('warning').filter((notice) => MISSING_NOTICE.test(notice.message))
+}
+
 test('a thread whose Claude transcript is gone continues in a new session and says so', async () => {
   const fresh = randomUUID()
-  await withLostSession([fresh], async (app, threadId, launches) => {
+  await withClaudeChat(false, [fresh], async (app, { threadId, launches }) => {
     const turn = await app.turnCompleted(await app.startTurn(threadId, 'hello again'))
     assert.equal(turn.status, 'completed')
     assert.equal(launches.length, 1)
     assert.equal(launches[0]?.resume, undefined)
     assert.equal(app.store.getThread(threadId)?.claudeSessionId, fresh)
-    const notices = app.notified('warning').filter((notice) => MISSING_NOTICE.test(notice.message))
+    const notices = missingNotices(app)
     assert.equal(notices.length, 1)
     assert.equal(notices[0]?.threadId, threadId)
   })
 })
 
-test('a lost Claude session is forgotten even when its new session fails to start', async () => {
+test('a chat keeps its Claude session until a new session has started', async () => {
   const fresh = randomUUID()
-  await withLostSession([new Error('Claude Code exited early'), fresh], async (app, threadId) => {
+  const runs = [new Error('Claude Code exited early'), fresh]
+  await withClaudeChat(false, runs, async (app, { threadId, sessionId, launches }) => {
     const failed = await app.turnCompleted(await app.startTurn(threadId, 'hello again'))
     assert.equal(failed.status, 'failed')
-    assert.equal(app.store.getThread(threadId)?.claudeSessionId, null)
+    assert.equal(app.store.getThread(threadId)?.claudeSessionId, sessionId)
     const next = await app.turnCompleted(await app.startTurn(threadId, 'and again'))
     assert.equal(next.status, 'completed')
+    assert.deepEqual(
+      launches.map((options) => options.resume),
+      [undefined, undefined],
+    )
     assert.equal(app.store.getThread(threadId)?.claudeSessionId, fresh)
-    // The user heard once that the earlier context is gone.
-    const notices = app.notified('warning').filter((notice) => MISSING_NOTICE.test(notice.message))
-    assert.equal(notices.length, 1)
+    // Each turn that went on without the earlier context said so.
+    assert.equal(missingNotices(app).length, 2)
+  })
+})
+
+test('a chat whose Claude config folder is out of reach fails the turn and keeps its session', async () => {
+  const fresh = randomUUID()
+  await withClaudeChat(true, [fresh], async (app, { threadId, sessionId, config, launches }) => {
+    // The folder is away, as on a volume that is not mounted.
+    await rename(config, `${config}.away`)
+    const failed = await app.turnCompleted(await app.startTurn(threadId, 'hello'))
+    assert.equal(failed.status, 'failed')
+    assert.match(failed.error.message, /transcript could not be read/)
+    assert.equal(launches.length, 0)
+    assert.equal(app.store.getThread(threadId)?.claudeSessionId, sessionId)
+    await rename(`${config}.away`, config)
+    const resumed = await app.turnCompleted(await app.startTurn(threadId, 'again'))
+    assert.equal(resumed.status, 'completed')
+    assert.equal(launches[0]?.resume, sessionId)
+    assert.equal(missingNotices(app).length, 0)
+  })
+})
+
+test('a fork whose first turn failed before Claude started still forks its parent session', async () => {
+  const forked = randomUUID()
+  const runs = [new Error('Claude Code exited early'), forked, forked]
+  await withClaudeChat(true, runs, async (app, { threadId, sessionId, launches }) => {
+    const fork = (await app.request('thread/fork', { threadId })).thread.id
+    assert.equal(app.store.getThread(fork)?.claudeSessionId, sessionId)
+    for (const text of ['one', 'two', 'three'])
+      await app.turnCompleted(await app.startTurn(fork, text))
+    assert.deepEqual(
+      launches.map((options) => [options.resume, options.forkSession === true]),
+      [
+        [sessionId, true],
+        // Its parent's session is never resumed as the fork's own.
+        [sessionId, true],
+        [forked, false],
+      ],
+    )
+    assert.equal(app.store.getThread(threadId)?.claudeSessionId, sessionId)
   })
 })

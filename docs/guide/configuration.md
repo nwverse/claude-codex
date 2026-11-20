@@ -119,7 +119,11 @@ the CLI looks.
 When the transcript is gone, for example after Claude Code deleted sessions
 older than its `cleanupPeriodDays`, the chat continues in a new Claude session
 and a notice says the earlier conversation could not be found. This holds
-whether or not the workspace moved.
+whether or not the workspace moved. Only a transcript that is certainly gone
+counts: when the Claude config folder, its `projects` folder or a transcript
+lookup cannot be read (an unmounted volume, a permission or privacy block),
+the turn fails and the chat keeps its session, so a message sent once the
+folder is back resumes the conversation.
 
 If the previous workspace has multiple candidate transcripts, or a same-ID
 file at the destination has diverged, the turn reports an error and preserves
