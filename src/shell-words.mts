@@ -87,6 +87,19 @@ export function parseLine(line: string): ParsedLine | null {
   let redirected = false
   let commandName = ''
   const cases: CaseState[] = []
+  // The first )) at or after `closeFrom` (-1 for none), found once for a
+  // run of (( starts; and whether one scan already reached the end of the
+  // line, so later starts with no )) after them need not look again.
+  let closeFrom = -1
+  let close = -1
+  let openToEnd = false
+  const firstClose = (from: number): number => {
+    if (closeFrom < 0 || from < closeFrom || (close >= 0 && from > close)) {
+      closeFrom = from
+      close = line.indexOf('))', from)
+    }
+    return close
+  }
   let array = false
   let test = false
   const reading = (): 'commands' | 'patterns' | 'array' | 'test' => {
@@ -262,7 +275,9 @@ export function parseLine(line: string): ParsedLine | null {
       // command, unless its first group closes before the end: ((a) | (b))
       // is two subshells.
       if (parts.length === 0 && next === '(' && reservedOnly && !redirected) {
-        const end = arithmeticCommandEnd(line, index)
+        const closing = firstClose(index + 2)
+        const end = closing < 0 && openToEnd ? 0 : arithmeticCommandEnd(line, index, closing)
+        if (closing < 0 && end === 0) openToEnd = true
         if (end === null) return null
         if (end > 0) {
           index = end - 1
@@ -571,22 +586,33 @@ function braceEnd(line: string, open: number, nesting = 0): number | null {
   return null
 }
 
-// Where an arithmetic command (( ... )) ends; 0 when it is subshells after
-// all, null when it holds a substitution or quotes.
-function arithmeticCommandEnd(line: string, open: number): number | null {
+// Where an arithmetic command (( ... )) ends: at `close`, the first ))
+// after it, where zsh ends it. 0 when its first group closes before that
+// (((a) | (b)) is two subshells) or nothing closes it; null when bash would
+// end it elsewhere (an unbalanced ( inside, also within ${...}), or it holds
+// what could hide or run a command: ; or a newline, a comment, a
+// substitution or quotes. The scan stops at `close`, so each start costs at
+// most that far.
+function arithmeticCommandEnd(line: string, open: number, close: number): number | null {
   let depth = 0
-  for (let scan = open; scan < line.length; scan += 1) {
+  const end = close < 0 ? line.length : close
+  for (let scan = open; scan < end; scan += 1) {
     const char = line[scan] ?? ''
     if (char === '(') depth += 1
     else if (char === ')') {
       depth -= 1
-      if (depth === 1) {
-        if (line[scan + 1] !== ')') return 0
-        return /[`'"\\]|\$\(/.test(line.slice(open + 2, scan)) ? null : scan + 2
-      }
-    }
+      if (depth === 1) return 0
+    } else if (
+      char === ';' ||
+      char === '\n' ||
+      (char === '#' && /\s/.test(line[scan - 1] ?? '')) ||
+      (char === '$' && line[scan + 1] === '(') ||
+      '`\'"\\'.includes(char)
+    )
+      return null
   }
-  return 0
+  if (close < 0) return 0
+  return depth === 2 ? close + 2 : null
 }
 
 // Where $((...)) ends; null when it is a command substitution after all

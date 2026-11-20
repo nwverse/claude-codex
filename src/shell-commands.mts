@@ -195,20 +195,22 @@ const NO_SCOPE: Scope = { bashEnv: false, env: false, arrays: false }
 function collect(line: string, depth: number, outer: Scope, out: Candidates): boolean {
   if (depth > MAX_DEPTH) return false
   const parsed = parseLine(line)
-  if (parsed === null || runsLater(line)) return false
+  if (parsed === null || runsLater(line, parsed.commands)) return false
   if (evaluatesHiddenText(line, parsed.commands, parsed.subscripts)) return false
+  // Named in the raw line or in a word with its quotes removed.
+  const texts = `${line}\n${parsed.commands.flatMap((words) => words.map((word) => word.text)).join('\n')}`
   const scope: Scope = {
-    bashEnv: outer.bashEnv || /\bBASH_ENV\b/.test(line),
-    env: outer.env || /\bENV\b/.test(line),
+    bashEnv: outer.bashEnv || /\bBASH_ENV\b/.test(texts),
+    env: outer.env || /\bENV\b/.test(texts),
     arrays: outer.arrays || makesArrays(line, parsed.commands),
   }
   return parsed.commands.every((words) => analyze(words, depth, scope, out))
 }
 
-// Whether a line makes an array: name=(...), read -a, mapfile, or a
-// declaration with -a or -A.
+// Whether a line makes an array: name=(...), name[i]=..., read -a,
+// mapfile, or a declaration with -a or -A.
 function makesArrays(line: string, commands: readonly (readonly Word[])[]): boolean {
-  if (/[A-Za-z0-9_]\+?=\(/.test(line)) return true
+  if (/[A-Za-z0-9_]\+?=\(|[A-Za-z_][A-Za-z0-9_]*\[[^\]\n]{0,256}\]\+?=/.test(line)) return true
   return commands.some((words) =>
     words.some((word, at) => {
       const name = programName(word.text)
@@ -499,12 +501,31 @@ function trapRuns(call: Call): number[] | null {
 // -A, or made one on the same line.
 function declareRuns(call: Call): number[] | null {
   if (call.args.some((arg) => arg.includes('=('))) return null
-  if (!call.scope.arrays || !['declare', 'local', 'typeset'].includes(call.name)) return []
-  const expands = call.args.some(
-    (arg) => /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/.test(arg) && arg.includes(UNKNOWN),
-  )
-  return expands ? null : []
+  if (!['declare', 'local', 'typeset'].includes(call.name)) return []
+  for (const arg of call.args) {
+    const name = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?\+?=/.exec(arg)?.[1]
+    if (name && arg.includes(UNKNOWN) && (call.scope.arrays || BASH_ARRAYS.has(name))) return null
+  }
+  return []
 }
+
+// The arrays bash makes itself.
+const BASH_ARRAYS = new Set([
+  'BASH_ALIASES',
+  'BASH_ARGC',
+  'BASH_ARGV',
+  'BASH_CMDS',
+  'BASH_LINENO',
+  'BASH_REMATCH',
+  'BASH_SOURCE',
+  'BASH_VERSINFO',
+  'COMP_WORDS',
+  'COPROC',
+  'DIRSTACK',
+  'FUNCNAME',
+  'GROUPS',
+  'PIPESTATUS',
+])
 
 // mapfile -C runs its callback every few lines it reads.
 function mapfileRuns(call: Call): number[] | null {

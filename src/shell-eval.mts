@@ -1,20 +1,96 @@
-import type { Word } from './shell-words.mjs'
+import { RESERVED, type Word } from './shell-words.mjs'
 import { UNKNOWN } from './wildcards.mjs'
 
 // Text a command line has the shell run later, which reading the line once
-// cannot follow (see shell-commands.mts). Both checks read the raw line,
-// quoted text included, so a bash -c or eval script counts too.
+// cannot follow (see shell-commands.mts). The checks read the raw line,
+// quoted text included, so a bash -c or eval script counts too, and the
+// parsed words, quotes removed, so `'PS''4'` is PS4 as well.
 
 // Names whose setting runs text later, however they are set: PS4 (set -x
 // expands it before each command), an exported bash function, zsh's
-// function and alias tables, and zsh's glob_subst (a glob qualifier in a
-// variable runs code), which sh and ksh emulation turn on.
+// function, alias and option tables, and zsh's glob_subst (a glob qualifier
+// in a variable runs code), which sh and ksh emulation turn on.
 const RUNS_LATER =
-  /\bPS4\b|BASH_FUNC_|\b(?:dis_)?(?:functions|aliases|galiases|saliases)(?:\[|\+?=)|\bemulate\s+(?:-\w+\s+)*(?:sh|ksh)\b/
-const GLOB_SUBST = /glob_?subst/i
+  /\bPS4\b|BASH_FUNC_|\b(?:dis_)?(?:functions|aliases|galiases|saliases)(?:\[|\+?=)|\boptions\[|\bemulate\s+(?:-\w+\s+)*(?:sh|ksh)\b/
+// zsh's tables, which `set -A name` fills.
+const TABLES = /^(?:dis_)?(?:functions|aliases|galiases|saliases|options)$/
 
-export function runsLater(line: string): boolean {
-  return RUNS_LATER.test(line) || GLOB_SUBST.test(line)
+// zsh ignores case and underscores in option names.
+function globSubst(text: string): boolean {
+  return text.toLowerCase().replaceAll('_', '').includes('globsubst')
+}
+
+export function runsLater(line: string, commands: readonly (readonly Word[])[]): boolean {
+  if (RUNS_LATER.test(line) || globSubst(line)) return true
+  return commands.some(
+    (words) =>
+      words.some((word) => RUNS_LATER.test(word.text) || globSubst(word.text)) ||
+      hidesTarget(words),
+  )
+}
+
+// A name with no expansion in it, as a setter's target should be.
+function isLiteralName(text: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\u0000]*\])?$/.test(text)
+}
+
+// Whether a builtin that sets variables or options names its target with
+// text built when the line runs (n=PS; printf -v "${n}4" ...): what it sets
+// cannot be told, so neither can what that runs later.
+function hidesTarget(words: readonly Word[]): boolean {
+  let at = 0
+  while (
+    at < words.length &&
+    (words[at]?.assignment === 'yes' ||
+      (words[at]?.plain === true && RESERVED.has(words[at]?.text ?? '')))
+  )
+    at += 1
+  const program = words[at]?.text ?? ''
+  const name = program.slice(program.lastIndexOf('/') + 1)
+  const args = words.slice(at + 1).map((word) => word.text)
+  // The values of the options in `valueTargets`, which name a target, and
+  // the operands after the options; `values` are the options that take a
+  // value.
+  const targets = (values: string, valueTargets = ''): { named: string[]; rest: string[] } => {
+    const found: string[] = []
+    let index = 0
+    for (; index < args.length; index += 1) {
+      const arg = args[index] ?? ''
+      if (arg === '--') {
+        index += 1
+        break
+      }
+      if (!/^[-+][a-zA-Z]+$/.test(arg)) break
+      const letters = arg.slice(1)
+      const valued = [...letters].findIndex((letter) => values.includes(letter))
+      if (valued < 0) continue
+      const value = valued < letters.length - 1 ? letters.slice(valued + 1) : (args[++index] ?? '')
+      if (valueTargets.includes(letters[valued] ?? '')) found.push(value)
+    }
+    return { named: found, rest: args.slice(index) }
+  }
+  let checked: string[] = []
+  if (name === 'printf') checked = targets('v', 'v').named
+  else if (name === 'wait') checked = targets('fnp', 'p').named
+  else if (name === 'read') {
+    const { named, rest } = targets('adinNptu', 'a')
+    checked = [...named, ...rest]
+  } else if (name === 'mapfile' || name === 'readarray')
+    checked = targets('dnOsuCc').rest.slice(0, 1)
+  else if (name === 'getopts') checked = targets('').rest.slice(1, 2)
+  else if (/^(?:declare|typeset|local|export|readonly|integer|float)$/.test(name))
+    checked = targets('').rest.map((arg) => /^[^=+]*/.exec(arg)?.[0] ?? '')
+  else if (name === 'set') {
+    // set -A name (zsh, ksh), set -o option.
+    const option = args.findIndex((arg) => /^[-+][a-zA-Z]*[Ao]$/.test(arg))
+    if (option >= 0) {
+      const target = args[option + 1] ?? ''
+      if (/A$/.test(args[option] ?? '') && TABLES.test(target)) return true
+      checked = [target]
+    }
+  } else if (name === 'setopt' || name === 'unsetopt')
+    return args.some((arg) => arg.includes(UNKNOWN))
+  return checked.some((target) => !isLiteralName(target))
 }
 
 // bash and zsh evaluate array subscripts and arithmetic, following names
@@ -23,9 +99,10 @@ export function runsLater(line: string): boolean {
 // unknown when a subscript in it holds an expansion or a printf escape
 // (`subscripts`, from shell-words.mts), or when what it evaluates names a
 // variable filled from text the line does not show: read, mapfile,
-// printf -v, getopts, select and for targets, ${x:=...}, and assignments
-// whose value holds [, $, a backtick, a backslash or unknown text, or names
-// such a variable. A line that evaluates nothing asks for none of this.
+// printf -v, getopts, select and for targets, ${x:=...}, the positional
+// parameters, and assignments whose value holds [, $, a backtick, a
+// backslash or unknown text, or names such a variable. A line that
+// evaluates nothing asks for none of this.
 export function evaluatesHiddenText(
   line: string,
   commands: readonly (readonly Word[])[],
@@ -37,6 +114,9 @@ export function evaluatesHiddenText(
   const tainted = taintedNames(line, commands)
   return [...evaluated].some((name) => tainted.all || tainted.names.has(name))
 }
+
+// What stands for the positional parameters ($1, ${2}, $@, $*) among names.
+const POSITIONAL = '$@'
 
 // Builtins that evaluate the names (and subscripts) they are given.
 const NAMING =
@@ -51,8 +131,9 @@ function declaresInteger(commands: readonly (readonly Word[])[]): boolean {
       const name = word.text.slice(word.text.lastIndexOf('/') + 1)
       if (name === 'integer') return true
       if (!DECLARATIONS.has(name)) return false
-      const options = words.slice(at + 1).filter((arg) => /^[-+][a-zA-Z]+$/.test(arg.text))
-      return options.some((option) => option.text.includes('i'))
+      for (let option = at + 1; /^[-+][a-zA-Z]+$/.test(words[option]?.text ?? ''); option += 1)
+        if (words[option]?.text.includes('i')) return true
+      return false
     }),
   )
 }
@@ -67,8 +148,9 @@ function nextOf(line: string, test: (char: string) => boolean): Int32Array {
   return next
 }
 
-// The names a line evaluates as arithmetic or as a variable name; null when
-// it evaluates nothing.
+// The names a line evaluates as arithmetic or as a variable name, with
+// POSITIONAL for the positional parameters; null when it evaluates nothing.
+// A name after ${# is not one: its length is.
 function evaluatedNames(line: string, commands: readonly (readonly Word[])[]): Set<string> | null {
   const length = line.length
   const marks = new Int32Array(length + 1)
@@ -105,7 +187,9 @@ function evaluatedNames(line: string, commands: readonly (readonly Word[])[]): S
       const indirect = line[at] === '!'
       if (indirect || line[at] === '#') at += 1
       const end = /[@*0-9]/.test(line[at] ?? '') ? at + 1 : nameAt(at)
-      if (indirect) mark(at, end)
+      // ${!a[@]} lists keys and ${!a@} names, not what a names.
+      const listing = /^(?:\[[@*]\]|[@*])/.test(line.slice(end, end + 3))
+      if (indirect && !listing) mark(at, end)
       let after = end
       if (line[end] === '[') {
         const shut = close[end + 1] ?? length
@@ -150,13 +234,19 @@ function evaluatedNames(line: string, commands: readonly (readonly Word[])[]): S
   if (naming) found = true
   const integer = declaresInteger(commands)
   if (!found && !integer) return null
-  const names = new Set<string>()
-  let depth = 0
-  let from = 0
-  for (const match of line.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) {
-    for (; from <= match.index; from += 1) depth += marks[from] ?? 0
-    if (depth > 0) names.add(match[0])
+  const depth = new Int32Array(length + 1)
+  for (let index = 0, running = 0; index < length; index += 1) {
+    running += marks[index] ?? 0
+    depth[index] = running
   }
+  const names = new Set<string>()
+  for (const match of line.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) {
+    const before = line.slice(Math.max(0, match.index - 3), match.index)
+    if ((depth[match.index] ?? 0) > 0 && !/(?:\$\{|\$)#$/.test(before)) names.add(match[0])
+  }
+  // $1, ${2}, $@ and $* take what the caller passed.
+  for (const match of line.matchAll(/\$\{?[0-9@*]/g))
+    if ((depth[match.index] ?? 0) > 0) names.add(POSITIONAL)
   // After an integer declaration, every assignment is arithmetic.
   if (integer)
     for (const words of commands)
@@ -173,7 +263,7 @@ function taintedNames(
   line: string,
   commands: readonly (readonly Word[])[],
 ): { all: boolean; names: Set<string> } {
-  const names = new Set<string>()
+  const names = new Set<string>([POSITIONAL])
   let all = false
   const separator = nextOf(line, (char) => ';&|\n'.includes(char))
   // What is read after each setter, at most 1 KB each and 256 KB in all;
@@ -207,32 +297,39 @@ function taintedNames(
     names.add({ read: 'REPLY', select: 'REPLY', getopts: 'OPTARG' }[command] ?? 'MAPFILE')
   }
   // for NAME in LIST takes what the list expands to; without `in`, the
-  // positional parameters.
+  // positional parameters. An indexed array's keys (${!a[@]}) are numbers.
+  const associative = /\s[-+][a-zA-Z]*A\b/.test(line)
   for (const match of line.matchAll(/\bfor\s+([A-Za-z_][A-Za-z0-9_]*)/g)) {
     const rest = textAfter(match.index + match[0].length)
-    const list = /^\s+in\b([\s\S]*)$/.exec(rest)?.[1]
+    const list = /^\s+in\b([^;\n]*)/.exec(rest)?.[1]
+    if (list !== undefined && !associative && /^\s*"?\$\{![A-Za-z_]\w*\[[@*]\]\}"?\s*$/.test(list))
+      continue
     if (list === undefined || /[[$`\\*?{]/.test(list)) names.add(match[1] ?? '')
   }
   for (const match of line.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*):?=/g)) names.add(match[1] ?? '')
   // An array's elements are not read.
   for (const match of line.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\+?=\(/g)) names.add(match[1] ?? '')
   // Assignments, and the names whose value is another name.
-  const links: [string, string][] = []
+  const pointedAt = new Map<string, string[]>()
   for (const words of commands)
     for (const word of words) {
       const assignment = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?\+?=([\s\S]*)$/.exec(word.text)
       if (!assignment) continue
       const [, target = '', value = ''] = assignment
       if (/[[$`\\]/.test(value) || (value.includes(UNKNOWN) && word.free)) names.add(target)
-      else if (isName(value)) links.push([target, value])
-    }
-  for (let grew = true; grew; ) {
-    grew = false
-    for (const [target, value] of links)
-      if (names.has(value) && !names.has(target)) {
-        names.add(target)
-        grew = true
+      else if (isName(value)) {
+        const pointing = pointedAt.get(value)
+        if (pointing) pointing.push(target)
+        else pointedAt.set(value, [target])
       }
-  }
+    }
+  // A name that names a filled one is filled too, however long the chain.
+  const pending = [...names]
+  for (let filled = pending.pop(); filled !== undefined; filled = pending.pop())
+    for (const target of pointedAt.get(filled) ?? [])
+      if (!names.has(target)) {
+        names.add(target)
+        pending.push(target)
+      }
   return { all, names }
 }

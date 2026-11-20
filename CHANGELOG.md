@@ -1084,18 +1084,19 @@ versioning or publishing metadata.
   glob or extended pattern group anywhere (`ls *.(ts|js)`, `ls !(x)`: zsh's
   `*(e:…:)` runs code), and text the shell runs later. That last one is
   found by name wherever the line sets it (an assignment, `export`,
-  `printf -v`, `${…:=…}`): `PS4`, `BASH_ENV` on a line that starts a shell,
+  `printf -v`, `${…:=…}`), quoted or not, and a setter whose target name is
+  built when the line runs counts too: `PS4`, `BASH_ENV` on a line that starts a shell,
   `ENV` on one that starts an interactive `sh`, `dash` or `ksh`, zsh's
   function and alias tables, `glob_subst` and `zstyle -e`, an exported
   `BASH_FUNC_`, `${(e)…}`, `$~x`, `${x@P}`, `mapfile -C`, and a declaration
   that reads an expansion into an array. On a line that evaluates
   arithmetic or names (`(( ))`, `$(( ))`, `let`, `${s:x}`, `a[x]=`, `${!x}`,
   `read`, `printf -v` and the like), so is a subscript holding an expansion,
-  and an evaluated name filled from `read`, `printf -v` or text with `[`,
-  `$` or an escape in it. A guard that cannot check a call (one with
+  and an evaluated name filled from `read`, `printf -v`, the positional
+  parameters or text with `[`, `$` or an escape in it. A guard that cannot check a call (one with
   thousands of options or a path of thousands of `x/../` parts) asks instead
   of failing, which let the call through. `case` patterns, array elements,
-  `[[ … ]]` and `(( … ))` tests, `[$TICKET]` or `[\x00-\x7F]` in a message or
+  `[[ … ]]` and `(( … ))` tests, array index loops, `[$TICKET]` or `[\x00-\x7F]` in a message or
   a regular expression, `ENV=prod bash deploy.sh`, `timeout 5 grep rm`,
   `command -v rm` and plain `$((…))` no longer ask under `Bash(rm:*)`, a
   rule with several `*` no longer takes seconds to match a long command,

@@ -495,6 +495,90 @@ test('GNU parallel inputs end its command, and many reserved words read in linea
   assert.ok(performance.now() - start < 5000)
 })
 
+test('an arithmetic command ends where bash and zsh both end it, and $1 in it is hidden text', () => {
+  // zsh ends (( at the first )); bash counts the parens inside ${...}.
+  for (const line of ['(( ${x:-((} )); rm -rf build # ))', '(( ${x:-((} )); rm -rf build; : # ))'])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+  // The positional parameters come from the caller.
+  for (const line of [
+    "x='a['; x+='$(rm -rf build)]'; set -- \"$x\"; (( $1 ))",
+    "f() { (( $1 )); }; x='a['; x+='$(rm -rf build)]'; f \"$x\"",
+    'f() { echo $(( ${1} + 1 )); }; f "$y"',
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+  for (const line of [
+    'if (( $# > 0 )); then echo args; fi',
+    'while (( i < 10 )); do (( i++ )); done',
+    '(( n = 16#ff ))',
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), false, line)
+})
+
+test('long chains of names and runs of (( read in linear time', () => {
+  let chain = ''
+  for (let index = 0; index < 15000; index += 1) chain += `a${index}=a${index + 1}; `
+  for (const [rule, line, asks] of [
+    ['rm:*', `${chain}read a15000; (( a0 ))`, true],
+    ['git push:*', `${'(( '.repeat(66000)}; rm -rf build`, true],
+    ['rm:*', `echo ${'(('.repeat(60000)}`, false],
+    ['rm:*', '(( 1 )); '.repeat(20000), false],
+  ] as const) {
+    const start = performance.now()
+    assert.equal(bashRuleCovers(rule, line), asks, line.slice(0, 40))
+    assert.ok(
+      performance.now() - start < 1000,
+      `${line.slice(0, 40)}: ${performance.now() - start} ms`,
+    )
+  }
+})
+
+test('a setter whose target is built at run time, and quoted names, count as run-later text', () => {
+  for (const line of [
+    "printf -v 'PS''4' '$(rm -rf build)'; set -x; :",
+    'n=PS; printf -v "${n}4" \'$(rm -rf build)\'; set -x; :',
+    'declare "P""S4=\\$(rm -rf build)"; set -x; :',
+    'echo \'rm -rf build\' | { export "BASH_""ENV=/dev/stdin"; bash -c :; }',
+    'echo \'rm -rf build\' | { n=BASH; printf -v "${n}_ENV" /dev/stdin; export "${n}_ENV"; bash -c :; }',
+    "n=y; printf -v \"$n\" '%s%s' 'a[' '$(rm -rf build)]'; (( y ))",
+    'typeset "func""tions[f]=rm -rf build"; f',
+    "n=functions; set -A $n f 'rm -rf build'; f",
+    "set -A functions f 'rm -rf build'; f",
+    "setopt glo_bsubst; x='*(e:rm -rf build:)'; ls $x",
+    "setopt GLOB_S_UBST; x='*(e:rm -rf build:)'; ls $x",
+    "n=globsub; setopt ${n}st; x='*(e:rm -rf build:)'; ls $x",
+    'options[globsubst]=on; ls $x',
+    // Arrays declare reads an expansion into: made by a[i]=, or bash's own.
+    "x[0]=1; y='($(rm -rf build))'; declare x=$y",
+    "y='($(rm -rf build))'; declare PIPESTATUS=$y",
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+  for (const line of [
+    "printf 'rm -rf %s' x",
+    'export "FOO=bar"',
+    'read -r -p "Name: " name',
+    'local -a files=("$@")',
+    'declare x=$y',
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), false, line)
+})
+
+test('array index loops are not read as evaluating hidden text', () => {
+  for (const line of [
+    'for i in "${!arr[@]}"; do echo "$i ${arr[$i]}"; done',
+    'arr=(a b c); for i in "${!arr[@]}"; do echo "$i: ${arr[$i]}"; done',
+    'arr=(a b c); for ((i=0; i<${#arr[@]}; i++)); do echo "$i ${arr[i]}"; done',
+    'files=(*.ts); for ((i=0; i<${#files[@]}; i++)); do echo "${files[$i]}"; done',
+    'arr=(a b c); i=0; while (( i < ${#arr[@]} )); do echo "${arr[i]}"; ((i++)); done',
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), false, line)
+  // Keys of an associative array are text, and ${!x} still follows a name.
+  for (const line of [
+    'declare -A m; read k; m[$k]=1; for i in "${!m[@]}"; do (( i )); done',
+    "x='a['; x+='$(rm -rf build)]'; echo ${!x}",
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+})
+
 test('only a command name matches in any case, and only where the system ignores case', () => {
   const folds = process.platform === 'darwin' || process.platform === 'win32'
   assert.equal(bashRuleCovers('rm -rf:*', 'RM -rf build'), folds)
