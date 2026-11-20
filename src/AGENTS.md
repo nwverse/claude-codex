@@ -82,6 +82,10 @@ Codex and Claude Code config bridging:
 - `shell-commands.mts` — every command a Bash command line may run (wrappers,
   `sh -c`, `eval`, `xargs`, `find -exec`), read as bash and zsh read it and
   failing closed, for the ask rules and hook `if` conditions.
+- `shell-words.mts` — a command line read into simple commands and words
+  (quotes, expansions, case patterns, arrays, `[[ ]]`) for `shell-commands.mts`.
+- `wildcards.mts` — text with wildcards on both sides (a rule's `*`, what the
+  shell expands) compared in linear time.
 - `permission-suggestions.mts` — Claude's "don't ask again" suggestions mapped
   to the App's approval-card choices (session rules and folders only with
   `CLAUDE_CODEX_SESSION_SUGGESTIONS=1`).

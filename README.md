@@ -331,9 +331,12 @@ matches them as Claude Code does and errs towards asking: a Bash rule covers
 each command of a compound command line, what wrappers such as `sudo`,
 `timeout`, `xargs`, `find -exec` or `sh -c` run whatever their options, and the
 command of a `Monitor` call; a word the shell expands (`$VAR`, a glob) may stand
-for any text, and a command line whose commands only the shell can tell
-(command substitution, a heredoc, a shell reading its commands from stdin) is
-asked about under any Bash rule, since it could run anything. An `Edit` rule
+for any text, a command name matches in any case on macOS and Windows, and a
+command line whose commands only the shell can tell (command substitution, a
+heredoc, a shell reading its commands from stdin, a zsh glob or extended
+pattern group, text the shell runs later such as `$(…)` in an array subscript)
+is asked about under any Bash rule, since it could run anything; so is a call
+the guard cannot check. An `Edit` rule
 covers every tool that edits files, a `Read` rule `Glob` and `Grep` by the
 folder they search and the folder a glob starts from; file rules match paths in
 any case and through symlinks, and `*` in a tool name or a `domain:` works as in

@@ -685,6 +685,45 @@ test("a hook's if is matched as an ask rule is, against the tool call", async ()
   }
 })
 
+test("a hook's if covers a Monitor call's command, reads :* at a word boundary and fails closed", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-if-bash-')))
+  const log = join(root, 'log')
+  try {
+    const session = (rule: string) =>
+      claudeHookSession([spec({ if: rule, command: `echo hit >> '${log}'` })], {
+        projectDir: root,
+        approvals: true,
+      }).hooks
+    const hits = () =>
+      readFile(log, 'utf8').then(
+        (text) => text.trim().split('\n').length,
+        () => 0,
+      )
+    const run = (hooks: SdkHooks, tool_name: string, command: string) =>
+      call(hooks, 'PreToolUse', { cwd: root, tool_name, tool_input: { command, description: 'x' } })
+    const push = session('Bash(git push:*)')
+    // Claude Code checks a Monitor call's command under the Bash rules.
+    await run(push, 'Monitor', 'tail -f log')
+    assert.equal(await hits(), 0)
+    await run(push, 'Monitor', 'git push origin main')
+    assert.equal(await hits(), 1)
+    // npm run test:* ends at a word: npm run test:unit is another script.
+    const tests = session('Bash(npm run test:*)')
+    await run(tests, 'Bash', 'npm run test:unit')
+    assert.equal(await hits(), 1)
+    await run(tests, 'Bash', 'npm run test -- --watch')
+    assert.equal(await hits(), 2)
+    // Thousands of options are read without failing the hook, and a line
+    // with too many readings to take apart meets the condition.
+    await run(push, 'Bash', `sudo ${'-z '.repeat(8000)}git push`)
+    assert.equal(await hits(), 3)
+    await run(push, 'Bash', `sudo ${'-z a '.repeat(3000)}ls`)
+    assert.equal(await hits(), 4)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('the SessionEnd hooks of a session share one budget', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-end-budget-')))
   const sessionEnd = (timeoutSec: number) => spec({ event: 'SessionEnd', timeoutSec })

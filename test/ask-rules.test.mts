@@ -173,9 +173,7 @@ test('a word the shell expands may be any text under a Bash ask rule', () => {
     // Assignments the shell takes before a command.
     'FOO+=1 rm -rf build',
     'a[1]=x rm -rf build',
-    // macOS finds a command whatever its case; zsh runs =cmd from the PATH.
-    'RM -rf build',
-    '/BIN/RM -rf build',
+    // zsh runs =cmd from the PATH.
     '=rm -rf build',
     '{fd}>/dev/null rm -rf build',
     // zsh's short forms run a command right after a test or a brace.
@@ -195,7 +193,6 @@ test('a word the shell expands may be any text under a Bash ask rule', () => {
     assert.equal(bashRuleCovers('git push:*', line), true, line)
   assert.equal(bashRuleCovers('git push *', 'git $SUB'), true)
   assert.equal(bashRuleCovers('git push:*', 'git "$SUB" origin'), true)
-  assert.equal(bashRuleCovers('git push:*', 'GIT PUSH'), true)
   // An exact rule naming a compound command covers that line.
   assert.equal(bashRuleCovers('git add . && git push', 'git add . && git push'), true)
 })
@@ -228,9 +225,177 @@ test('Bash ask rules are matched in time linear in the command', () => {
   const start = performance.now()
   assert.equal(bashRuleCovers('* a * b * c * d *', `echo ${'a b c '.repeat(400)}`), false)
   assert.equal(bashRuleCovers('rm:*', `sudo ${'-z a '.repeat(100)}ls`), false)
-  // A command too big to take apart asks.
-  assert.equal(bashRuleCovers('rm:*', `echo ${'a[b]{c,d}*?'.repeat(20000)}`), true)
+  // A command line with too many readings to take apart asks.
+  assert.equal(bashRuleCovers('rm:*', `sudo ${'-z a '.repeat(3000)}ls`), true)
+  // One long command is still read, and so is a long host.
+  assert.equal(bashRuleCovers('git push:*', `echo '${'{"a":1}'.repeat(25000)}' | jq .`), false)
+  const host = `https://${'a.'.repeat(5000)}com/`
+  assert.equal(
+    askRuleCovers('WebFetch(domain:*.*.*.example.com)', 'WebFetch', { url: host }, '/'),
+    false,
+  )
   assert.ok(performance.now() - start < 5000)
+})
+
+test('pathological input makes the ask guard ask rather than throw', async () => {
+  const guard = askRulesGuard(['Bash(rm:*)', 'Read(~/.ssh/**)'], '/')
+  const decision = async (tool_name: string, tool_input: Record<string, unknown>) => {
+    const output = await guard.hooks[0]?.({ tool_name, tool_input }, undefined, {
+      signal: new AbortController().signal,
+    })
+    return (output?.hookSpecificOutput as Record<string, unknown> | undefined)?.permissionDecision
+  }
+  // Thousands of options, and a path of thousands of x/../ parts.
+  assert.equal(await decision('Bash', { command: `sudo ${'-z '.repeat(8000)}rm -rf build` }), 'ask')
+  assert.equal(
+    await decision('Bash', { command: `nice ${'-z '.repeat(60000)}rm -rf build` }),
+    'ask',
+  )
+  const deep = `/tmp/${'x/../'.repeat(5000)}zz`
+  assert.equal(await decision('Read', { file_path: deep }), 'ask')
+  // A call the guard cannot read is asked about.
+  const unreadable = {
+    get command(): string {
+      throw new Error('unreadable')
+    },
+  }
+  assert.equal(await decision('Bash', unreadable), 'ask')
+})
+
+test('a Bash ask rule reads $((...)) and ${...} as bash and zsh do', () => {
+  // $((cmd)|(cmd)) closes its first group early: command substitution.
+  for (const line of [
+    'echo $((rm -rf build)|(cat))',
+    'echo $((rm -rf build) && (true))',
+    'x=$((rm -rf build) || (true)); echo $x',
+    // bash closes ${...} at its first }, whatever braces or quotes come
+    // before; ${ cmd; } runs cmd.
+    'echo ${x:-{}; rm -rf build; echo }',
+    "echo ${x:-'{'}; rm -rf build; echo }",
+    'echo "${x:-{}"; rm -rf build; echo "}"',
+    'echo ${x#{}; rm -rf build; echo }',
+    'echo ${ rm -rf build; }',
+    'echo ${| rm -rf build; }',
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+  for (const line of ['echo $((1 + 2))', 'count=$((count + 1))', 'echo "${HOME}/x" ${#arr[@]}'])
+    assert.equal(bashRuleCovers('rm:*', line), false, line)
+})
+
+test('a Bash ask rule asks where quoted text runs as code later', () => {
+  for (const line of [
+    // zsh: (e) evaluates, ~ globs (a qualifier can run code), the function
+    // table defines.
+    "x='$(rm -rf build)'; echo ${(e)x}",
+    "x='*(e:rm -rf build:)'; ls $~x",
+    "x='*(e:rm -rf build:)'; ls ${~x}",
+    "functions[f]='rm -rf build'; f",
+    // bash: PS4 under set -x, @P, exported functions, arrays declare reads
+    // again, mapfile's callback.
+    "PS4='$(rm -rf build)'; set -x; :",
+    "PS4='$(rm -rf build)' bash -xc :",
+    "x='$(rm -rf build)'; echo ${x@P}",
+    "env 'BASH_FUNC_f%%=() { rm -rf build; }' bash -c f",
+    "declare -a 'x=($(rm -rf build))'",
+    "echo x | mapfile -c 1 -C 'rm -rf build' arr",
+    // A subscript evaluated later, with its $ built when the line runs.
+    'd=\'$\'; x="a[${d}(rm -rf build)]"; (( x ))',
+    "printf -v x 'a[\\x24(rm -rf build)]'; (( x ))",
+    "x='a[b[1]+$(rm -rf build)]'; (( x ))",
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+})
+
+test('a Bash ask rule takes env and sudo assignments whatever their quoting', () => {
+  for (const line of [
+    "env 'FOO=1' rm -rf build",
+    'sudo "FOO=1" rm -rf build',
+    'env A\\=1 rm -rf build',
+    'doas "A=1" rm -rf build',
+  ])
+    assert.equal(bashRuleCovers('rm:*', line), true, line)
+})
+
+test('a shell reading stdin through a path or after BASH_ENV asks under any Bash rule', () => {
+  for (const line of [
+    "echo 'rm -rf build' | bash /dev/stdin",
+    "echo 'rm -rf build' | zsh /dev/stdin",
+    "echo 'rm -rf build' | sh /dev/fd/0",
+    "echo 'rm -rf build' | bash /proc/self/fd/0",
+    'echo "$CMD" | bash "$SCRIPT"',
+    "echo 'rm -rf build' | source /dev/stdin",
+    "echo 'rm -rf build' | . /dev/stdin",
+    "echo 'rm -rf build' | BASH_ENV=/dev/stdin bash -c true",
+    "echo 'rm -rf build' | env ENV=/dev/stdin sh -i",
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+  for (const line of ['bash ./build.sh', 'source ~/.nvm/nvm.sh && nvm use', 'bash "$HOME/x.sh"'])
+    assert.equal(bashRuleCovers('git push:*', line), false, line)
+})
+
+test('wrappers that run their input, or a shell, with no command ask', () => {
+  for (const line of [
+    "parallel ::: 'rm -rf build'",
+    "echo 'rm -rf build' | parallel",
+    "echo 'rm -rf build' | script -q /dev/null",
+    "echo 'rm -rf build' | doas -s",
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+  for (const line of [
+    'autoload zargs; zargs -- *.tmp -- rm -rf',
+    'gtimeout 5 rm -rf build',
+    'xcrun rm -rf build',
+    "sandbox-exec -p '(version 1)' rm -rf build",
+  ])
+    assert.equal(bashRuleCovers('rm:*', line), true, line)
+  for (const line of ['parallel -k echo ::: a b', 'script -q /dev/null make', 'sudo -u admin ls'])
+    assert.equal(bashRuleCovers('git push:*', line), false, line)
+})
+
+test('case patterns, array elements, [[ ]] tests and markdown are not read as commands', () => {
+  for (const line of [
+    'case "$1" in start|stop) echo ok;; *) echo no;; esac',
+    'case $f in *.md|*.txt) echo doc;; *) echo other;; esac',
+    'while [[ $# -gt 0 ]]; do case "$1" in --dry-run) DRY=1; shift;; *) shift;; esac; done',
+    'case "$1" in\n  -h|--help) usage;;\n  (*) run "$@";;\nesac',
+    'files=(*.ts); echo ${#files[@]}',
+    'declare -a arr=(src/*.ts)',
+    '[[ $v =~ v([0-9]+)\\.([0-9]+) ]] && echo "${BASH_REMATCH[1]}"',
+    'if [[ "$OSTYPE" =~ ^(darwin|linux) ]]; then echo unix; fi',
+    '[[ $x == @(a|b) ]] && echo ab',
+    '[[ $a == 1 && $b == 2 ]] && echo both',
+    "git commit -m 'fix(guard): handle [x] in `foo`'",
+    'git commit -m "fix: [x] use \\`foo\\`"',
+    "gh pr create --title t --body 'See [the docs](https://x.dev) and run `npm test`.'",
+  ]) {
+    assert.equal(bashRuleCovers('git push:*', line), false, line)
+    assert.equal(bashRuleCovers('zzz-no-such-command:*', line), false, line)
+  }
+  // What a case, an array or a test leaves to run still counts.
+  for (const line of [
+    'case x in a) git push;; esac',
+    'case x in a) echo;; *) git push;; esac',
+    'case x in (a|b) echo;; esac; git push',
+    'files=(*.ts) git push',
+    '[[ -n x ]] && git push',
+    '[[ -n x ]] git push',
+    '[[ a ]]&&git push',
+    '[[ a ]]||git push',
+    'x=1 [[ a || git push ]]',
+    'case x in $(git push)) echo;; esac',
+    'a=( $(git push) )',
+    'echo =(git push)',
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+})
+
+test('only a command name matches in any case, and only where the system ignores case', () => {
+  const folds = process.platform === 'darwin' || process.platform === 'win32'
+  assert.equal(bashRuleCovers('rm -rf:*', 'RM -rf build'), folds)
+  assert.equal(bashRuleCovers('rm -rf:*', '/BIN/RM -rf build'), folds)
+  assert.equal(bashRuleCovers('Git push:*', 'git push'), folds)
+  assert.equal(bashRuleCovers('git branch -D:*', 'git branch -d old'), false)
+  assert.equal(bashRuleCovers('git push:*', 'git PUSH'), false)
 })
 
 test('a Bash ask rule covers the command a Monitor call runs', () => {
@@ -336,6 +501,7 @@ test('domain, tool-name and subagent ask rules cover what Claude Code covers', (
   // Renamed tools, and a call that names no subagent runs the default one.
   assert.equal(covers('KillShell', 'TaskStop'), true)
   assert.equal(covers('Agent(general-purpose)', 'Agent'), true)
+  assert.equal(covers('Agent(Explore)', 'Agent'), false)
   assert.equal(covers('Task(reviewer)', 'Agent', { subagent_type: 'reviewer' }), true)
 })
 

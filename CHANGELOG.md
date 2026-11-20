@@ -986,20 +986,29 @@ versioning or publishing metadata.
   prompt: a shell's `-c` script after its other options (`bash -c -e '…'`) or
   behind a wrapper (`nohup sh -c 'cd app && git push'`); wrappers it did not
   know, whichever of their options take a value (`setsid`, `flock`, `env -S`,
-  `watch`, `su -c`, `trap`, `sudo -EH -u root`, zsh's `noglob`, `-` and
-  `repeat`, and more); what `xargs` and `find -exec` add; words the shell
-  expands (`$'…'`, `$VAR` arguments, globs and brace lists, also in a command
-  name); a command in another case or as zsh's `=cmd`; zsh's short `if` and
-  `always` forms; a `Monitor` call's command; file paths in another case,
-  through `..` after a symlink, relative to the session's current folder, or
-  where a `Glob` pattern points; `*` in a tool name or a `domain:`, and a
-  `domain:` with a trailing dot, a port or a non-ASCII name; and a subagent
-  call that names no `subagent_type`. A command line whose commands cannot be
-  told apart (a shell reading stdin, an `alias`, an array subscript holding
-  `$(…)`, a zsh glob in a command name) is asked about under any Bash rule.
-  `timeout 5 grep rm`, `command -v rm` and `$((…))` no longer ask under
-  `Bash(rm:*)`, and a rule with several `*` no longer takes seconds to match a
-  long command, blocking the adapter meanwhile. (#346)
+  `watch`, `su -c`, `trap`, `sudo -EH -u root`, `env 'FOO=1'`, zsh's `noglob`,
+  `-` and `repeat`, `zargs`, and more); what `xargs` and `find -exec` add;
+  words the shell expands (`$'…'`, `$VAR` arguments, globs and brace lists,
+  also in a command name); on macOS, a command name in another case; zsh's
+  `=cmd` and its short `if` and `always` forms; a `Monitor` call's command;
+  file paths in another case, through `..` after a symlink, relative to the
+  session's current folder, or where a `Glob` pattern points; `*` in a tool
+  name or a `domain:`, and a `domain:` with a trailing dot, a port or a
+  non-ASCII name. A command line whose commands cannot be told apart is asked
+  about under any Bash rule: a shell or `source` reading stdin (also through
+  `/dev/stdin` or after `BASH_ENV=`), `parallel` or `script` with no command,
+  an `alias`, a zsh glob or extended pattern group anywhere (`ls *.(ts|js)`,
+  `ls !(x)`: zsh's `*(e:…:)` runs code), and text the shell runs later (an
+  array subscript holding `$(…)` or an expansion, `PS4`, `${(e)…}`, `$~x`,
+  `${x@P}`, zsh's function table, an exported `BASH_FUNC_`, `declare
+  'x=(…)'`, `mapfile -C`). A guard that cannot check a call (one with
+  thousands of options or a path of thousands of `x/../` parts) asks instead
+  of failing, which let the call through. `case` patterns, array elements,
+  `[[ … ]]` tests, `timeout 5 grep rm`, `command -v rm` and plain `$((…))` no
+  longer ask under `Bash(rm:*)`, a rule with several `*` no longer takes
+  seconds to match a long command, blocking the adapter meanwhile, and an
+  `Agent(…)` rule covers a call with no `subagent_type` only when it names
+  `general-purpose`. (#346)
 
 ### Trustworthy history and settings
 

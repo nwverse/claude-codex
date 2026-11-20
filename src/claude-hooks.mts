@@ -376,11 +376,16 @@ export function claudeHookSession(
 }
 
 // Whether a tool call meets a hook's `if`: the call an ask rule written the
-// same way would cover. Relative paths start from the call's folder.
+// same way would cover. Relative paths start from the call's folder. A call
+// that cannot be checked meets it, as one Claude Code cannot parse does.
 function conditionMet(rule: string, input: Record<string, unknown>, projectDir: string): boolean {
   const tool = typeof input.tool_name === 'string' ? input.tool_name : ''
   const cwd = typeof input.cwd === 'string' && input.cwd ? input.cwd : projectDir
-  return askRuleCovers(rule, tool, asTable(input.tool_input) ?? {}, cwd)
+  try {
+    return askRuleCovers(rule, tool, asTable(input.tool_input) ?? {}, cwd)
+  } catch {
+    return true
+  }
 }
 
 // Whether a hook's matcher takes a query, as the CLI decides: every query
