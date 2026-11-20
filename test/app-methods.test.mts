@@ -509,8 +509,39 @@ test('adapter homes whose config.json links to one file keep every simultaneous 
       assert.equal(saved.model, 'opus')
       for (const [i, key] of keys.entries()) assert.equal(saved.overrides[key], i, key)
       assert.equal((await lstat(link)).isSymbolicLink(), true)
+      // The lock beside it is the owner's alone.
+      assert.equal((await stat(`${file}.lock.sqlite`)).mode & 0o777, 0o600)
     } finally {
       await b.close()
+    }
+  })
+})
+
+test('a config.json linked into a read-only folder answers unchanged saves and refuses changes', {
+  skip: process.platform === 'win32' || process.getuid?.() === 0,
+}, async () => {
+  await withServer(async (server) => {
+    // Its home exists once it answers.
+    await server.request('config/read')
+    const dotfiles = join(server.home, 'dotfiles')
+    const target = join(dotfiles, 'claude-codex.json')
+    await mkdir(dotfiles)
+    await writeFile(target, JSON.stringify({ model: 'opus' }))
+    await symlink(target, join(server.home, 'claude-codex-adapter', 'config.json'))
+    await chmod(target, 0o444)
+    await chmod(dotfiles, 0o555)
+    try {
+      const unchanged = await server.request('config/value/write', {
+        keyPath: 'model',
+        value: 'opus',
+      })
+      assert.equal(unchanged.status, 'ok')
+      await assert.rejects(
+        server.request('config/value/write', { keyPath: 'model', value: 'sonnet' }),
+        (error: Error) => error.message.includes('EACCES') && error.message.includes(target),
+      )
+    } finally {
+      await chmod(dotfiles, 0o755)
     }
   })
 })

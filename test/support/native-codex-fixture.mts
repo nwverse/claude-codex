@@ -91,13 +91,14 @@ function handle(message) {
 }
 `
 
-export function nativeCodexTestEnv(home: string): NodeJS.ProcessEnv {
+// `log` lists what the fake children hear; adapters sharing a home can keep
+// separate ones.
+export function nativeCodexTestEnv(home: string, log = join(home, 'fake.log')): NodeJS.ProcessEnv {
   const script = join(home, 'fake-codex.cjs')
   writeFileSync(script, FAKE_CODEX)
   const binary = join(home, 'codex')
   writeFileSync(binary, `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`)
   chmodSync(binary, 0o755)
-  const log = join(home, 'fake.log')
   writeFileSync(log, '')
   return {
     HOME: home,

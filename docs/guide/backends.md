@@ -49,10 +49,15 @@ conversations continue on their original route, which runs only the default
 Codex provider, so they refuse Codex+AsterGate models. Turning native mode off
 keeps native sidebar entries. Re-enable it to reopen them.
 
-Adapters that share a state directory take turns on a native chat. While one
-runs a turn, the others refuse to start, steer, interrupt, compact, review,
-roll back, revert, archive or delete it until the turn ends or its adapter
-exits.
+Adapters that share a state directory never run a native chat at the same
+time. While one runs a turn or changes the chat, the others refuse to start,
+steer, interrupt, compact, review, roll back, revert, inject into, set the goal
+of, archive or delete it, until that ends or the adapter exits. Continuing one
+native chat from two adapters in turn is not supported yet: each adapter's
+Codex child keeps the conversation it loaded, so it does not see turns the
+other adapter added later and continues from what it saw. Use one adapter per
+native chat at a time; a child that was stopped (after
+`CLAUDE_CODEX_NATIVE_IDLE_MS`, or with its adapter) loads the chat afresh.
 
 Fresh title helpers run on Claude. A description fork of a native chat uses
 its parent’s provider and rollout, so that provider processes the description.

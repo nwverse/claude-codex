@@ -1313,6 +1313,12 @@ export class SessionStore {
         .prepare(`UPDATE threads SET native_active_owner_pid = ?, native_active_owner_started = ?
         WHERE id = ?`)
         .run(self.pid, self.started, threadId)
+      // The turn of an owner that exited ended with it.
+      if (owner)
+        this.db
+          .prepare(`UPDATE threads SET status_json = ?, updated_at = ?
+          WHERE id = ? AND json_extract(status_json, '$.type') = 'active'`)
+          .run(JSON.stringify({ type: 'idle' }), nowSeconds(), threadId)
       return true
     })
   }
@@ -1361,10 +1367,12 @@ export class SessionStore {
       )
   }
 
-  updateNativeThreadStatus(threadId: string, status: ThreadStatus): void {
+  // A status other than active ends this adapter's claim, unless it still
+  // holds it for a request or turn of its own.
+  updateNativeThreadStatus(threadId: string, status: ThreadStatus, keepClaim = false): void {
     const owner = currentProcessOwner()
     const release =
-      status.type === 'active'
+      status.type === 'active' || keepClaim
         ? ''
         : ', native_active_owner_pid = NULL, native_active_owner_started = NULL'
     this.db

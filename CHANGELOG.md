@@ -22,13 +22,18 @@ versioning or publishing metadata.
   without native mode. Opening a Claude chat, or a native chat of the other
   provider, while the composer was on another harness's model used to fail
   with "cannot change runtime backend … start a new thread". (#337)
-- Adapters sharing a state directory take turns on a native Codex chat, as
-  they do on Claude chats: while one adapter's turn runs, another refuses
-  `turn/start`, shell commands, reviews, compaction, rollback, revert, steer,
-  interrupt, archive and delete with "has an active turn in another adapter
-  process". Two `codex app-server` children used to run or rewrite the same
-  rollout at once. A turn left by an adapter that exited does not block the
-  next one. (#337)
+- Adapters sharing a state directory no longer run a native Codex chat at the
+  same time. While one adapter's turn or change runs, another refuses
+  `turn/start`, shell commands, reviews, compaction, rollback, revert, item
+  injection, goal changes, steer, interrupt, archive and delete with "has an
+  active turn in another adapter process", as for Claude chats. Two `codex
+  app-server` children used to run or rewrite the same rollout at once. The
+  claim ends with the turn, the request, the adapter or its Codex child; a
+  turn Codex accepted but never announced holds it for
+  `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` at most. Continuing one native chat from
+  two adapters in turn is still unsupported: each adapter's Codex child keeps
+  the conversation it loaded and does not see turns the other one added
+  later. (#337)
 - With native mode on, an existing `codex exec` chat, and a fork the adapter
   makes itself, refuse a Codex+AsterGate model ("start a new thread"); a
   resume ignores one. Such a chat used to accept the model and then fail every
@@ -893,9 +898,12 @@ versioning or publishing metadata.
 
 - Settings saves from adapters whose `config.json` is a link to one shared
   file all stay. Each save is now locked next to the file the link points to,
-  as the shared Claude model and command catalogs are; adapters with different
-  state directories used to overwrite each other's simultaneous saves while
-  reporting each one as saved. (#337)
+  in an empty owner-only `config.json.lock.sqlite`, as the shared Claude model
+  and command catalogs are; adapters with different state directories used to
+  overwrite each other's simultaneous saves while reporting each one as saved.
+  A link into a folder the adapter cannot write (read-only dotfiles) takes no
+  lock: unchanged saves succeed and changes fail on the file, as before.
+  (#337)
 - A deleted chat stays deleted and a rename sticks when a `turn/start`
   arrives at the same time, for example from a second window on the same
   chat. `turn/start` re-reads the thread after waiting on a running turn

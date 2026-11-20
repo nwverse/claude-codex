@@ -81,9 +81,9 @@ const FORWARDED = new Set([
 // its rollout stays in step.
 const MIRRORED = new Set(['thread/name/set', 'thread/archive', 'thread/unarchive', 'thread/delete'])
 
-// Requests that run or rewrite the rollout. Adapters sharing the state
-// directory take turns: each holds the thread's native claim while its child
-// does one, and keeps it while a turn it started runs.
+// Requests that run or rewrite the rollout. One adapter's child at a time
+// does: the adapter holds the thread's native claim while such a request is
+// in flight and while a turn it started runs.
 const CLAIMING = new Set([
   'turn/start',
   'thread/shellCommand',
@@ -91,6 +91,8 @@ const CLAIMING = new Set([
   'thread/compact/start',
   'thread/rollback',
   'thread/revert',
+  'thread/inject_items',
+  'thread/goal/set',
   'thread/archive',
   'thread/delete',
 ])
@@ -134,6 +136,12 @@ export class CodexNativeBridge {
   private readonly activeTurns = new Map<string, ActiveTurn>()
   private readonly pendingRequests = new Map<string, { threadId: string; turnId: string | null }>()
   private readonly changesInFlight = new Set<string>()
+  // Claiming requests in flight, by thread.
+  private readonly claimsInFlight = new Map<string, number>()
+  // Turns the child accepted but has yet to announce, by thread.
+  private readonly unannounced = new Map<string, { provider: string; timer: NodeJS.Timeout }>()
+  // turn/started notifications so far, by thread.
+  private readonly turnStarts = new Map<string, number>()
   private idleTimer: NodeJS.Timeout | null = null
 
   constructor(host: CodexBridgeHost) {
@@ -150,6 +158,7 @@ export class CodexNativeBridge {
     const children = [...this.children.values()].map((child) => child.close())
     this.children.clear()
     for (const id of this.pendingRequests.keys()) this.finishRequest(id)
+    this.releaseUnannounced()
     await Promise.all(children)
     for (const id of this.activeTurns.keys())
       this.host.store.updateNativeThreadStatus(id, { type: 'idle' })
@@ -184,6 +193,13 @@ export class CodexNativeBridge {
         (startsTurn || method === 'thread/settings/update' || MIRRORED.has(method)))
     )
       throw invalidRequest('another change is in progress on this thread; retry when it finishes')
+    // Another adapter's child would run a second turn on the rollout, or
+    // rewrite it under the running one. Refused before the model check below
+    // can save a change; the claim itself is taken once the request is known
+    // to be the native harness's.
+    const claims = CLAIMING.has(method)
+    if ((claims || TURN_CONTROL.has(method)) && this.host.store.hasForeignNativeTurn(threadId))
+      throw foreignTurnError(threadId)
     const model = requestedModel(params)
     if (model && ['thread/resume', 'thread/settings/update', 'turn/start'].includes(method)) {
       const current = this.host.store.getThread(threadId)
@@ -224,21 +240,16 @@ export class CodexNativeBridge {
           'a fork uses its parent’s Codex provider; start a new chat to switch providers',
         )
     }
-    // Another adapter's child would run a second turn on the rollout, or
-    // rewrite it under the running one.
-    const claims = CLAIMING.has(method)
-    if (
-      claims
-        ? !this.host.store.claimNativeTurn(threadId)
-        : TURN_CONTROL.has(method) && this.host.store.hasForeignNativeTurn(threadId)
-    )
-      throw foreignTurnError(threadId)
+    if (claims) {
+      if (!this.host.store.claimNativeTurn(threadId)) throw foreignTurnError(threadId)
+      this.claimsInFlight.set(threadId, (this.claimsInFlight.get(threadId) ?? 0) + 1)
+    }
     this.host.subscribe(thread.id, peer)
     this.requestsInFlight += 1
     this.clearIdleTimer()
     if (startsTurn) this.startingTurns.set(threadId, new Set())
     if (MIRRORED.has(method)) this.changesInFlight.add(threadId)
-    let announcedTurn = false
+    const startsBefore = this.turnStarts.get(threadId) ?? 0
     try {
       if (!thread.codexSessionId) await this.createChildThread(thread)
       if (MIRRORED.has(method)) {
@@ -259,6 +270,7 @@ export class CodexNativeBridge {
         )
         if (stopsWork) {
           this.activeTurns.delete(threadId)
+          this.clearUnannounced(threadId)
           this.finishThreadRequests(threadId)
           this.loaded.get(child.provider)?.ids.delete(childId)
         }
@@ -270,15 +282,20 @@ export class CodexNativeBridge {
           const resumed = asRecord(await this.forward(thread, 'thread/resume', { threadId }))
           return { thread: resumed.thread }
         }
-        if (method === 'thread/delete')
+        if (method === 'thread/delete') {
           this.adapterIdByChild.delete(thread.codexSessionId as string)
+          this.turnStarts.delete(threadId)
+        }
         return local
       }
       const result = await this.forward(thread, method, params)
       // A detached review runs on a thread of its own.
-      announcedTurn =
+      if (
         ANNOUNCED_TURN.has(method) &&
+        (this.turnStarts.get(threadId) ?? 0) === startsBefore &&
         (stringField(asRecord(result).reviewThreadId) ?? threadId) === threadId
+      )
+        this.awaitTurn(threadId, thread.nativeCodexProvider as string)
       if (method === 'thread/settings/update') return NOT_ROUTED
       if (model && (method === 'turn/start' || method === 'thread/resume')) {
         const current = this.host.store.getThread(threadId)
@@ -286,15 +303,59 @@ export class CodexNativeBridge {
       }
       return result
     } finally {
-      // A turn started on the thread keeps the claim until it ends.
-      if (claims && !announcedTurn && !this.activeTurns.has(threadId))
-        this.host.store.releaseNativeTurn(threadId)
+      if (claims) {
+        const left = (this.claimsInFlight.get(threadId) ?? 1) - 1
+        if (left > 0) this.claimsInFlight.set(threadId, left)
+        else this.claimsInFlight.delete(threadId)
+        this.settleClaim(threadId)
+      }
       if (MIRRORED.has(method)) this.changesInFlight.delete(threadId)
       if (startsTurn) this.startingTurns.delete(threadId)
       this.requestsInFlight -= 1
       this.host.checkIdle()
       this.scheduleIdleStop()
     }
+  }
+
+  // Codex answers a shell command, review or compaction before it announces
+  // the turn. The claim waits for that, for a while: a child that exits or
+  // stops first, or never announces it, leaves nothing running.
+  private awaitTurn(threadId: string, provider: string): void {
+    this.clearUnannounced(threadId)
+    const timer = setTimeout(() => {
+      this.unannounced.delete(threadId)
+      this.settleClaim(threadId)
+    }, turnWaitMs())
+    timer.unref()
+    this.unannounced.set(threadId, { provider, timer })
+  }
+
+  private clearUnannounced(threadId: string): void {
+    const entry = this.unannounced.get(threadId)
+    if (!entry) return
+    clearTimeout(entry.timer)
+    this.unannounced.delete(threadId)
+  }
+
+  private releaseUnannounced(provider?: string): void {
+    for (const [threadId, entry] of this.unannounced) {
+      if (provider && entry.provider !== provider) continue
+      this.clearUnannounced(threadId)
+      this.settleClaim(threadId)
+    }
+  }
+
+  // Whether this adapter still runs or changes the thread's rollout.
+  private holdsClaim(threadId: string): boolean {
+    return (
+      this.claimsInFlight.has(threadId) ||
+      this.activeTurns.has(threadId) ||
+      this.unannounced.has(threadId)
+    )
+  }
+
+  private settleClaim(threadId: string): void {
+    if (!this.holdsClaim(threadId)) this.host.store.releaseNativeTurn(threadId)
   }
 
   // Children with nothing to do for a while are stopped; the next request
@@ -308,6 +369,7 @@ export class CodexNativeBridge {
       this.idleTimer = null
       if (this.busy()) return this.scheduleIdleStop()
       for (const child of this.children.values()) void child.stop()
+      this.releaseUnannounced()
       debugLog('codexBridge.idleStop', {})
     }, ms)
     this.idleTimer.unref()
@@ -601,6 +663,8 @@ export class CodexNativeBridge {
     switch (method) {
       case 'turn/started': {
         const turnId = stringField(asRecord(params.turn).id)
+        this.turnStarts.set(threadId, (this.turnStarts.get(threadId) ?? 0) + 1)
+        this.clearUnannounced(threadId)
         if (turnId) this.recordActiveTurn(threadId, turnId, thread.nativeCodexProvider as string)
         return
       }
@@ -610,7 +674,12 @@ export class CodexNativeBridge {
         const active = this.activeTurns.get(threadId)
         if (!active || active.turnId === turnId) {
           this.activeTurns.delete(threadId)
-          this.host.store.updateNativeThreadStatus(threadId, { type: 'idle' })
+          this.clearUnannounced(threadId)
+          this.host.store.updateNativeThreadStatus(
+            threadId,
+            { type: 'idle' },
+            this.holdsClaim(threadId),
+          )
         }
         if (turnId) this.finishThreadRequests(threadId, turnId)
         this.host.checkIdle()
@@ -619,7 +688,11 @@ export class CodexNativeBridge {
       case 'thread/status/changed': {
         const status = asRecord(params.status)
         if (typeof status.type === 'string')
-          this.host.store.updateNativeThreadStatus(threadId, status as ThreadRecord['status'])
+          this.host.store.updateNativeThreadStatus(
+            threadId,
+            status as ThreadRecord['status'],
+            this.holdsClaim(threadId),
+          )
         return
       }
       case 'thread/name/updated': {
@@ -717,8 +790,13 @@ export class CodexNativeBridge {
         method: 'thread/status/changed',
         params: { threadId, status: { type: 'idle' } },
       })
-      this.host.store.updateNativeThreadStatus(threadId, { type: 'idle' })
+      this.host.store.updateNativeThreadStatus(
+        threadId,
+        { type: 'idle' },
+        this.claimsInFlight.has(threadId),
+      )
     }
+    this.releaseUnannounced(provider)
     for (const id of this.pendingRequests.keys()) {
       if (id.startsWith(`cx:${provider}:${generation}:`)) this.finishRequest(id)
     }
@@ -731,6 +809,12 @@ export class CodexNativeBridge {
     if (!child || childRequestId === undefined || childRequestId === null) return null
     return `cx:${provider}:${child.generation}:${String(childRequestId)}`
   }
+}
+
+// How long a claim waits for Codex to announce a turn it accepted.
+function turnWaitMs(): number {
+  const ms = Number(process.env.CLAUDE_CODEX_NATIVE_TURN_WAIT_MS)
+  return ms > 0 ? ms : 30_000
 }
 
 function requestedModel(params: Record<string, unknown>): string | null {
