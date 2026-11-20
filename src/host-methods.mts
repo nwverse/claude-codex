@@ -1,9 +1,10 @@
 // App-server methods for features Codex gets from OpenAI's services or from
 // its own host: connectors, the plugin catalog, remote control, passkey
-// verification and account extras. Claude Code has none of them, so each
-// method reports the state that holds here (nothing installed, disabled,
-// unavailable) and only an action that cannot happen fails. An unanswered
-// method would surface in the App as a broken request.
+// verification, account extras, model providers and feedback bundles.
+// Claude Code has none of them, so each method reports the state that holds
+// here (nothing installed, disabled, unavailable) and only an action that
+// cannot happen fails. An unanswered method would surface in the App as a
+// broken request.
 
 import { createHash } from 'node:crypto'
 import { homedir, hostname } from 'node:os'
@@ -138,16 +139,41 @@ export function hostMethod(method: string, params: Record<string, unknown>): unk
       return { isGovCloud: false, shouldWarn: false }
     case 'account/bedrock/setup':
       throw new Error('Bedrock is configured in Claude Code, not through the Codex App')
+    case 'account/gcp/setup':
+      throw invalidRequest(
+        'Google Cloud Vertex AI is configured in Claude Code, not through the Codex App',
+      )
     case 'account/gatewayOAuth/read':
       return { providerId: '', providerName: '', required: false, status: null, error: null }
     case 'account/gatewayOAuth/login':
       throw new Error('no model provider here signs in through a gateway')
     case 'account/gatewayOAuth/cancel':
       return {}
+    // Codex's model providers. Every thread here reports claude-code, as
+    // config/read's model_provider does, and that is none of the kinds the
+    // App's provider settings show or edit (OpenAI, gateway, Bedrock, GCP).
+    case 'modelProvider/list':
+      return { data: [], defaultProviderId: 'claude-code', canChangeDefault: false }
+    case 'modelProvider/config/write':
+      throw invalidRequest(
+        'model providers are configured in Claude Code, not through the Codex App',
+      )
+    // The ChatGPT sign-ins the App's workspace switcher lists; there are none.
+    case 'accountSession/list':
+      return { activeSessionId: null, sessions: [] }
+    case 'accountSession/switch':
+      throw invalidRequest(
+        'there is no ChatGPT sign-in to switch to: Claude Code signs in on its own',
+      )
     case 'account/rateLimitResetCredit/consume':
       return { outcome: 'noCredit' }
     case 'account/workspaceMessages/read':
       return { featureEnabled: false, messages: [] }
+    // Codex writes its logs and the thread's rollout into a ZIP at savePath.
+    // The adapter has neither to bundle, and an answer without the file
+    // would have the App report it saved.
+    case 'feedback/save':
+      throw invalidRequest('saving a feedback bundle is not supported with Claude Code')
     // Every environment runs on this machine.
     case 'environment/info':
       return {

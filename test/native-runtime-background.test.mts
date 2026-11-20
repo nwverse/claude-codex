@@ -53,6 +53,8 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
   prompts: Record<string, unknown>[] = []
   interrupts = 0
   stoppedTasks: string[] = []
+  // Whether stopTask never answers, as a wedged session does.
+  stopHangs = false
   closed = false
   // What mcpServerStatus answers; null makes it fail, and 'hang' never
   // answers, as a wedged session does.
@@ -85,6 +87,7 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
 
   async stopTask(taskId: string): Promise<void> {
     this.stoppedTasks.push(taskId)
+    if (this.stopHangs) return new Promise(() => {})
   }
 
   async mcpServerStatus(): Promise<Record<string, unknown>[]> {
@@ -876,6 +879,26 @@ test('native MCP reload retries only the servers an open session could not reach
   await waitFor(() => listener.released.length === 1, 'session release')
   await runtime.reloadMcpServers()
   assert.deepEqual(query.reconnects, ['docs', 'search'])
+  await runtime.stop()
+})
+
+test('native stopTask gives up on a session that never answers the stop', async () => {
+  const { runtime, queries } = fakeRuntime()
+  runtime.setBackgroundListener(recordingListener())
+  const first = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(...launchBackgroundAgent('a8'))
+  await first
+
+  // A delete or archive waits on the stop; a wedged session must not hold
+  // it up for good.
+  query.stopHangs = true
+  const asked = Date.now()
+  assert.equal(await runtime.stopTask('thread', 'a8'), false)
+  const waited = Date.now() - asked
+  assert.ok(waited >= 4_000 && waited < 8_000, `waited ${waited} ms`)
+  assert.deepEqual(query.stoppedTasks, ['a8'])
+  query.stopHangs = false
   await runtime.stop()
 })
 

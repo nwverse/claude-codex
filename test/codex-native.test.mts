@@ -222,6 +222,67 @@ test('a GPT chat runs in the ChatGPT child', async () => {
   }
 })
 
+test("a native chat's deferred items and memory summary come from its child", async () => {
+  const app = startAdapter()
+  try {
+    await initialize(app)
+    const started = await app.request('thread/start', { model: 'gpt-6.1-sol', cwd: app.home })
+    const threadId = started.result.thread.id as string
+    await runTurn(app, threadId, 'decline')
+    for (const [method, params] of [
+      ['thread/items/read', { threadId, turnId: 'turn-old', itemIds: ['c1'] }],
+      ['thread/memory/read', { threadId }],
+    ] as const) {
+      const answer = await app.request(method, params)
+      assert.equal(answer.error, undefined, `${method}: ${JSON.stringify(answer.error)}`)
+      const heard = app.childLog().filter((entry) => entry.method === method)
+      assert.equal(heard.length, 1, method)
+      assert.match(heard[0].params.threadId, /^openai-thread-/)
+    }
+  } finally {
+    await app.stop()
+  }
+})
+
+// The child's thread/read carries its readState, from which the App marks the
+// chat read or unread. A -32601 here would turn server read state off for
+// the whole connection.
+test("a native chat's read state is its child's, conflicts included", async () => {
+  const app = startAdapter()
+  try {
+    await initialize(app)
+    const started = await app.request('thread/start', { model: 'gpt-6.1-sol', cwd: app.home })
+    const threadId = started.result.thread.id as string
+    await runTurn(app, threadId, 'decline')
+    const update = (expectedRevision: string) =>
+      app.request('thread/readState/update', {
+        threadId,
+        operation: { type: 'unread' },
+        expectedRevision,
+      })
+
+    const updated = await update('r1')
+    assert.equal(updated.error, undefined, JSON.stringify(updated.error))
+    assert.deepEqual(updated.result, {
+      readState: { firstUnread: { type: 'threadStart' }, revision: 'r2' },
+    })
+    const heard = app.childLog().filter((entry) => entry.method === 'thread/readState/update')
+    assert.equal(heard.length, 1)
+    assert.match(heard[0].params.threadId, /^openai-thread-/)
+
+    // The App reads the conflict's code and data.
+    const stale = await update('r0')
+    assert.equal(stale.error.code, -32600)
+    assert.equal(stale.error.message, 'read state changed')
+    assert.deepEqual(stale.error.data, {
+      reason: 'readStateConflict',
+      readState: { firstUnread: null, revision: 'r1' },
+    })
+  } finally {
+    await app.stop()
+  }
+})
+
 test('a chat keeps its harness once it has a conversation; a new one can still move', async () => {
   const app = startAdapter()
   try {

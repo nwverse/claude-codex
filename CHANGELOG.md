@@ -43,6 +43,12 @@ versioning or publishing metadata.
   the rest of its process group with it, as a stopped one does, so helpers it
   started, such as MCP servers that ignore stdin EOF, no longer run on after
   every crash. (#334)
+- With native mode on, `thread/items/read`, `thread/memory/read` and
+  `thread/readState/update` for a native Codex chat go to its Codex child,
+  like the chat's other history requests. The App can load a command output
+  Codex left out of a history page, and marking a native chat read or unread
+  no longer gets `-32601`, which turned the App's server read state off for
+  the whole connection. (#343)
 
 ### `ws://` listener authentication
 
@@ -276,6 +282,21 @@ versioning or publishing metadata.
 - The note that tells Claude which Codex App tools it lacks also names
   `delete_thread`, which App 26.1111's thread instructions mention. (#347)
 
+- Ten of the eleven requests Codex App 26.1111 newly calls no longer fail
+  with "method not found". `thread/items/read` returns the stored items it
+  names, `thread/memory/read` reports no memory summary, `modelProvider/list`
+  and `accountSession/list` list no Codex model providers or ChatGPT
+  sign-ins, and `thread/sample/cancel` succeeds. Google Cloud setup, model
+  provider writes, workspace switches, feedback bundles (`feedback/save`) and
+  `thread/sample` fail with `-32600` and say why. The eleventh,
+  `thread/readState/update`, keeps its `-32601` for Claude chats, as Codex
+  answers without its state database: their `thread/read` carries no
+  `readState`, so the App keeps their unread dots itself (App rule
+  `thread-read-state`). (#343)
+- `thread/section/move` now sends `thread/section/changed` to every
+  connected client, as Codex does, so a second App window reloads its
+  sidebar sections after a chat moves into, within or out of a section,
+  the pinned one included. (#343)
 - A file the turn diff leaves out (too large, binary or past the size limit)
   shows as a binary change with the reason after it, which renderers show
   without content and `git apply` refuses. It used to be a one-line hunk that
@@ -350,6 +371,16 @@ versioning or publishing metadata.
   included, instead of losing only its pty bridge. For `command/exec` too,
   the SIGKILL now comes as soon as the command exits if that is before the
   1 s grace ends, and never later. (#334)
+- A stopping adapter refuses `command/exec`, `process/spawn`, `turn/start`,
+  `review/start` and `thread/compact/start` with "server stopped". A `unix://`
+  or `ws://` client still connected while it waited for process groups could
+  start a command that outlived the adapter in its own process group, or a
+  turn that stayed in progress until the next start. (#342)
+- A `process/spawn` without a pty whose process exits while a child it left in
+  the background holds its output open now reports `process/exited` after at
+  most a 2 s drain, as `command/exec` answers, and its handle is free again.
+  It used to stay taken, with no exit, until that child ended: `process/kill`
+  and `timeoutMs` could not end the wait. (#342)
 - A terminal with a TTY (`process/spawn` with `tty`) reports `process/exited`
   as soon as its command exits, after the rest of its output, with the real
   exit code (128+N for a signal, 127 when the command cannot start). It used
@@ -383,6 +414,22 @@ versioning or publishing metadata.
   removing (nor a review or compaction on an archived chat), and the App
   hears nothing more of a deleted thread, such as a `turn/completed` still
   marked `inProgress`. (#328)
+- A turn, review or compaction the App starts just before it deletes,
+  archives or interrupts it no longer starts Claude a moment later, and the
+  App no longer hears its `turn/started` after its `turn/completed` or the
+  chat's `thread/deleted`. (#341)
+- While `thread/archive` waits for the turns in a chat and its subagent
+  threads to stop, a turn, review, compaction or shell command started there
+  is refused with `thread <id> is being archived` instead of running on in
+  the archived chat, and queued messages stay queued. A message queued on a
+  subagent thread of a chat being deleted now goes with it instead of failing
+  with `unknown thread`. Deleting or archiving a chat ends its turns before
+  its background agents, so a turn on a subagent thread can no longer launch
+  an agent that keeps running in the archived chat. A second `thread/archive`
+  or `thread/delete` of the same chat waits for the first and answers with
+  it, instead of finishing early and letting a new turn in, and a background
+  agent whose stop Claude Code never confirms holds either up for at most
+  5 seconds. (#341)
 - Startup recovery streams the completed history and rechecks a turn before
   repairing its activity markers. A report another adapter finished while
   recovery was scanning stays in the conversation.
@@ -585,6 +632,12 @@ versioning or publishing metadata.
   removes a socket at its path only when the socket refuses a connection, so
   of two daemons that do start, the one that binds second leaves the socket
   to the first and exits. (#329)
+- An adapter starting on a new state directory creates its state database in
+  one commit instead of 56. With every commit flushed to disk, that took over
+  200 fsyncs before the first daemon listened, which a busy disk stretched to
+  seconds. The debug log now records when each startup step ends
+  (`adapter.startup`, in ms since the process started), so a slow start shows
+  where the time went. (#345)
 - With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
   Code processes one at a time: a new session waits until the previous
   launch has sent its first SDK message, has ended, or has held the slot for
@@ -1513,6 +1566,14 @@ versioning or publishing metadata.
   Codex harness and the shared process-group and JSON-file helpers, and the
   root AGENTS.md points to the configuration reference table for the full
   list of variables. (#338)
+- `npm audit --omit=dev` reports no known advisories; it reported 9
+  packages (1 critical, 5 high). The lockfile takes fixed versions within the
+  existing ranges: zod 4.6.7, which checks the arguments of the adapter's
+  in-process MCP tools, and the MCP SDK 1.32.2 that npm installs as a peer of
+  the Claude Agent SDK, with its HTTP server packages (`express`'s
+  `body-parser`, `qs` and `proxy-addr`, `hono`, `@hono/node-server`,
+  `ip-address`, `fast-uri`), which the adapter does not load. The Claude Agent
+  SDK stays at 0.3.322. (#340)
 
 ### Validation and release gates
 

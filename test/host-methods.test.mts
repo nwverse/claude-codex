@@ -62,6 +62,38 @@ test('a Bedrock account passes the GovCloud check of the App', () => {
   })
 })
 
+test('model providers, account sessions and feedback bundles are honest about Claude Code', () => {
+  // The App's provider settings list none of claude-code's kind, and it
+  // switches ChatGPT sign-ins, of which there are none.
+  assert.deepEqual(hostMethod('modelProvider/list', {}), {
+    data: [],
+    defaultProviderId: 'claude-code',
+    canChangeDefault: false,
+  })
+  assert.deepEqual(hostMethod('accountSession/list', { refreshWorkspaceMetadata: true }), {
+    activeSessionId: null,
+    sessions: [],
+  })
+  // What only Codex can set up or do is an invalid request with the reason.
+  for (const [method, params, reason] of [
+    ['account/gcp/setup', { projectId: 'p' }, /Vertex AI is configured in Claude Code/],
+    [
+      'modelProvider/config/write',
+      { settings: { type: 'customGateway', name: 'g', baseUrl: 'https://g' } },
+      /model providers are configured in Claude Code/,
+    ],
+    ['accountSession/switch', { sessionId: 's', accountId: 'a' }, /no ChatGPT sign-in/],
+    ['feedback/save', { savePath: '/tmp/f.zip', classification: 'bug' }, /feedback bundle/],
+  ] as const) {
+    assert.throws(
+      () => hostMethod(method, params),
+      (error: unknown) =>
+        error instanceof RpcError && error.code === -32600 && reason.test(error.message),
+      method,
+    )
+  }
+})
+
 test('an unknown method is a JSON-RPC method-not-found error; others are server errors', () => {
   const missing = methodNotFound('thread/prediction/request')
   assert.ok(missing instanceof RpcError)

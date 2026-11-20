@@ -8,6 +8,7 @@ import {
   pageLimit,
   pageTimeline,
   pageTurns,
+  readItems,
   snippetAt,
   threadSnippet,
 } from '../src/thread-history.mjs'
@@ -156,6 +157,35 @@ test('pageItems pages a thread or one turn, with offset and item anchors', () =>
   assert.throws(
     () => pageItems(turns, { turnId: null, cursor: 'x', limit: 1, sortDirection: 'asc' }),
     /invalid item cursor/,
+  )
+})
+
+test('readItems returns the named items of one turn, in its order', () => {
+  const turns = [
+    turn('t1', [user('u1', 'one'), agent('a1', 'one back')]),
+    turn('t2', [user('u2', 'two'), agent('a2', 'two back'), agent('c2', 'aside', 'commentary')]),
+  ]
+  const read = readItems(turns, { turnId: 't2', itemIds: ['c2', 'u2', 'a1', 'gone', 'c2'] })
+  // a1 belongs to another turn and gone to none: both are left out.
+  assert.deepEqual(
+    read.map((entry) => entry.item.id),
+    ['u2', 'c2'],
+  )
+  assert.deepEqual(read[0], {
+    turnId: 't2',
+    item: user('u2', 'two'),
+    startedAtMs: null,
+    completedAtMs: null,
+  })
+  assert.throws(() => readItems(turns, { turnId: 'nope', itemIds: ['u1'] }), /turn not found: nope/)
+  for (const itemIds of [[], Array.from({ length: 101 }, (_, i) => `i${i}`), 'u1', [1], null])
+    assert.throws(
+      () => readItems(turns, { turnId: 't1', itemIds }),
+      /itemIds must contain 1 to 100 IDs/,
+    )
+  assert.equal(
+    readItems(turns, { turnId: 't1', itemIds: Array.from({ length: 100 }, () => 'u1') }).length,
+    1,
   )
 })
 
