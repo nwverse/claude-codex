@@ -99,6 +99,51 @@ test('stopping the server signals each process group once, SIGKILL included, bef
   })
 })
 
+// A stdio client's pipe closing disconnects it before the adapter stops, and a
+// unix or ws client can disconnect just before a launchd stop: stop() still
+// waits for the SIGKILL that the disconnect's stop owes.
+test('stopping the server waits for the stops a disconnect started', {
+  timeout: 20_000,
+}, async (t) => {
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    let pid = 0
+    try {
+      app
+        .call('command/exec', {
+          processId: 'ignores',
+          command: ['sh', '-c', 'trap "" TERM; echo $$; while :; do sleep 0.1; done'],
+          cwd: app.home,
+          streamStdoutStderr: true,
+          disableTimeout: true,
+        })
+        .catch(() => {})
+      pid =
+        (
+          await app.waitFor(() =>
+            printedPids(app, 'command/exec/outputDelta', 'processId', 'ignores'),
+          )
+        )[0] ?? 0
+      const signalled: unknown[] = []
+      const kill = process.kill
+      t.mock.method(process, 'kill', (target: number, signal?: string | number) => {
+        if (Math.abs(target) === pid) signalled.push([target, signal])
+        return kill.call(process, target, signal)
+      })
+
+      app.server.closePeer({ id: 'app', send: () => {}, close: () => {} })
+      await app.server.stop()
+
+      assert.deepEqual(signalled, [
+        [-pid, 'SIGTERM'],
+        [-pid, 'SIGKILL'],
+      ])
+      assert.ok(await exits(pid, 1_000), `process ${pid} outlived the server`)
+    } finally {
+      if (pid && isAlive(pid)) process.kill(pid, 'SIGKILL')
+    }
+  })
+})
+
 // A terminal's process can exit while a child it left in the background holds
 // its pipes, and so its handle, open. Its pid is free by then: a signal to it,
 // or to the group of that id, could reach another process.

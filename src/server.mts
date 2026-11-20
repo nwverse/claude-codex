@@ -757,6 +757,10 @@ export class CodexClaudeAppServer {
   // The connection that started each command/exec and process/spawn process:
   // as in Codex, they end with it. thread/shellCommand's belong to the thread.
   private processOwners = new WeakMap<ChildProcess, string>()
+  // Stops under way, one per process, until each settles: a repeated
+  // process/kill joins the first, and stop() also waits for the ones a
+  // disconnect started after taking the process out of the maps.
+  private processStops = new Map<ChildProcess, Promise<void>>()
   // A watch belongs to the connection that made it: ids are unique per connection.
   private fsWatchers = new WeakMap<RpcPeer, Map<string, PathWatch>>()
   // Goal state lives in the store. These track the hidden continuation turns
@@ -929,7 +933,7 @@ export class CodexClaudeAppServer {
       for (const [id, child] of processes)
         if (this.processOwners.get(child) === peer.id) {
           processes.delete(id)
-          void stopClientProcess(child)
+          void this.stopProcess(child)
         }
   }
 
@@ -941,11 +945,11 @@ export class CodexClaudeAppServer {
     // of reach of a signal to the adapter's group (launchd job stop, Ctrl-C),
     // and a terminal has no timeout: end what is still running.
     const processesStopped = this.stopClientProcesses()
-    this.stopCommandsListener()
-    this.sleepMonitor.stop?.()
-    this.idleSleep.stop()
-    this.leaderThreads.stop()
     try {
+      this.stopCommandsListener()
+      this.sleepMonitor.stop?.()
+      this.idleSleep.stop()
+      this.leaderThreads.stop()
       for (const turnId of this.userShells.keys()) this.stopUserShells(turnId, 'server stopped')
       // Child turns are created directly from Task/Workflow events and are not
       // registered in activeTurnByThread. Finalize them before aborting the
@@ -978,13 +982,25 @@ export class CodexClaudeAppServer {
 
   // Each command/exec and process/spawn process, stopped once: taken out of
   // the maps first, so the clients that disconnect as the adapter goes do not
-  // signal them again. Settles when every one has exited or been sent SIGKILL,
-  // which process.exit() would otherwise drop with its timer.
+  // signal them again. Settles when every one, and every one whose stop was
+  // already under way (a client that disconnected just before), has exited or
+  // been sent SIGKILL, which process.exit() would otherwise drop with its timer.
   private stopClientProcesses(): Promise<unknown> {
     const children = [...this.commandProcesses.values(), ...this.processHandles.values()]
     this.commandProcesses.clear()
     this.processHandles.clear()
-    return Promise.all(children.map(stopClientProcess))
+    for (const child of children) void this.stopProcess(child)
+    return Promise.all(this.processStops.values())
+  }
+
+  // stopClientProcess, kept in processStops until it settles.
+  private stopProcess(child: ChildProcess): Promise<void> {
+    let stopped = this.processStops.get(child)
+    if (!stopped) {
+      stopped = stopClientProcess(child).finally(() => this.processStops.delete(child))
+      this.processStops.set(child, stopped)
+    }
+    return stopped
   }
 
   // Background agents keep running (and Claude may still answer them) after
@@ -9632,8 +9648,7 @@ export class CodexClaudeAppServer {
       params.timeoutMs == null ? defaultTimeout : numberOr(params.timeoutMs, defaultTimeout)
     // Stopped as process/kill stops it: the group with SIGKILL to follow, or
     // the pty bridge's own stop of its shell's session.
-    const timeout =
-      timeoutMs > 0 ? setTimeout(() => void stopClientProcess(child), timeoutMs) : null
+    const timeout = timeoutMs > 0 ? setTimeout(() => void this.stopProcess(child), timeoutMs) : null
 
     child.once('error', (error) => {
       debugLog('process.spawn.error', {
@@ -9720,7 +9735,7 @@ export class CodexClaudeAppServer {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
     if (!child) throw invalidRequest(`unknown process handle: ${processHandle}`)
-    void stopClientProcess(child)
+    void this.stopProcess(child)
     return {}
   }
 

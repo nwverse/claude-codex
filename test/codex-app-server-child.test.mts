@@ -6,8 +6,8 @@ import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { CodexAppServerChild } from '../src/codex-app-server-child.mjs'
 
-// A fake `codex app-server` that starts a helper in its own process group (as
-// an MCP server would run) and exits when asked to, as a crash would.
+// A fake `codex app-server` that starts a helper in its process group (as an
+// MCP server would run) and exits when asked to, as a crash would.
 const FAKE_CODEX = `
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')

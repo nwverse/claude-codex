@@ -46,7 +46,7 @@ test('a process without a pty that reaches timeoutMs is stopped with its group a
         command: ['sh', '-c', script],
         cwd: app.home,
         streamStdoutStderr: true,
-        timeoutMs: 500,
+        timeoutMs: 2_000,
       })
       pids.push(...(await app.waitFor(() => printedPids(app, processHandle))))
     }
