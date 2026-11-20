@@ -7922,7 +7922,8 @@ export class CodexClaudeAppServer {
       return
     }
     const queue = this.queuedSubagentActivity.get(parentThreadId) ?? []
-    queue.push({ context, kind })
+    // The item names the agent only; its prompt stays out of the queue.
+    queue.push({ context: { ...context, prompt: '' }, kind })
     this.queuedSubagentActivity.set(parentThreadId, queue.slice(-MAX_QUEUED_ACTIVITY))
   }
 

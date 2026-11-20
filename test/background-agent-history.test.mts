@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
+import type { ClaudeRuntime } from '../src/types.mjs'
 import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 // The adapter keeps background agents that already reported back, so a
@@ -17,12 +18,12 @@ interface KnownAgent {
   taskId: string | null
   agentId: string | null
   running: boolean
-  context: { childThreadId: string; prompt: string }
+  context: { childThreadId: string; childTurnId: string; prompt: string }
 }
 
 // Each turn launches background agents task-0 and task-1 ('launch'), or
 // sends both a message ('message').
-function backgroundAgentsRuntime() {
+function backgroundAgentsRuntime(extra: Partial<ClaudeRuntime> = {}) {
   const runtime = scriptedRuntime(async (context, handlers) => {
     for (const i of [0, 1]) {
       if (context.prompt === 'launch') {
@@ -59,9 +60,12 @@ function backgroundAgentsRuntime() {
       }
     }
     await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
-  })
+  }, extra)
   return runtime
 }
+
+const knownAgents = (server: object) =>
+  Reflect.get(server, 'backgroundSubagents') as Map<string, KnownAgent>
 
 test('only the most recently finished background agents stay known, and SendMessage still reopens an older one', async () => {
   const runtime = backgroundAgentsRuntime()
@@ -103,20 +107,24 @@ test('only the most recently finished background agents stay known, and SendMess
     await report(parent, 0)
     // As many agents as the adapter keeps (another chat's) finish after the
     // first one ...
-    const known = Reflect.get(app.server, 'backgroundSubagents') as Map<string, KnownAgent>
+    const known = knownAgents(app.server)
     const finished = known.get(first)
     assert.ok(finished)
-    for (let i = 0; i < KEPT; i += 1) {
-      const id = `other-${i}`
-      known.set(id, {
-        ...finished,
-        parentThreadId: 'another-chat',
-        toolUseId: id,
-        taskId: id,
-        agentId: id,
-        context: { ...finished.context, childThreadId: id },
-      })
-    }
+    const another = (id: string, running: boolean): KnownAgent => ({
+      ...finished,
+      parentThreadId: 'another-chat',
+      toolUseId: id,
+      taskId: id,
+      agentId: id,
+      running,
+      context: { ...finished.context, childThreadId: id, childTurnId: id },
+    })
+    for (let i = 0; i < KEPT; i += 1) known.set(`other-${i}`, another(`other-${i}`, false))
+    // Agents still running stay, however many finished, also ahead of them.
+    const entries = [...known]
+    known.clear()
+    for (let i = 0; i < 3; i += 1) known.set(`running-${i}`, another(`running-${i}`, true))
+    for (const [id, entry] of entries) known.set(id, entry)
     // ... and one more pushes it out, with the next oldest that no SendMessage
     // is on its way to.
     const pending = Reflect.get(app.server, 'pendingAgentCalls') as Map<string, unknown>
@@ -128,6 +136,9 @@ test('only the most recently finished background agents stay known, and SendMess
     })
     await report(parent, 1)
     pending.delete('send-other')
+    const running = [...known].filter(([, entry]) => entry.running).map(([id]) => id)
+    assert.deepEqual(running, ['running-0', 'running-1', 'running-2'])
+    for (const id of running) known.delete(id)
     assert.equal(known.size, KEPT)
     assert.equal(known.has(first), false)
     assert.equal(known.has('other-0'), true)
@@ -158,5 +169,40 @@ test('only the most recently finished background agents stay known, and SendMess
       )
       assert.equal(app.store.listTurns(child).at(-1)?.status, 'inProgress')
     }
+  })
+})
+
+// thread/delete forgets the agents of the threads it deletes. A stop that
+// was still on its way to one settles it, and must not bring it back.
+test('a stop that settles an agent the adapter already forgot leaves it forgotten', async () => {
+  let stopCalled = false
+  let finishStop!: (stopped: boolean) => void
+  const runtime = backgroundAgentsRuntime({
+    stopTask: () => {
+      stopCalled = true
+      return new Promise<boolean>((resolve) => {
+        finishStop = resolve
+      })
+    },
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const parent = await app.startThread()
+    await app.turnCompleted(await app.startTurn(parent, 'launch'))
+    const [child] = app
+      .notified('item/completed')
+      .filter((params) => params.item.tool === 'spawnAgent')
+      .map((params) => String(params.item.receiverThreadIds[0]))
+    assert.ok(child)
+    const known = knownAgents(app.server)
+    assert.equal(known.get(child)?.running, true)
+
+    // The user stops the agent from its thread; the CLI takes its time.
+    const stopping = app.request('turn/interrupt', { threadId: child })
+    await app.waitFor(() => (stopCalled ? true : undefined))
+    known.delete(child)
+    finishStop(true)
+    await stopping
+    assert.equal(app.store.listTurns(child).at(-1)?.status, 'interrupted')
+    assert.equal(known.has(child), false)
   })
 })
