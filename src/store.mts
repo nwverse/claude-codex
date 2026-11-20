@@ -1442,21 +1442,16 @@ export class SessionStore {
   }
 
   startNativeTurnActivity(threadId: string): void {
-    const owner = currentProcessOwner()
+    // A turn Codex announces late can find another adapter's turn running on
+    // the claim it took meanwhile; that one keeps the claim and the status.
+    if (!this.claimNativeTurn(threadId)) return
     // An earlier status event may already carry waitingOnApproval or other flags.
     this.db
       .prepare(`
-      UPDATE threads SET native_active_owner_pid = ?, native_active_owner_started = ?,
-        status_json = CASE WHEN json_extract(status_json, '$.type') = 'active'
+      UPDATE threads SET status_json = CASE WHEN json_extract(status_json, '$.type') = 'active'
                            THEN status_json ELSE ? END, updated_at = ?
       WHERE id = ?`)
-      .run(
-        owner.pid,
-        owner.started,
-        JSON.stringify({ type: 'active', activeFlags: [] }),
-        nowSeconds(),
-        threadId,
-      )
+      .run(JSON.stringify({ type: 'active', activeFlags: [] }), nowSeconds(), threadId)
   }
 
   // A status other than active ends this adapter's claim, unless it still

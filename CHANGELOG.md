@@ -30,10 +30,11 @@ versioning or publishing metadata.
   app-server` children used to run or rewrite the same rollout at once. The
   claim ends with the turn, the request, the adapter or its Codex child; a
   turn Codex accepted but never announced holds it for
-  `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` at most. Continuing one native chat from
-  two adapters in turn is still unsupported: each adapter's Codex child keeps
-  the conversation it loaded and does not see turns the other one added
-  later. (#337)
+  `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` at most, and one announced after that
+  leaves another adapter's claim alone. Continuing one native chat from two
+  adapters in turn is still unsupported: each adapter's Codex child keeps the
+  conversation it loaded and does not see turns the other one added later.
+  (#337)
 - With native mode on, an existing `codex exec` chat, and a fork the adapter
   makes itself, refuse a Codex+AsterGate model ("start a new thread"); a
   resume ignores one. Such a chat used to accept the model and then fail every

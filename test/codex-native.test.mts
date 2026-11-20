@@ -750,8 +750,9 @@ function nativeOwner(home: string, threadId: string): number | null {
   }
 }
 
+// Polls with a deadline far beyond what a loaded machine needs.
 async function eventually(check: () => boolean, what: string): Promise<void> {
-  const end = Date.now() + 10_000
+  const end = Date.now() + 60_000
   while (!check()) {
     if (Date.now() > end) throw new Error(`${what} never happened`)
     await delay(50)
@@ -768,24 +769,34 @@ const UNANNOUNCED = (threadId: string) =>
   ] as const
 
 test('a native claim ends with its request, or a while after a turn Codex never announced', async () => {
+  // The wait is far longer than a request and the check after it take on a
+  // loaded machine, so each claim is still held when it is checked.
   const app = startAdapter({
-    env: { CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '1000', FAKE_REFUSE_CHANGES: '1' },
+    env: { CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '5000', FAKE_REFUSE_CHANGES: '1' },
   })
   try {
-    const threadId = await startChat(app)
-    await runTurn(app, threadId, 'accept')
-    const owner = () => nativeOwner(app.home, threadId)
+    const chat = async () => {
+      const id = await startChat(app)
+      await runTurn(app, id, 'accept')
+      return id
+    }
+    const threadId = await chat()
+    const owner = (id = threadId) => nativeOwner(app.home, id)
     assert.equal(owner(), null)
     // A rollback, or a request Codex refuses, holds it while it runs.
     assert.deepEqual((await app.request('thread/rollback', { threadId, numTurns: 1 })).result, {})
     assert.equal(owner(), null)
     assert.match((await app.request('thread/archive', { threadId })).error.message, /unavailable/)
     assert.equal(owner(), null)
-    for (const [method, params] of UNANNOUNCED(threadId)) {
+    // Each on a chat of its own, so no claim stands in for another.
+    const chats = [threadId, await chat(), await chat()]
+    const requests = chats.flatMap((id, i) => UNANNOUNCED(id).slice(i, i + 1))
+    for (const [method, params] of requests) {
       assert.equal((await app.request(method, params)).error, undefined, method)
-      assert.equal(owner(), app.proc.pid, method)
-      await eventually(() => owner() === null, `${method} claim release`)
+      assert.equal(owner(params.threadId), app.proc.pid, method)
     }
+    for (const [method, params] of requests)
+      await eventually(() => owner(params.threadId) === null, `${method} claim release`)
     // A request that ends meanwhile leaves the claim to the one still waiting.
     const overlapping = [
       { id: 9001, method: 'thread/compact/start', params: { threadId } },
@@ -826,25 +837,59 @@ test('a native claim for a turn Codex never announced ends with its child or ada
 })
 
 test('a native claim for a turn Codex never announced ends when the idle child stops', async () => {
-  const first = startAdapter({ env: { CLAUDE_CODEX_NATIVE_IDLE_MS: '1500' } })
-  const apps = [first]
+  // The idle stop comes far later than the probe right after the compaction
+  // can take on a loaded machine; the second adapter is up before it starts.
+  const first = startAdapter({ env: { CLAUDE_CODEX_NATIVE_IDLE_MS: '6000' } })
+  const second = startAdapter({ home: first.home, log: join(first.home, 'second.log') })
   try {
+    await initialize(second)
     const threadId = await startChat(first)
     await runTurn(first, threadId, 'accept')
+    const exits = () => first.childLog().filter((entry) => entry.event === 'exit').length
+    const before = exits()
     assert.equal((await first.request('thread/compact/start', { threadId })).error, undefined)
-    const second = startAdapter({ home: first.home, log: join(first.home, 'second.log') })
-    apps.push(second)
-    await initialize(second)
     const probe = () => second.request('thread/rollback', { threadId, numTurns: 1 })
     assert.match((await probe()).error?.message ?? '', /active turn in another adapter process/)
-    await eventually(
-      () => first.childLog().some((entry) => entry.event === 'exit'),
-      'idle child stop',
-    )
+    await eventually(() => exits() > before, 'idle child stop')
     await eventually(() => nativeOwner(first.home, threadId) === null, 'claim release')
     assert.deepEqual((await probe()).result, {})
   } finally {
-    await Promise.all(apps.map((app) => app.stop()))
+    await Promise.all([first.stop(), second.stop()])
+  }
+})
+
+test('a turn Codex announces late leaves another adapter’s claim alone', async () => {
+  const first = startAdapter({
+    env: { CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '500', FAKE_LATE_TURN: '1' },
+  })
+  const second = startAdapter({ home: first.home, log: join(first.home, 'second.log') })
+  try {
+    await initialize(second)
+    const threadId = await startChat(first)
+    await runTurn(first, threadId, 'accept')
+    assert.equal((await first.request('thread/compact/start', { threadId })).error, undefined)
+    await eventually(() => nativeOwner(first.home, threadId) === null, 'claim release')
+    const started = await second.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'held' }],
+    })
+    assert.equal(started.error, undefined, JSON.stringify(started.error))
+    await second.reader.until((message) => message.method?.endsWith('requestApproval'))
+    // The first child now announces, and ends, the compaction's turn.
+    assert.equal((await first.request('thread/goal/get', { threadId })).error, undefined)
+    assert.ok(
+      first.reader.received.some(
+        (message) => message.method === 'turn/started' && message.params.turn.id === 'turn-late',
+      ),
+    )
+    assert.equal(nativeOwner(first.home, threadId), second.proc.pid)
+    const listed = await second.request('thread/list', {})
+    assert.deepEqual(listed.result.data.find((row: any) => row.id === threadId).status, {
+      type: 'active',
+      activeFlags: ['waitingOnApproval'],
+    })
+  } finally {
+    await Promise.all([first.stop(), second.stop()])
   }
 })
 

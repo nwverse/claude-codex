@@ -14,6 +14,9 @@ if (process.env.FAKE_IGNORE_TERM) {
 } else process.on('SIGTERM', () => process.exit(0))
 const models = new Map()
 const waiting = new Map()
+// With FAKE_LATE_TURN, a compaction's turn is announced, and ends, only when
+// thread/goal/get arrives.
+let lateTurn = null
 let next = 0
 let buffer = ''
 process.stdin.setEncoding('utf8')
@@ -64,6 +67,17 @@ function handle(message) {
       return reply({ thread: { id: p.threadId, modelProvider: provider, turns: [{ id: 'turn-old' }] }, model: models.get(p.threadId) || 'unknown', modelProvider: provider })
     case 'thread/settings/update':
       if (p.model) models.set(p.threadId, p.model)
+      return reply({})
+    case 'thread/compact/start':
+      if (process.env.FAKE_LATE_TURN) lateTurn = p.threadId
+      return reply({})
+    case 'thread/goal/get':
+      if (lateTurn) {
+        const turn = { id: 'turn-late', status: 'inProgress', items: [] }
+        send({ method: 'turn/started', params: { threadId: lateTurn, turn } })
+        send({ method: 'turn/completed', params: { threadId: lateTurn, turn: { ...turn, status: 'completed' } } })
+        lateTurn = null
+      }
       return reply({})
     case 'turn/start': {
       const turnId = 'turn-' + (++next)
