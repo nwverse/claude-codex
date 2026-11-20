@@ -159,9 +159,9 @@ codex.
   `thread/tokenUsage/updated`).
 - Notifications a client lists in `initialize`'s
   `capabilities.optOutNotificationMethods` are not sent to it, as in Codex. For
-  a thread whose client opted out of `turn/diff/updated` (the App does), the
-  adapter also skips the whole-tree `git diff` after each tool call; the turn's
-  end still records one.
+  a thread whose clients all opted out of `turn/diff/updated` (the App does),
+  the adapter also skips the whole-tree `git diff` after each tool call and at
+  the turn's end. The diff is only sent, never stored with the turn.
 - `config/read` reports `web_search = "live"`, the way Claude's WebSearch tool
   searches, unless the App saved another value or, with none saved,
   `CLAUDE_CODEX_WEBSEARCH=0` turns it off; `disabled` either way takes

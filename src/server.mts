@@ -3613,7 +3613,6 @@ export class CodexClaudeAppServer {
         completedAt: null,
         durationMs: null,
         items: [item],
-        diff: '',
         error: null,
       }
       this.claimSideTurn(turn)
@@ -3908,7 +3907,6 @@ export class CodexClaudeAppServer {
       completedAt: null,
       durationMs: null,
       items: [userItem, entered],
-      diff: '',
       error: null,
     }
     this.claimSideTurn(turn)
@@ -3985,7 +3983,6 @@ export class CodexClaudeAppServer {
       durationMs: null,
       // The compaction item joins the turn once it completes (compactThread).
       items: [],
-      diff: '',
       error: null,
     }
     this.claimSideTurn(turn)
@@ -4533,7 +4530,6 @@ export class CodexClaudeAppServer {
       completedAt: null,
       durationMs: null,
       items: initialItems,
-      diff: '',
       error: null,
       rootTurnId: rootTurnId.trim() ? rootTurnId : null,
     }
@@ -5769,7 +5765,6 @@ export class CodexClaudeAppServer {
                   content: [{ type: 'text', text: promptText, text_elements: [] }],
                 },
               ],
-              diff: '',
               error: null,
               // A spawned agent works for the turn that spawned it, as in Codex.
               rootTurnId: turn.rootTurnId ?? turn.id,
@@ -6319,15 +6314,10 @@ export class CodexClaudeAppServer {
                 method: 'item/completed',
                 params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
               })
-            // A whole-tree diff after every tool is wasted on a client that
-            // opted out of hearing it (every follower of the thread, when
-            // several are); the turn's end still records one.
-            const targets = this.targetsForParams(peer, { threadId: thread.id })
-            if (targets.every((target) => this.optedOut(target, 'turn/diff/updated'))) return
+            if (!this.turnDiffHeard(peer, thread.id)) return
             const diff = await gitDiff(thread.cwd)
             if (this.stopped || this.store.getTurn(turn.id)?.status !== 'inProgress') return
             if (diff) {
-              this.store.updateTurnDiff(turn.id, diff)
               this.notify(peer, {
                 method: 'turn/diff/updated',
                 params: { threadId: thread.id, turnId: turn.id, diff },
@@ -6825,19 +6815,20 @@ export class CodexClaudeAppServer {
     }
     if (ended()) return
 
-    let finalDiff = await gitDiff(thread.cwd)
+    const turnDiff = async (): Promise<string> =>
+      this.turnDiffHeard(peer, thread.id) ? gitDiff(thread.cwd) : ''
+    let finalDiff = await turnDiff()
     // A joined shell can outlast the model and make further file changes.
     // Finish its item and refresh the diff before closing the turn.
     let shells = this.userShells.get(turn.id)
     while (shells) {
       await Promise.all(Array.from(shells.runs.values(), (run) => run.done))
       if (ended()) return
-      finalDiff = await gitDiff(thread.cwd)
+      finalDiff = await turnDiff()
       shells = this.userShells.get(turn.id)
     }
     if (ended()) return
     if (finalDiff) {
-      this.store.updateTurnDiff(turn.id, finalDiff)
       this.notify(peer, {
         method: 'turn/diff/updated',
         params: { threadId: thread.id, turnId: turn.id, diff: finalDiff },
@@ -6983,7 +6974,6 @@ export class CodexClaudeAppServer {
             content: [{ type: 'text', text: context.prompt, text_elements: [] }],
           },
         ],
-        diff: '',
         error: null,
       }
       // A child thread deleted while its agent ran keeps nothing of it: the
@@ -7963,7 +7953,6 @@ export class CodexClaudeAppServer {
         completedAt: null,
         durationMs: null,
         items: [userItem],
-        diff: '',
         error: null,
         rootTurnId,
       }
@@ -8029,7 +8018,6 @@ export class CodexClaudeAppServer {
       completedAt: null,
       durationMs: null,
       items: [],
-      diff: '',
       error: null,
     }
     try {
@@ -10582,6 +10570,15 @@ export class CodexClaudeAppServer {
   // Whether the client asked in initialize not to hear `method`.
   private optedOut(peer: RpcPeer, method: string): boolean {
     return this.peerFeatures.get(peer)?.optedOutNotifications.has(method) === true
+  }
+
+  // Whether a connected client of the thread hears turn/diff/updated. The
+  // diff is only sent, never stored, so a whole-tree `git diff` is wasted
+  // when every follower opted out of it (the App does) or none is connected.
+  private turnDiffHeard(peer: RpcPeer, threadId: string): boolean {
+    return this.targetsForParams(peer, { threadId }).some(
+      (target) => this.peers.has(target.id) && !this.optedOut(target, 'turn/diff/updated'),
+    )
   }
 
   private notifyThread(threadId: string, notification: { method: string; params: unknown }): void {

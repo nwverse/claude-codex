@@ -270,8 +270,11 @@ async function main(): Promise<void> {
     armIdleExit()
   }
 
+  // Turn diffs older versions stored go in the background once the adapter
+  // serves (see clearStoredTurnDiffs).
   if (normalized === 'stdio://') {
     startStdioTransport(onMessage, onClose)
+    void store.clearStoredTurnDiffs()
     return
   }
   try {
@@ -286,7 +289,9 @@ async function main(): Promise<void> {
       `[claude-codex-adapter] app-server already running at ${daemon.socketPath}\n`,
     )
     await shutdown('socketInUse')
+    return
   }
+  void store.clearStoredTurnDiffs()
 }
 
 interface UnixDaemon {

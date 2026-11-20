@@ -702,7 +702,6 @@ test('startup recovery terminalizes persisted in-progress item liveness', async 
           durationMs: null,
         },
       ],
-      diff: '',
       error: null,
     })
 
@@ -853,7 +852,6 @@ test('startup recovery repairs stale items on already-terminal turns and is idem
           durationMs: null,
         },
       ],
-      diff: '',
       error: { message: 'already interrupted' },
     })
 
@@ -918,7 +916,6 @@ test('startup recovery keeps markers of finished agents and ends the ones it cut
       completedAt: status === 'completed' ? now - 1 : null,
       durationMs: status === 'completed' ? 3000 : null,
       items: [],
-      diff: '',
       error: null,
     })
   const spawn = (id: string) => ({
@@ -972,7 +969,6 @@ test('startup recovery keeps markers of finished agents and ends the ones it cut
         },
         activity(finished, 'completed'),
       ],
-      diff: '',
       error: null,
     })
 
@@ -1066,7 +1062,6 @@ test('startup recovery fails only the turns of servers that are gone', async () 
           completedAt: null,
           durationMs: null,
           items: [],
-          diff: '',
           error: null,
         })
       }

@@ -11,9 +11,10 @@ const require = createRequire(import.meta.url)
 const { DatabaseSync } = require('node:sqlite') as {
   DatabaseSync: new (
     path: string,
+    options?: { timeout?: number },
   ) => {
     exec(sql: string): void
-    prepare(sql: string): { all(...params: unknown[]): any[] }
+    prepare(sql: string): { all(...params: unknown[]): any[]; run(...params: unknown[]): unknown }
     close(): void
   }
 }
@@ -162,6 +163,121 @@ test('startup repairs each legacy condition on its own', async (t) => {
         await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
       }
     })
+  }
+})
+
+// How an older build writes a turn, which a rollback runs again: with the
+// whole uncommitted `git diff`.
+function olderBuildWrite(db: InstanceType<typeof DatabaseSync>, id: string, diff: string): void {
+  db.prepare(`INSERT INTO turns (id, thread_id, status, started_at, items_json, diff)
+    VALUES (?, 'clean', 'completed', 1, '[]', ?)
+    ON CONFLICT(id) DO UPDATE SET diff = excluded.diff`).run(id, diff)
+}
+
+function diffBytes(db: InstanceType<typeof DatabaseSync>): string[] {
+  return db
+    .prepare(
+      `SELECT id, octet_length(diff) AS bytes FROM turns
+       UNION ALL SELECT thread_id, octet_length(diff) FROM thread_inherited_turns ORDER BY 1`,
+    )
+    .all()
+    .map(({ id, bytes }) => `${id}:${bytes}`)
+}
+
+test('turn diffs older builds stored stay out of reads, and none is written or forked again', async () => {
+  const { home, path } = await cleanStore()
+  const big = 'x'.repeat(64 * 1024)
+  try {
+    const raw = new DatabaseSync(path)
+    insertThread(raw, 'fork', `forked_from_id = 'clean'`)
+    olderBuildWrite(raw, 'old', big)
+    const store = new SessionStore(path)
+    try {
+      // Opening leaves them to clearStoredTurnDiffs, and reads skip them.
+      assert.deepEqual(diffBytes(raw), ['old:65536'])
+      const turn = store.getTurn('old')
+      assert.ok(turn)
+      assert.equal('diff' in turn, false)
+      assert.deepEqual(
+        store.historyTurns('clean').map((entry) => Object.keys(entry).includes('diff')),
+        [false],
+      )
+      // A fork copies none, and the next write of the turn drops its own.
+      store.copyInheritedHistory('fork', 'clean', 1)
+      assert.deepEqual(diffBytes(raw), ['fork:0', 'old:65536'])
+      store.upsertTurn({ ...turn, id: 'new' })
+      store.upsertTurn(turn)
+      assert.deepEqual(diffBytes(raw), ['fork:0', 'new:0', 'old:0'])
+    } finally {
+      store.close()
+      raw.close()
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('old turn diffs leave the store open at once and go a few rows per write', async () => {
+  const { home, path } = await cleanStore()
+  const diff = 'x'.repeat(64 * 1024)
+  try {
+    const raw = new DatabaseSync(path)
+    insertThread(raw, 'fork', `forked_from_id = 'clean'`)
+    for (let index = 0; index < 40; index++) olderBuildWrite(raw, `old-${index}`, diff)
+    const inherit = raw.prepare(`INSERT INTO thread_inherited_turns
+      (thread_id, position, id, status, items_json, diff) VALUES ('fork', ?, ?, 'completed', '[]', ?)`)
+    for (let index = 0; index < 10; index++) inherit.run(index, `old-${index}`, diff)
+    const left = () =>
+      Number(
+        raw
+          .prepare(`SELECT (SELECT COUNT(*) FROM turns WHERE diff <> '')
+          + (SELECT COUNT(*) FROM thread_inherited_turns WHERE diff <> '') AS rows`)
+          .all()[0]?.rows,
+      )
+
+    // Opening writes none of it, so another adapter holding the write lock
+    // does not hold it up (a write would wait out the 5 s busy timeout).
+    raw.exec('BEGIN IMMEDIATE')
+    const opening = performance.now()
+    let store = new SessionStore(path)
+    const opened = performance.now() - opening
+    raw.exec('ROLLBACK')
+    assert.ok(opened < 2_000, `opening took ${Math.round(opened)} ms`)
+    assert.equal(left(), 50)
+
+    // One batch, then a pause; closing the store ends the run.
+    const paused = store.clearStoredTurnDiffs(0, 60_000)
+    assert.equal(left(), 42)
+    store.close()
+    await paused
+
+    store = new SessionStore(path)
+    try {
+      const before = changeCounter(path)
+      const clearing = store.clearStoredTurnDiffs(0, 5)
+      assert.equal(left(), 34)
+      // Between batches the file is free: a writer that does not wait gets in.
+      const other = new DatabaseSync(path, { timeout: 0 })
+      other.exec(`UPDATE threads SET name = 'meanwhile' WHERE id = 'clean'`)
+      other.close()
+      await clearing
+      assert.equal(left(), 0)
+      // 24 + 10 more rows, eight per write at most, and the other writer.
+      assert.ok(changeCounter(path) - before >= 1 + 3 + 2 + 1)
+      assert.equal(store.historyTurns('clean').length, 40)
+    } finally {
+      store.close()
+    }
+
+    // A cleared store goes through without a write.
+    const before = changeCounter(path)
+    store = new SessionStore(path)
+    await store.clearStoredTurnDiffs()
+    store.close()
+    assert.equal(changeCounter(path), before, 'clearing a cleared store must not write')
+    raw.close()
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 

@@ -1127,7 +1127,6 @@ test('history reads add the marks to a visualize line stored without them', asyn
         memoryCitation: null,
       },
     ],
-    diff: '',
     error: null,
   })
   store.close()

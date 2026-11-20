@@ -98,6 +98,21 @@ interface StaleTurnRow {
   owner_started: string | null
 }
 
+// What a turn read decodes, in turns and thread_inherited_turns alike: every
+// column rowToTurn uses, and not diff, which older builds filled with up to
+// megabytes per turn until clearStoredTurnDiffs gets to it.
+const TURN_COLUMNS =
+  'id, thread_id, status, started_at, completed_at, duration_ms, items_json, error_json, root_turn_id'
+
+// How clearStoredTurnDiffs goes: at most so many rows and (past the first
+// row) bytes per write, then how long one slice may run and how long it waits
+// before the next, longer than SQLite's longest busy-wait step (100 ms) so a
+// writer waiting in another process gets in.
+const DIFF_CLEAR_BATCH = 8
+const DIFF_CLEAR_BATCH_BYTES = 8 * 1024 * 1024
+const DIFF_CLEAR_SLICE_MS = 50
+const DIFF_CLEAR_PAUSE_MS = 150
+
 const PROJECT_SELECT = `SELECT p.*, (
   SELECT MAX(t.updated_at) FROM threads t WHERE t.project_id = p.id AND t.archived = 0
 ) AS recency_at FROM projects p`
@@ -138,6 +153,11 @@ export class SessionStore {
   // Turns streamItem changed that are not written yet, by id.
   private pendingTurns = new Map<string, TurnRecord>()
   private flushTimer: ReturnType<typeof setTimeout> | null = null
+  // The running clearStoredTurnDiffs: its next slice and its promise.
+  private diffClearing: {
+    timer: ReturnType<typeof setTimeout> | null
+    resolve: () => void
+  } | null = null
 
   constructor(path = join(adapterHome(), 'state.sqlite')) {
     mkdirSync(adapterHome(), { recursive: true, mode: 0o700 })
@@ -429,6 +449,78 @@ export class SessionStore {
     } catch {
       // Migrations are best-effort; never block adapter startup on cleanup.
     }
+  }
+
+  // Older builds stored the whole uncommitted `git diff` with every turn and
+  // fork copy, up to megabytes each, and never read it back. The columns stay
+  // for those builds, which read '' fine; reads here leave them out
+  // (TURN_COLUMNS), and this empties them so SQLite can reuse the space. A
+  // store can hold gigabytes, so it goes a few rows per write, in slices on
+  // unref'd timers: the adapter serves meanwhile, and another process waits
+  // one batch at most. The adapter runs it on every start once it listens, so
+  // diffs written during a rollback go too; a clean store takes reads only
+  // (octet_length does not read the text). Resolves once none is left, the
+  // store closes or a write fails (the next start goes on).
+  clearStoredTurnDiffs(
+    sliceMs = DIFF_CLEAR_SLICE_MS,
+    pauseMs = DIFF_CLEAR_PAUSE_MS,
+  ): Promise<void> {
+    this.stopClearingDiffs()
+    const tables = ['turns', 'thread_inherited_turns']
+    let after = 0
+    // Empties the next few diffs, in rowid order; false once none is left.
+    const batch = (): boolean => {
+      for (let table = tables[0]; table; table = tables[0]) {
+        const rows = this.db
+          .prepare(
+            `SELECT rowid AS id, octet_length(diff) AS bytes FROM ${table}
+             WHERE rowid > ? AND octet_length(diff) > 0 ORDER BY rowid LIMIT ${DIFF_CLEAR_BATCH}`,
+          )
+          .all(after) as Array<{ id: number | bigint; bytes: number }>
+        let bytes = 0
+        const last = rows.find(
+          (row, index) =>
+            (bytes += row.bytes) >= DIFF_CLEAR_BATCH_BYTES || index === rows.length - 1,
+        )
+        if (last) {
+          this.db
+            .prepare(
+              `UPDATE ${table} SET diff = ''
+               WHERE rowid > ? AND rowid <= ? AND octet_length(diff) > 0`,
+            )
+            .run(after, last.id)
+          after = Number(last.id)
+          return true
+        }
+        tables.shift()
+        after = 0
+      }
+      return false
+    }
+    return new Promise((resolve) => {
+      const slice = () => {
+        const started = performance.now()
+        try {
+          do {
+            if (!batch()) return this.stopClearingDiffs()
+          } while (performance.now() - started < sliceMs)
+        } catch {
+          return this.stopClearingDiffs()
+        }
+        const timer = setTimeout(slice, pauseMs)
+        timer.unref?.()
+        this.diffClearing = { timer, resolve }
+      }
+      this.diffClearing = { timer: null, resolve }
+      slice()
+    })
+  }
+
+  private stopClearingDiffs(): void {
+    const clearing = this.diffClearing
+    this.diffClearing = null
+    if (clearing?.timer) clearTimeout(clearing.timer)
+    clearing?.resolve()
   }
 
   // Whether any thread row matches the condition. A read, so it takes no
@@ -1464,7 +1556,7 @@ export class SessionStore {
     }
     return this.transaction(() => {
       const inProgress = this.db.prepare(
-        `SELECT * FROM turns
+        `SELECT ${TURN_COLUMNS}, owner_pid, owner_started FROM turns
          WHERE thread_id = ? AND status = 'inProgress'
          ORDER BY started_at DESC, rowid DESC`,
       )
@@ -1521,19 +1613,21 @@ export class SessionStore {
     this.writeTurn(turn)
   }
 
+  // The diff column stays empty (see clearStoredTurnDiffs); a turn an older
+  // build wrote one into loses it here.
   private writeTurn(turn: TurnRecord): void {
     const owner = currentProcessOwner()
     this.conn
       .prepare(`
-        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id, owner_pid, owner_started)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, error_json, root_turn_id, owner_pid, owner_started)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           status=excluded.status,
           started_at=excluded.started_at,
           completed_at=excluded.completed_at,
           duration_ms=excluded.duration_ms,
           items_json=excluded.items_json,
-          diff=excluded.diff,
+          diff='',
           error_json=excluded.error_json,
           root_turn_id=COALESCE(excluded.root_turn_id, turns.root_turn_id),
           owner_pid=excluded.owner_pid,
@@ -1547,7 +1641,6 @@ export class SessionStore {
         turn.completedAt,
         turn.durationMs,
         JSON.stringify(turn.items),
-        turn.diff,
         turn.error == null ? null : JSON.stringify(turn.error),
         turn.rootTurnId ?? null,
         owner.pid,
@@ -1571,7 +1664,7 @@ export class SessionStore {
   getTurn(id: string): TurnRecord | null {
     const pending = this.pendingTurns.get(id)
     if (pending) return jsonClone(pending)
-    const row = this.db.prepare('SELECT * FROM turns WHERE id = ?').get(id)
+    const row = this.db.prepare(`SELECT ${TURN_COLUMNS} FROM turns WHERE id = ?`).get(id)
     return row ? this.rowToTurn(row) : null
   }
 
@@ -1587,7 +1680,7 @@ export class SessionStore {
 
   listTurns(threadId: string): TurnRecord[] {
     const rows = this.db
-      .prepare('SELECT * FROM turns WHERE thread_id = ? ORDER BY started_at ASC')
+      .prepare(`SELECT ${TURN_COLUMNS} FROM turns WHERE thread_id = ? ORDER BY started_at ASC`)
       .all(threadId)
     return rows.map((row: unknown) => this.rowToTurn(row))
   }
@@ -1605,7 +1698,7 @@ export class SessionStore {
   lastTurn(threadId: string): TurnRecord | null {
     const row = this.db
       .prepare(
-        'SELECT * FROM turns WHERE thread_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1',
+        `SELECT ${TURN_COLUMNS} FROM turns WHERE thread_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1`,
       )
       .get(threadId)
     return row ? this.rowToTurn(row) : null
@@ -1744,19 +1837,21 @@ export class SessionStore {
   // One turn of the thread's history: its own, or one it inherited.
   historyTurn(threadId: string, turnId: string): TurnRecord | null {
     const own = this.db
-      .prepare('SELECT * FROM turns WHERE id = ? AND thread_id = ?')
+      .prepare(`SELECT ${TURN_COLUMNS} FROM turns WHERE id = ? AND thread_id = ?`)
       .get(turnId, threadId)
     if (own) return this.rowToTurn(own)
     this.ensureInheritedHistory(threadId)
     const inherited = this.db
-      .prepare('SELECT * FROM thread_inherited_turns WHERE thread_id = ? AND id = ?')
+      .prepare(`SELECT ${TURN_COLUMNS} FROM thread_inherited_turns WHERE thread_id = ? AND id = ?`)
       .get(threadId, turnId)
     return inherited ? this.rowToTurn(inherited) : null
   }
 
   private listInheritedTurns(threadId: string): TurnRecord[] {
     const rows = this.db
-      .prepare('SELECT * FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position ASC')
+      .prepare(
+        `SELECT ${TURN_COLUMNS} FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position ASC`,
+      )
       .all(threadId)
     return rows.map((row: unknown) => this.rowToTurn(row))
   }
@@ -1953,11 +2048,11 @@ export class SessionStore {
   private writeInheritedHistory(threadId: string, parentId: string, count: number): void {
     this.db.prepare('DELETE FROM thread_inherited_turns WHERE thread_id = ?').run(threadId)
     const columns =
-      'id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id, claude_session_id, claude_message_uuid'
+      'id, status, started_at, completed_at, duration_ms, items_json, error_json, root_turn_id, claude_session_id, claude_message_uuid'
     const rows = this.historyRows(parentId, columns, count)
     const insert = this.db.prepare(
       `INSERT INTO thread_inherited_turns (thread_id, position, ${columns})
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     for (const [position, row] of rows.entries()) {
       insert.run(
@@ -1969,7 +2064,6 @@ export class SessionStore {
         row.completed_at ?? null,
         row.duration_ms ?? null,
         row.items_json,
-        row.diff ?? '',
         row.error_json ?? null,
         row.root_turn_id ?? null,
         row.claude_session_id ?? null,
@@ -2369,14 +2463,6 @@ export class SessionStore {
     return changed ? JSON.stringify(items) : itemsJson
   }
 
-  updateTurnDiff(turnId: string, diff: string): TurnRecord | null {
-    const turn = this.getTurn(turnId)
-    if (!turn) return null
-    turn.diff = diff
-    this.upsertTurn(turn)
-    return turn
-  }
-
   getGoal(threadId: string): ThreadGoal | null {
     const row = this.db
       .prepare('SELECT goal_json FROM thread_goals WHERE thread_id = ?')
@@ -2511,6 +2597,7 @@ export class SessionStore {
   }
 
   close(): void {
+    this.stopClearingDiffs()
     try {
       this.flushPendingTurns()
     } finally {
@@ -2628,7 +2715,6 @@ export class SessionStore {
       completedAt: row.completed_at == null ? null : Number(row.completed_at),
       durationMs: row.duration_ms == null ? null : Number(row.duration_ms),
       items: JSON.parse(String(row.items_json)),
-      diff: String(row.diff ?? ''),
       error: row.error_json == null ? null : JSON.parse(String(row.error_json)),
       rootTurnId: row.root_turn_id == null ? null : String(row.root_turn_id),
     }
