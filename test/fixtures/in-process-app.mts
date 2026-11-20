@@ -1,6 +1,7 @@
 // An adapter server in the test process, driven like the App drives it:
 // requests in, notifications and server requests out to one peer.
 
+import '../support/hermetic-env.mjs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'

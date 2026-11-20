@@ -1,6 +1,7 @@
 // Shared helpers for the adapter-*.test.mts suites. Each suite runs in its own
 // node:test process, so the suites run in parallel. This file sits outside the
 // dist/test/*.mjs glob, so npm test does not run it as a suite.
+import './hermetic-env.mjs'
 import { type ChildProcess, type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { mkdtemp, rm } from 'node:fs/promises'

@@ -1313,26 +1313,28 @@ versioning or publishing metadata.
   fixture drift gate.
 - The docs build no longer ignores dead links, so a link to a page that does not
   exist fails CI.
-- `npm test` passes in a developer's or Claude Code's shell as it does on CI:
+- `npm test` passes in a developer's or Claude Code's shell as it does on CI,
+  and leaves that shell's adapter and Claude state alone.
   `CLAUDE_CODE_WORKFLOWS=1`, `umask 077` and a global
-  `commit.gpgsign = true` no longer fail tests, the ~105 mock adapters the
-  suites on `test/support/adapter-harness.mts` start no longer get the
-  shell's `ANTHROPIC_*`, `CLAUDE*` or `CODEX_*` variables, and no suite
-  writes to the real `~/.codex` debug log. Daemon and fixture tests allow for
-  a busy machine, `npm run build` clears `dist/test` so a deleted suite stops
-  running, and a hung test fails after 2 minutes instead of holding
-  `npm test` (CI jobs stop after 20).
-- `npm test` preloads `test/support/hermetic-env.mts` into every suite, not
-  only the `adapter-*` ones, so no suite and no adapter it starts gets the
-  shell's `ANTHROPIC_*`, `CLAUDE*` or `CODEX_*` variables. Run from a shell or
-  chat that exports `CLAUDE_CODEX_HOME` (as `claude-codex-isolated` does), the
-  suites wrote dozens of mock threads, debug and run logs, and an
-  `approval_policy = never`, `danger-full-access` default into that live
-  adapter home. An MCP test no longer reads `~/.codex/config.toml` or writes
-  to the debug log in `~/.codex/claude-codex-adapter` (#330).
-- The relative `CLAUDE_CODEX_SOCKET_PATH` test passes in a checkout deeper
-  than about 84 bytes, and the `app-server daemon version` test runs on macOS
-  instead of skipping under its long temp folder (#330).
+  `commit.gpgsign = true` no longer fail tests. `npm test` preloads
+  `dist/test/support/hermetic-env.mjs` into every suite, and the suites that
+  start adapters or run adapter code in-process import it too, for a direct
+  `node --test` run. So no suite
+  and no adapter it starts gets the shell's `ANTHROPIC_*`, `CLAUDE*` or
+  `CODEX_*` variables. Only the suites on `test/support/adapter-harness.mts`
+  dropped them before. From a shell or chat that exports `CLAUDE_CODEX_HOME`
+  (as `claude-codex-isolated` does), the others wrote dozens of mock threads,
+  debug and run logs, and an `approval_policy = never`, `danger-full-access`
+  default into that live adapter home. No suite writes to `~/.codex` either:
+  a session store for a database elsewhere no longer creates the adapter
+  home, a thread's git lookup that outlives its server no longer logs, and an
+  MCP test no longer reads `~/.codex/config.toml`. The relative
+  `CLAUDE_CODEX_SOCKET_PATH` test passes in a checkout deeper than about 84
+  bytes, and the `app-server daemon version` test runs on macOS instead of
+  skipping under its long temp folder.
+  Daemon and fixture tests allow for a busy machine, `npm run build` clears
+  `dist/test` so a deleted suite stops running, and a hung test fails after 2
+  minutes instead of holding `npm test` (CI jobs stop after 20) (#330).
 - The mock adapter suites, once one `adapter.test.mts`, run as parallel
   `adapter-*` suites, and tests that failed on a busy machine or with the
   long macOS temp folder pass there (#130, #193, #213, #214). Biome is 2.6,
