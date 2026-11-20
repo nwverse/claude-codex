@@ -294,6 +294,37 @@ test('a watched file recovers when its folder is deleted and created again, leak
   })
 })
 
+test('a watched file recovers when its folder is replaced before the watch sees the deletion', async (t) => {
+  const spy = spyOnWatch(t)
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    const git = gitDir()
+    const head = join(git, 'HEAD')
+    await watchLive(app, 'head', head, head)
+
+    for (const branch of ['a', 'b', 'c', 'd', 'e']) {
+      // `rm -rf .git && git init` in one go: the watch handles the deletion
+      // once the new .git is there, which on ext4 often has the inode number
+      // of the old one.
+      const seen = changes(app, 'head').length
+      const watches = spy.paths.length
+      rmSync(git, { recursive: true })
+      mkdirSync(git)
+      writeFileSync(head, 'ref: refs/heads/main\n')
+      assert.deepEqual(await nextChange(app, 'head', seen), [head])
+      // The watch moves to the new .git: on Linux the old one is dead.
+      await poll('a watch on the new .git', () => (spy.paths.length > watches ? true : undefined))
+      assert.deepEqual(spy.paths.slice(watches), [git])
+      const update = await probeChange(app, 'head', () =>
+        gitUpdate(head, `ref: refs/heads/${branch}\n`),
+      )
+      assert.deepEqual(update, [head])
+      await openWatches(spy, 1)
+    }
+    await app.request('fs/unwatch', { watchId: 'head' })
+    await openWatches(spy, 0)
+  })
+})
+
 test('a folder created just before the watch on its parent starts is not missed', async (t) => {
   const root = tempRoot()
   const a = join(root, 'a')
@@ -325,6 +356,44 @@ test('a folder created just before the watch on its parent starts is not missed'
     assert.deepEqual(spy.paths, [root, a, b])
     const update = await probeChange(app, 'head', (attempt) => writeFileSync(head, `${attempt}\n`))
     assert.deepEqual(update, [head])
+    await openWatches(spy, 1)
+    await app.request('fs/unwatch', { watchId: 'head' })
+    await openWatches(spy, 0)
+  })
+})
+
+test('a folder gone again before its watch starts leaves the watch where it was', async (t) => {
+  const root = tempRoot()
+  const a = join(root, 'a')
+  const b = join(a, 'b')
+  const head = join(b, 'HEAD')
+  mkdirSync(a)
+  // b appears once the watch on a starts, so the check after it finds b, and
+  // is gone again before the watch on b starts, which then fails.
+  let raced = false
+  const spy = spyOnWatch(t, (path, listener, start) => {
+    if (!raced && path === a) mkdirSync(b)
+    if (!raced && path === b) {
+      raced = true
+      rmSync(b, { recursive: true })
+    }
+    return start(listener)
+  })
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    assert.deepEqual(await app.request('fs/watch', { watchId: 'head', path: head }), { path: head })
+    assert.deepEqual(spy.paths, [a, b])
+    await openWatches(spy, 1)
+    // The watch stayed on a and still moves down once b is there.
+    const init = await probeChange(app, 'head', (attempt) => {
+      if (attempt > 0) {
+        utimesSync(b, new Date(), new Date())
+      } else {
+        mkdirSync(b)
+        writeFileSync(head, 'ref: refs/heads/main\n')
+      }
+    })
+    assert.deepEqual(init, [head])
+    assert.equal(spy.paths.at(-1), b)
     await openWatches(spy, 1)
     await app.request('fs/unwatch', { watchId: 'head' })
     await openWatches(spy, 0)
