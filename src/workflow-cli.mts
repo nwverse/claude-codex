@@ -10,6 +10,7 @@ import { workflowHealth } from './workflow-health.mjs'
 import {
   blockWorkflowTask,
   completeWorkflowTask,
+  enqueueWorkflowTask,
   failWorkflowTask,
   renewWorkflowLease,
   scheduleNextWorkflowTask,
@@ -41,7 +42,7 @@ export async function runWorkflowCli(
     case 'enqueue': {
       const task = await store.transact((state) => {
         const enqueued = taskFromArgs(parsed, clock())
-        return { state: upsertTask(state, enqueued), value: enqueued }
+        return { state: enqueueWorkflowTask(state, enqueued), value: enqueued }
       })
       writeJson(io.stdout, { status: 'enqueued', statePath: store.path, task })
       return 0
@@ -173,16 +174,6 @@ function taskFromArgs(args: ParsedArgs, now: Date): WorkflowTask {
     lease: null,
     blockedReason: null,
     lastError: null,
-  }
-}
-
-function upsertTask(state: WorkflowState, task: WorkflowTask): WorkflowState {
-  if (!state.tasks.some((candidate) => candidate.id === task.id)) {
-    return { ...state, tasks: [...state.tasks, task] }
-  }
-  return {
-    ...state,
-    tasks: state.tasks.map((candidate) => (candidate.id === task.id ? task : candidate)),
   }
 }
 

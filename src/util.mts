@@ -193,16 +193,7 @@ export function debugLog(event: string, data: Record<string, unknown> = {}): voi
 }
 
 // Long-running adapter daemons would otherwise grow debug.jsonl until the disk
-// fills. Bound it with a simple `.1`/`.2`/... rotation: when the active log
-// passes `maxBytes`, push it down one slot and start fresh. Bound by `keep`,
-// dropping anything older. Sized envs override; failures swallow because the
-// debug log is best-effort and must never break the main flow.
-export function rotateLogIfNeeded(path: string): void {
-  const maxBytes = debugLogMaxBytes()
-  if (maxBytes <= 0) return
-  rotateLog(path, maxBytes)
-}
-
+// fills, so debugLog rotates it once it reaches this size (0 never rotates).
 function debugLogMaxBytes(): number {
   return numericEnv('CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', 50 * 1024 * 1024)
 }

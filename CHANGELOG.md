@@ -324,10 +324,11 @@ versioning or publishing metadata.
   still working is refused with "this agent is still working; message it from
   its parent chat or wait for it to report", instead of naming an active turn
   in another adapter process that does not exist. (#335)
-- A `turn/start` sent while another is still starting on the same thread, or
-  a goal continuation that waited on it, joins that turn instead of opening a
-  second run whose answer was dropped, and a late cleanup from an older turn
-  no longer clears the newer one or marks the thread idle. (#241)
+- A `turn/start` sent while another turn runs or is still starting on the
+  same thread, or a goal continuation that waited on it, joins that turn
+  instead of opening a second run that orphaned it or whose answer was
+  dropped, and a late cleanup from an older turn no longer clears the newer
+  one or marks the thread idle. (#241)
 - `thread/loaded/list` honors its cursor: following `nextCursor` returns the
   next page instead of the first one again, the last page's cursor is
   `null`, `limit: 0` counts as 1 instead of looping on empty pages, and a
@@ -425,8 +426,7 @@ versioning or publishing metadata.
   in progress with an unhandled rejection.
 - Goals, steer and the message queue follow the Codex App: `thread/goal/*`
   with continuation turns, token and time budgets and goal tools for Claude;
-  steer errors in Codex's wording; `thread/queue/*`; and a `turn/start` that
-  races a running turn joins it instead of orphaning it.
+  steer errors in Codex's wording; and `thread/queue/*`.
 - A queued message that starts after the App disconnected is no longer killed
   by the unix daemon's idle exit 15 s into its turn, with the message already
   gone from the queue; nor is any other turn that starts while the daemon
@@ -491,15 +491,18 @@ versioning or publishing metadata.
   to when neither names one (by default
   `app-server-control/app-server-control.sock` under `CODEX_HOME`); an
   explicit `--listen unix://PATH` or `proxy --sock PATH` still wins. Both
-  commands read it, so set it where both run. The daemon makes the socket's
-  folder private to the user, so give the socket a folder of its own.
+  commands read it, so set it where both run. The daemon creates a missing
+  folder with mode 700 and leaves an existing folder's permissions as they
+  are; it refuses to start in a folder that group or other users can write
+  to unless the folder is sticky, as `/tmp` is.
 - `app-server proxy` takes `--sock=PATH` as well as `--sock PATH`; a `--sock`
   with no path is an error instead of quietly using the default socket. A
   bad `--listen` (`tcp://...`, `ws://host:abc`, or `--listen` with no value)
   now fails with one line before the state database opens, instead of a
   stack trace after it, or a silent `stdio://`. The unix daemon no longer
-  refuses to start over a pid file that is empty, holds `0`, or names a
-  process that is not listening on the socket.
+  refuses to start over a pid file that is empty or holds `0`, nor over one
+  naming a process that has not listened on the socket within the startup
+  limit described next.
 - A unix daemon that takes more than 10 seconds to start no longer gets a
   second daemon beside it. A second `--listen unix://` used to take it for
   stale after 10 seconds and start too; one of the two then removed the
@@ -1398,6 +1401,13 @@ versioning or publishing metadata.
   `CLAUDE_CODEX_SESSION_CHANGES` and the summary model, the backends guide
   the shim's and `claude-codex-mode`'s own variables, and the worktree docs
   say that `CLAUDE_CODEX_AUTO_WORKTREE=1` turns isolation on. (#304)
+- The capability matrix no longer says `CLAUDE_CODEX_ALLOWED_TOOLS` restricts
+  Claude's tools: the listed tools are pre-approved and run without an
+  approval card, and a Claude Code deny rule is what takes a tool away. The
+  `src/` AGENTS.md map lists the modules added since, such as the native
+  Codex harness and the shared process-group and JSON-file helpers, and the
+  root AGENTS.md points to the configuration reference table for the full
+  list of variables. (#338)
 
 ### Validation and release gates
 
@@ -1414,7 +1424,7 @@ versioning or publishing metadata.
   writes to the real `~/.codex` debug log. Daemon and fixture tests allow for
   a busy machine, `npm run build` clears `dist/test` so a deleted suite stops
   running, and a hung test fails after 2 minutes instead of holding
-  `npm test` (CI jobs stop after 20).
+  `npm test` (the CI job that runs it stops after 20 minutes).
 - The mock adapter suites, once one `adapter.test.mts`, run as parallel
   `adapter-*` suites, and tests that failed on a busy machine or with the
   long macOS temp folder pass there (#130, #193, #213, #214). Biome is 2.6,
@@ -1455,6 +1465,5 @@ versioning or publishing metadata.
   bypass behavior.
 - The App's worktree tools (its `threadAttachments` gate) on a local host,
   where the App names them for its bundled `codex_app` MCP server instead of
-  sending them as `dynamicTools`, MCP tool-call progress, and Claude Code
-  plugin skills in the "/" popup are not included. Hook runs are shown live
-  but not kept in history.
+  sending them as `dynamicTools`, and MCP tool-call progress are not
+  included. Hook runs are shown live but not kept in history.
