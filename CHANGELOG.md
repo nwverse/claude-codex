@@ -350,6 +350,13 @@ versioning or publishing metadata.
   A file whose directory does not exist yet (`.git/HEAD` before `git init`)
   is watched from the nearest existing folder, as Codex does, instead of
   failing with `ENOENT`. (#333)
+- `fs/watch` on a file keeps working when a folder on the way to it is deleted
+  and created again, such as `.git` in `rm -rf .git && git init`. As in Codex,
+  the watch picks the nearest existing folder again on every event, so it
+  moves up and then down into the new folder; on Linux it used to stop for
+  good. A folder created while the watch moves down to it is no longer
+  missed, and on macOS a watch whose nearest existing folder is `/` now sees
+  its entry. (#348)
 - `fs/readDirectory` lists a symlink as the file or folder it points to, as
   `fs/getMetadata` and Codex do, and leaves out a dangling link. Linked files
   such as `CLAUDE.md -> AGENTS.md` and linked package folders used to show as
