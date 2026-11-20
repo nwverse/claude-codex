@@ -13,7 +13,8 @@
 // - the App's feature-gate table and minimum app-server version, against the
 //   version the adapter reports, and the methods each gate it turns on makes
 //   the App call (GATED_METHODS in src/app-compat.mts);
-// - the clientInfo name the App sends in initialize;
+// - the clientInfo name the App sends in initialize, which must be one of
+//   DESKTOP_CLIENT_NAMES;
 // - the App rules, which only a person can re-check.
 //
 // --app takes an App bundle, its app.asar, or a directory app.asar was
@@ -62,9 +63,20 @@ const { values: args } = parseArgs({
   },
 })
 
+// The check ends by setting process.exitCode and letting Node exit once
+// stdout is written: exiting at once would drop what a pipe has not taken
+// yet. fail() stops it with a CheckStopped, which only sets the code.
+class CheckStopped extends Error {}
+process.on('uncaughtException', (error) => {
+  if (error instanceof CheckStopped) return
+  console.error(error)
+  process.exitCode = 1
+})
+
 function fail(message) {
   console.error(`check-app-upgrade: ${message}`)
-  process.exit(2)
+  process.exitCode = 2
+  throw new CheckStopped(message)
 }
 
 const baselinePath = resolve(args.baseline)
@@ -80,9 +92,16 @@ const recorded = existsSync(baselinePath) ? JSON.parse(readFileSync(baselinePath
 if (bundleOnly && !recorded)
   fail(`--bundle-only takes the protocol from ${baselinePath}, which is missing`)
 
-const { APP_RULES, DESKTOP_CLIENT_NAME, GATED_METHODS, VERIFIED_APP_VERSIONS } = await import(
-  join(root, 'dist', 'src', 'app-compat.mjs')
-).catch(() => fail('dist/ is missing; run it through `npm run check:app-upgrade`'))
+const {
+  APP_RULES,
+  DESKTOP_CLIENT_NAMES,
+  dispatchCases,
+  GATED_METHODS,
+  KEPT_OFF_GATES,
+  VERIFIED_APP_VERSIONS,
+} = await import(join(root, 'dist', 'src', 'app-compat.mjs')).catch(() =>
+  fail('dist/ is missing; run it through `npm run check:app-upgrade`'),
+)
 const { codexCompatVersion } = await import(join(root, 'dist', 'src', 'util.mjs'))
 
 // --- App bundle ------------------------------------------------------------
@@ -157,16 +176,78 @@ function openAsar(path) {
   }
 }
 
+// The minifier wrote string literals as template literals (`…`) up to
+// 26.1013 and as double-quoted strings ("…") from 26.1111, so the patterns
+// take either quote.
+const QUOTE = '["\'`]'
 const VERSION = String.raw`\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?`
 const KEY = String.raw`[A-Za-z_$][\w$]*`
-const GATE_TABLE = new RegExp(
-  String.raw`\{(?:${KEY}:\`${VERSION}\`,){8,}${KEY}:\`${VERSION}\`\}`,
+// A gate needs a version, or is null when no version turns it on (26.1111).
+const GATE = String.raw`${KEY}:(?:${QUOTE}${VERSION}${QUOTE}|null)`
+const GATE_TABLE = new RegExp(String.raw`\{(?:${GATE},){8,}${GATE}\}`, 'g')
+const GATE_ENTRY = new RegExp(String.raw`(${KEY}):(?:${QUOTE}(${VERSION})${QUOTE}|null)`, 'g')
+const UNSUPPORTED = 'codex-app-server-version-unsupported:'
+// The minimum, declared together with the prefix of the error that rejects
+// a server below it (26.1013), or in a constant of its own that the
+// update-required error names (26.1111).
+const MINIMUM = new RegExp(String.raw`${QUOTE}(${VERSION})${QUOTE},${KEY}=${QUOTE}${UNSUPPORTED}`)
+const MINIMUM_NAME = new RegExp(String.raw`minRequiredVersion:(${KEY})[,}]`)
+// clientInfo.name in initialize: a literal (26.1013), or a constant of
+// another module (26.1111: name:lr.EW, lr=r(87329)).
+const CLIENT_NAME = new RegExp(
+  String.raw`clientInfo:\{name:(?:${QUOTE}([^"'\`]+)${QUOTE}|(${KEY})\.(${KEY})[,}])`,
   'g',
 )
-const MINIMUM = new RegExp(String.raw`\`(${VERSION})\`,\w+=\`codex-app-server-version-unsupported:`)
-const CLIENT_NAME = /clientInfo:\{name:`([^`]+)`/g
 // A string literal shaped like an app-server method: namespace/name[/...].
 const METHOD_NAME = /[`'"]([a-z][A-Za-z]*(?:\/[A-Za-z_]+)+)[`'"]/g
+
+const asPattern = (name) => name.replaceAll('$', '\\$')
+
+// The version the minimum's constant is set to: the declaration of that name
+// closest before the error prefix, as minified names repeat across modules.
+function minimumIn(text) {
+  const old = text.match(MINIMUM)?.[1]
+  if (old) return old
+  const name = text.match(MINIMUM_NAME)?.[1]
+  if (!name) return null
+  const before = text.indexOf(UNSUPPORTED)
+  let found = null
+  const declaration = new RegExp(
+    String.raw`(?:^|[^\w$.])${asPattern(name)}=${QUOTE}(${VERSION})${QUOTE}`,
+    'g',
+  )
+  for (const match of text.matchAll(declaration)) {
+    if (found && match.index > before) break
+    found = match[1]
+  }
+  return found
+}
+
+// The module a minified name used at `at` was bound to in a script
+// (`lr=r(87329)`, `e2=n("N2rm")`): the binding closest before the use, as
+// minified names repeat across modules. Then the constant `key` that module
+// exports.
+function moduleOf(text, name, at) {
+  const binding = new RegExp(
+    String.raw`(?:^|[^\w$.])${asPattern(name)}=${KEY}\(\s*"?([\w$]+)"?\s*\)`,
+    'g',
+  )
+  let found = null
+  for (const match of text.matchAll(binding)) {
+    if (found && match.index > at) break
+    found = match[1]
+  }
+  return found
+}
+
+function exportedConstant(text, id, key) {
+  const start = new RegExp(
+    String.raw`(?:^|[,{])"?${asPattern(id)}"?\(${KEY},${KEY},${KEY}\)\{`,
+  ).exec(text)
+  if (!start) return null
+  const body = text.slice(start.index, start.index + 50_000)
+  return new RegExp(String.raw`[,{]${asPattern(key)}:${QUOTE}([^"'\`]+)${QUOTE}`).exec(body)?.[1]
+}
 
 function bundleFacts(app) {
   const asar = openBundle(app)
@@ -176,19 +257,20 @@ function bundleFacts(app) {
     let gates = null
     let minimum = null
     const clientNames = new Set()
+    // clientInfo names that are another module's constant, found in a second
+    // pass over the scripts of the same directory.
+    const exported = []
     const names = new Set()
-    for (const file of asar.files) {
-      if (!file.path.endsWith('.js')) continue
-      if (!SCRIPT_DIRS.some((dir) => file.path.startsWith(dir))) continue
+    const scripts = asar.files.filter(
+      (file) => file.path.endsWith('.js') && SCRIPT_DIRS.some((dir) => file.path.startsWith(dir)),
+    )
+    for (const file of scripts) {
       const text = asar.read(file)
       for (const match of text.matchAll(METHOD_NAME)) names.add(match[1])
-      if (text.includes('threadQueue:`')) {
+      if (/threadQueue:["'`]/.test(text)) {
         for (const match of text.matchAll(GATE_TABLE)) {
           const table = Object.fromEntries(
-            [...match[0].matchAll(new RegExp(`(${KEY}):\`([^\`]+)\``, 'g'))].map((entry) => [
-              entry[1],
-              entry[2],
-            ]),
+            [...match[0].matchAll(GATE_ENTRY)].map((entry) => [entry[1], entry[2] ?? null]),
           )
           if (
             'threadQueue' in table &&
@@ -197,10 +279,27 @@ function bundleFacts(app) {
             gates = table
         }
       }
-      if (!minimum && text.includes('codex-app-server-version-unsupported:'))
-        minimum = text.match(MINIMUM)?.[1] ?? null
-      if (text.includes('clientInfo:{name:`'))
-        for (const match of text.matchAll(CLIENT_NAME)) clientNames.add(match[1])
+      if (!minimum && text.includes(UNSUPPORTED)) minimum = minimumIn(text)
+      if (text.includes('clientInfo:{name:'))
+        for (const match of text.matchAll(CLIENT_NAME)) {
+          if (match[1]) clientNames.add(match[1])
+          else {
+            const id = moduleOf(text, match[2], match.index)
+            const dir = SCRIPT_DIRS.find((prefix) => file.path.startsWith(prefix))
+            if (id) exported.push({ id, key: match[3], dir, expression: match[0] })
+            else notes.push(`could not tell which module ${match[2]} is in ${file.path}`)
+          }
+        }
+    }
+    for (const file of exported.length > 0 ? scripts : []) {
+      const pending = exported.filter((ref) => !ref.value && file.path.startsWith(ref.dir))
+      if (pending.length === 0) continue
+      const text = asar.read(file)
+      for (const ref of pending) ref.value = exportedConstant(text, ref.id, ref.key)
+    }
+    for (const ref of exported) {
+      if (ref.value) clientNames.add(ref.value)
+      else notes.push(`could not resolve the clientInfo name of \`${ref.expression}\``)
     }
     return { appVersion, gates, minimum, clientNames: [...clientNames].sort(), names }
   } finally {
@@ -452,26 +551,36 @@ function facts(app, { codex, source } = {}) {
 const DISPATCH_FILES = new Set(['server.mts', 'host-methods.mts'])
 
 // handled: the requests a case answers, leaving out the cases that only
-// answer "method not found".
+// answer "method not found" (dispatchCases in src/app-compat.mts). byDesign:
+// those of them an App rule says the App copes with.
 function adapterFacts() {
   const handled = new Set()
+  const byDesign = new Map()
   const sent = new Set()
   const srcDir = join(root, 'src')
   for (const file of readdirSync(srcDir)) {
     if (!file.endsWith('.mts')) continue
     const text = readFileSync(join(srcDir, file), 'utf8')
     if (DISPATCH_FILES.has(file)) {
-      for (const match of text.matchAll(/case '([A-Za-z][\w/]*)':/g)) handled.add(match[1])
-      for (const block of text.matchAll(/((?:case '[^']+':\s*)+)throw methodNotFound\(method\)/g))
-        for (const match of block[1].matchAll(/case '([^']+)':/g)) handled.delete(match[1])
+      const switchCases = dispatchCases(text)
+      for (const method of switchCases.cases)
+        if (!switchCases.notFound.has(method)) handled.add(method)
+      for (const [method, rule] of switchCases.byDesign) byDesign.set(method, rule)
     }
     for (const match of text.matchAll(
       /method: '([a-zA-Z]+(?:\/[a-zA-Z_]+)+|configWarning|error|warning)'/g,
     ))
       sent.add(match[1])
   }
-  return { handled, sent }
+  return { handled, byDesign, sent }
 }
+
+// A method the adapter answers with "method not found", and why when that is
+// by design.
+const notFound = (method) =>
+  adapter.byDesign.has(method)
+    ? `${method} (by design, rule ${adapter.byDesign.get(method)})`
+    : method
 
 // --- Versions --------------------------------------------------------------
 
@@ -568,7 +677,7 @@ if (!bundleOnly) {
       list(
         'new, answered with "method not found"',
         added.filter((m) => !adapter.handled.has(m)),
-        (m) => `+ ${m}`,
+        (m) => `+ ${notFound(m)}`,
       )
       list(
         'new, already handled',
@@ -581,7 +690,9 @@ if (!bundleOnly) {
     list('removed', removed, (m) => `- ${m}`)
   }
   const unanswered = next.clientRequests.filter((m) => !adapter.handled.has(m))
-  console.log(`  answered with "method not found" (${unanswered.length}): ${unanswered.join(', ')}`)
+  console.log(
+    `  answered with "method not found" (${unanswered.length}): ${unanswered.map(notFound).join(', ')}`,
+  )
   const schemaOut = new Set([...next.serverRequests, ...next.serverNotifications])
   const previousOut = new Set([...previous.serverRequests, ...previous.serverNotifications])
   const gone = [...adapter.sent].filter((m) => !schemaOut.has(m) && previousOut.has(m)).sort()
@@ -611,7 +722,13 @@ function appMethodsReport() {
     list('newly named', requests.added, (m) => `+ ${m}`)
     list('no longer named', requests.removed, (m) => `- ${m}`)
   }
-  for (const method of next.appRequests.filter((m) => !adapter.handled.has(m)))
+  const unanswered = next.appRequests.filter((m) => !adapter.handled.has(m))
+  list(
+    '-32601 by design',
+    unanswered.filter((m) => adapter.byDesign.has(m)),
+    (m) => `${m} (rule ${adapter.byDesign.get(m)})`,
+  )
+  for (const method of unanswered.filter((m) => !adapter.byDesign.has(m)))
     problems.push(`the App calls ${method}, which the adapter answers with "method not found"`)
   const others = previous.appOtherMethods
   const other = diff(others ?? [], next.appOtherMethods)
@@ -627,7 +744,9 @@ function appMethodsReport() {
     return
   }
   list('newly named', other.added, (m) => `+ ${m}`)
-  for (const method of other.added.filter((m) => !adapter.handled.has(m))) {
+  for (const method of other.added.filter(
+    (m) => !adapter.handled.has(m) && !adapter.byDesign.has(m),
+  )) {
     if (bundleOnly)
       problems.push(
         `the App names ${method}, which the adapter does not answer and the protocol of ${previousLabel} does not have; read the App's protocol with --protocol-source`,
@@ -640,19 +759,27 @@ function appMethodsReport() {
 }
 appMethodsReport()
 
+// A gate is on from its version up; a null gate is off for every version
+// but the App's own development builds (0.0.0).
+const gateOn = (version) => version != null && compareVersions(reported, version) >= 0
+
 console.log(`\nFeature gates (adapter reports ${reported})`)
 if (!next.gates) {
   problems.push('found no feature-gate table in the bundle; check the gates by hand')
 } else {
   const before = previous.gates ?? {}
   for (const [name, version] of Object.entries(next.gates).sort()) {
-    const state = compareVersions(reported, version) >= 0 ? 'on ' : 'off'
+    const state = gateOn(version) ? 'on ' : 'off'
     const change = !(name in before)
       ? '  (new)'
       : before[name] !== version
-        ? `  (was ${before[name]})`
+        ? `  (was ${before[name] ?? 'never'})`
         : ''
-    console.log(`  ${state} ${name.padEnd(32)} ${version}${change}`)
+    console.log(`  ${state} ${name.padEnd(32)} ${version ?? 'never'}${change}`)
+    if (name in before && gateOn(before[name]) && !gateOn(version))
+      notes.push(
+        `${name} was on for ${reported} and is off now: it needs ${version ?? 'a 0.0.0 build'}`,
+      )
   }
   for (const name of Object.keys(before).filter((name) => !(name in next.gates)))
     console.log(`  --  ${name.padEnd(32)} removed`)
@@ -661,21 +788,33 @@ if (!next.gates) {
       notes.push(`GATED_METHODS lists ${name}, which App ${next.appVersion} does not gate on`)
       continue
     }
-    if (compareVersions(reported, next.gates[name]) < 0) continue
-    const unanswered = methods.filter((method) => !adapter.handled.has(method))
+    if (!gateOn(next.gates[name])) continue
+    const unanswered = methods.filter(
+      (method) => !adapter.handled.has(method) && !adapter.byDesign.has(method),
+    )
     if (unanswered.length > 0)
       problems.push(
         `the adapter's version turns on ${name}, but it does not answer ${unanswered.join(', ')}`,
       )
   }
+  for (const [name, reason] of Object.entries(KEPT_OFF_GATES)) {
+    if (!(name in next.gates)) {
+      notes.push(`KEPT_OFF_GATES lists ${name}, which App ${next.appVersion} does not gate on`)
+      continue
+    }
+    if (gateOn(next.gates[name]))
+      problems.push(
+        `the adapter's version turns on ${name} (needs ${next.gates[name]}), which KEPT_OFF_GATES keeps off: ${reason}`,
+      )
+  }
   for (const name of Object.keys(next.gates).filter(
-    (name) => !(name in before) && !(name in GATED_METHODS),
+    (name) => !(name in before) && !(name in GATED_METHODS) && !(name in KEPT_OFF_GATES),
   ))
-    if (compareVersions(reported, next.gates[name]) >= 0)
+    if (gateOn(next.gates[name]))
       notes.push(
         `the new gate ${name} is on; find what the App calls behind it and add those methods to GATED_METHODS`,
       )
-  if (compareVersions(reported, next.gates.threadQueue) < 0)
+  if (!gateOn(next.gates.threadQueue))
     notes.push(
       `the App keeps queued messages in the window: threadQueue needs ${next.gates.threadQueue}, set CLAUDE_CODEX_COMPAT_VERSION to use the server-side queue`,
     )
@@ -689,8 +828,10 @@ if (!next.minimum) {
 }
 
 console.log(`\nclientInfo names: ${next.clientNames.join(', ') || '(none found)'}`)
-if (!next.clientNames.includes(DESKTOP_CLIENT_NAME))
-  problems.push(`the App no longer sends clientInfo.name ${DESKTOP_CLIENT_NAME}`)
+if (!next.clientNames.some((name) => DESKTOP_CLIENT_NAMES.includes(name)))
+  problems.push(
+    `the App sends none of the desktop clientInfo names the adapter knows (${DESKTOP_CLIENT_NAMES.join(', ')})`,
+  )
 
 console.log('\nApp rules to re-check by hand (src/app-compat.mts, docs/reference/app-compat.md)')
 for (const rule of APP_RULES) {
@@ -722,4 +863,4 @@ if (args['write-baseline']) {
   )
 }
 
-process.exit(problems.length > 0 ? 1 : 0)
+process.exitCode = problems.length > 0 ? 1 : 0

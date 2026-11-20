@@ -18,10 +18,10 @@ line a rule touches.
 
 | Rule | The App… | Check on a new build |
 | --- | --- | --- |
-| `client-info` | identifies itself in `initialize` as `clientInfo.name` `codex_desktop`, with its build as the version | `check:app-upgrade` finds the name |
+| `client-info` | identifies itself in `initialize` as `clientInfo.name` `Codex Desktop` (`codex_desktop` up to 26.1013), with its build as the version | `check:app-upgrade` finds one of the names in `DESKTOP_CLIENT_NAMES` |
 | `feature-gates` | turns features on by the app-server version in the `initialize` userAgent, and rejects one below its minimum | `check:app-upgrade` lists the gates |
-| `prediction-provider` | from 26.1013, predicts the next composer message by forking the thread with `thread/fork` and `experimentalPredictionMode`, only when its `modelProvider` is `openai` | the bundle's prediction path still stops with `unsupported_provider` for another provider |
-| `daemon-version` | with `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1`, runs `codex app-server daemon version` and connects to the server on `<CODEX_HOME>/app-server-control/app-server-control.sock` when it reports a version, or starts its own over stdio when the probe fails | the bundle still runs the probe and reads that socket |
+| `prediction-provider` | predicts the next composer message only when the thread's `modelProvider` is `openai` (26.1013 with a `thread/fork` and `experimentalPredictionMode`, 26.1111 with `thread/sample`); 26.1111 uses that fork for an adaptive title refresh of any chat instead | the bundle's prediction path still stops with `unsupported_provider` for another provider |
+| `daemon-version` | with `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1`, runs `codex app-server daemon version` and connects to the server on `<CODEX_HOME>/app-server-control/app-server-control.sock` when it reports a version, or starts its own over stdio when the probe fails; 26.1111 probes only for a connection without `-c` overrides, which its desktop connection always has | the bundle still runs the probe and reads that socket |
 | `config-warnings` | lists `configWarning` notifications under Settings > Agent > Configuration | an unlisted build shows the warning there |
 | `bedrock-account` | filters the model picker through its OpenAI allowlist unless `account/read` returns a Bedrock account | the picker lists the Claude models |
 | `model-efforts` | offers each model the `model/list` efforts that are also enabled under Settings > Agent > Model features (max is off by default and listed once a model offers it), and falls back to the model's `defaultReasoningEffort` | after a Claude turn, Max is listed there; with it on, Claude Opus offers Max and Claude Haiku no effort levels |
@@ -38,52 +38,52 @@ line a rule touches.
 | `steer-bubble` | settles the steering bubble when a `userMessage` item carries its `clientUserMessageId` | a steer shows once, in the transcript |
 | `subagent-completed-kind` | renders the completed `subAgentActivity` kind from 26.930 without declaring it | a finished subagent shows as done |
 | `subagent-close-hides` | removes a child from the panel when `closeAgent` follows its successful wait | a finished subagent stays in the panel |
-| `completed-wait` | marks every working agent of the thread done when a wait completes | with two agents, the first to finish does not end the second |
-| `agent-states` | shows `interrupted` as done and `errored` as failed | a stopped subagent shows as done |
+| `completed-wait` | marks every working agent of the thread done when a wait completes (26.1111 only for ChatGPT-hosted conversations) | with two agents, the first to finish does not end the second |
+| `agent-states` | shows `interrupted` as done and `errored` as failed; 26.1111 keeps only agents that finished in its panel | a stopped subagent shows as done (26.1111: it leaves the panel, and its row says interrupted) |
 | `subagent-failure-reason` | shows a failed turn's `error.message` as an error row in that turn (not an interrupted one's), and an agent's `agentsStates` message after its status on a `spawnAgent` or `sendInput` row, never on a wait or `closeAgent` | a subagent whose run fails ends its thread with an error row naming the cause, without stack frames; the parent's failed turn says how many subagents failed and why the first did |
 | `subagent-read` | reads a child with `includeTurns: false` and shows one without turns as loading | a finished subagent opens with its prompt, its work and its reply |
-| `child-prompt` | creates the child conversation from `thread/started` with an empty turn | a running subagent shows its prompt |
+| `child-prompt` | creates the child conversation from `thread/started` with an empty turn (26.1111: with none, adding one on the first `turn/started`) | a running subagent shows its prompt |
 | `subagent-titles` | titles a subagent thread with the `name` its `thread/started` carries, and otherwise generates one from the parent's `spawnAgent` prompt with a model turn of its own | a subagent's and a workflow agent's threads show the description or label at once, with no title turn for them |
 | `nested-subagent` | finds a child through the `spawnAgent` item of the conversation its `parentThreadId` names | a subagent's own subagent opens from the outer subagent's conversation, at depth 2 |
-| `rate-limit-banner` | shows a banner for every `account/rateLimits/updated` | no banner after an ordinary reply |
+| `rate-limit-banner` | shows a banner for every `account/rateLimits/updated` (up to 26.1013; 26.1111 ignores it) | no banner after an ordinary reply |
 | `projects` | holds project writes until `project/list` answers, and matches the `project not found` and deleted-key error texts | a project and a chat moved into it survive an App restart |
 | `delete-missing-rollout` | retries `thread/delete` with `missingRolloutRecovery` after `no rollout found for thread id <id>` | deleting all archived chats empties the list |
-| `inline-visualizations` | renders an HTML fragment from a `::codex-inline-vis{path="…"}` line, reading it only for a UUIDv7 thread id, and installs its bundled `visualize` plugin with `plugin/install` each time it starts | in a new chat, a chart Claude is asked for renders inside the reply |
+| `inline-visualizations` | renders an HTML fragment from a `::codex-inline-vis{path="…"}` line, reading it only for a UUIDv7 thread id (26.1111 also its UUIDv8 form), and installs its bundled `visualize` plugin with `plugin/install` each time it starts (26.1111: while `plugin/list` does not report it installed) | in a new chat, a chart Claude is asked for renders inside the reply |
 | `visualize-line` | renders an inline visualization from a line holding `visualize` and its JSON wrapped in the private-use marks its visualize skill documents, and shows the same line without the marks as text | a reply that names a visualization as a plain `visualize{…}` line shows it rendered, also after the chat is reopened |
-| `code-review-plugin-server` | turns on its bundled code-review plugin's MCP server with a `-c` setting and drives the Pull Requests panel through `mcpServer/tool/call`, `mcpServer/resource/read` and `mcpServerStatus/list` on server `code-review` | with `CLAUDE_CODEX_APP_PLUGIN_MCP=1` and gh signed in, the Pull Requests panel lists pull requests |
+| `code-review-plugin-server` | up to 26.1013 (26.1111 runs `gh` on the host instead), turns on its bundled code-review plugin's MCP server with a `-c` setting and drives the Pull Requests panel through `mcpServer/tool/call`, `mcpServer/resource/read` and `mcpServerStatus/list` on server `code-review` | with `CLAUDE_CODEX_APP_PLUGIN_MCP=1` and gh signed in, the Pull Requests panel lists pull requests |
 | `quiet-turn-heartbeat` | leaves a thread read and sends no notification when the turn's last agent message ends with a `<heartbeat>` block deciding `DONT_NOTIFY`, and hides the block once the message completes | a turn that leaves a background agent running ends without an unread dot or visible block; the agent's report lights the dot |
 | `helper-thread-model` | generates titles, descriptions and turn summaries in ephemeral helper threads on its own OpenAI model, accepting another one, with `model: null` and an `outputSchema` declaring JSON Schema draft 2020-12 on `turn/start`, waiting 30 seconds for the answer; keeps the first words as the title when that fails | with Codex routing off, a new chat gets a generated title |
 | `model-menu-settings` | applies a model picked in an open chat with `thread/settings/update`, and on an error shows a "Couldn't update model settings" toast and puts the menu back (for `-32600` it adds "Check your config.toml.", the error message and an Open config.toml button); only code `-32601` or a method-not-found text means the method is missing | in a Claude chat with a reply, picking a Codex model shows the toast with the reason and keeps the Claude model |
 | `reasoning-summary` | shows a reasoning item only through its summary parts, bolding the first when there are several, and never renders its raw content | Claude's thinking shows above the reply, live and after the chat is reopened |
 | `reconnecting-errors` | shows an `error` with `willRetry` as a passing row in the turn; a `Reconnecting... n/m` message counts attempts and replaces a Reconnecting row right before it, any other message gets a row of its own | with the API answering 529 for a while, the turn shows `Reconnecting 1/10` counting up, then the reply; a running foreground subagent shows its own retries in its thread, not in the parent |
-| `error-codes` | reads `codexErrorInfo`: `serverOverloaded` shows "Server is busy", `usageLimitExceeded` opens a ChatGPT plan upgrade card, `cyberPolicy` a safety notice | a turn the overloaded API ends says the server is busy |
-| `thread-git-info` | shows `gitInfo.branch` in the sidebar, looks the workspace up itself when `thread/start` answers with none, replaces what it knows with the `thread/resume` answer, and sets the branch it creates with `thread/metadata/update` | after an App restart, a Claude chat in a repository still shows its branch in the sidebar |
-| `context-gauge` | fills the context gauge from the latest `thread/tokenUsage/updated` as `last.totalTokens` over `modelContextWindow`, and hides it when either is null | in a chat that has finished a turn, the gauge moves during a long turn instead of jumping at its end |
-| `collaboration-modes` | enables `/plan` and the Plan toggle only when `collaborationMode/list` has a `plan` preset, sends the mode with the picker's model and effort in `collaborationMode.settings` (top-level `model` and `effort` null on `turn/start`), and adopts the mode `thread/settings/updated` and `thread/resume` report | in a Claude chat `/plan` is enabled, and the Plan toggle stays on after a message |
-| `plan-implementation` | asks "Implement this plan?" when a completed turn has a non-empty `plan` item, and sends the plan back as a default-mode turn when accepted | a plan asked for in Plan mode shows as one card, followed by the prompt |
+| `error-codes` | reads `codexErrorInfo`: `serverOverloaded` shows "Server is busy" on a retry row and offers Retry on a failed turn, `usageLimitExceeded` opens a ChatGPT plan upgrade card, `cyberPolicy` a safety notice | a turn the overloaded API ends says why and offers Retry |
+| `thread-git-info` | shows `gitInfo.branch` in the sidebar, looks the workspace up itself when `thread/start` answers with none, replaces what it knows with the `thread/resume` answer (26.1111 keeps it), and sets the branch it creates with `thread/metadata/update` | after an App restart, a Claude chat in a repository still shows its branch in the sidebar |
+| `context-gauge` | fills the context gauge from the latest `thread/tokenUsage/updated` as `last.totalTokens` over `modelContextWindow`, and hides it when either is null | with Show context window usage on (off by default in 26.1111), in a chat that has finished a turn, the gauge moves during a long turn instead of jumping at its end |
+| `collaboration-modes` | enables `/plan` and the Plan toggle only when `collaborationMode/list` has a `plan` preset, sends the mode with the picker's model and effort in `collaborationMode.settings` (top-level `model` and `effort` null on `turn/start`), and adopts the mode `thread/settings/updated` reports, and the one `thread/resume` reports up to 26.1013 | in a Claude chat `/plan` is enabled, and the Plan toggle stays on after a message |
+| `plan-implementation` | asks "Implement this plan?" when a completed turn has a non-empty `plan` item, and sends a default-mode turn when accepted (the plan up to 26.1013; 26.1111 "Please implement the plan.", with the plan only when edited) | a plan asked for in Plan mode shows as one card, followed by the prompt |
 | `skill-injection` | sends a skill picked in the composer as a `[$name](path)` link, and one picked from a plugin or setup card as a `skill` input item | Claude follows a picked skill without reading its file first; the message shows only the chip |
-| `additional-context` | attaches `additionalContext` entries (`untrusted` or `application`) to `turn/start` and `turn/steer`, for example after connecting a suggested plugin, and keeps them out of the user's message | the turn after connecting a plugin uses the context; the message shows none of it |
+| `additional-context` | attaches `additionalContext` entries (`untrusted` or `application`) to `turn/start` and `turn/steer`, for example after connecting a suggested plugin (26.1111: on nearly every turn), and keeps them out of the user's message | the turn after connecting a plugin uses the context; the message shows none of it |
 | `injected-context` | sends `thread/inject_items` while no turn runs, before the `turn/start` it belongs to: an MCP app's content or an inline visualization's state as an `untrusted_input` call and output, or the boundary of a side chat as a user message; it expects them in the model's history and shows none of them | after interacting with an inline visualization, the next message gets no extra JSON reply, and Claude knows the state |
-| `app-tool-availability` | writes developer instructions describing its own tools (`create_thread`, `automation_update`, `create_worktree`, …) and gives them to Codex threads only | asked for a new thread or worktree, Claude points to the App; tool names new in the build's instructions are added to the list in `src/turn-context.mts` |
-| `prewarmed-threads` | starts a new chat's thread before anything is sent, hides it from `thread/list` until its first `turn/start`, and forgets it when the connection drops or the App quits; sends the first message there whatever model was picked meanwhile | after an adapter restart, a new chat left empty does not show in the sidebar; a new chat sent on a model of the other backend runs on it |
+| `app-tool-availability` | writes developer instructions describing its own tools (`create_thread`, `delete_thread`, `automation_update`, `create_worktree`, …) and gives them to Codex threads only | asked for a new thread or worktree, Claude points to the App; tool names new in the build's instructions are added to the list in `src/turn-context.mts` |
+| `prewarmed-threads` | starts a new chat's thread before anything is sent, hides it from `thread/list` until its first `turn/start`, deletes it once unused (26.1111: unsubscribes from it), and forgets it when the connection drops or the App quits; sends the first message there whatever model was picked meanwhile | after an adapter restart, a new chat left empty does not show in the sidebar; a new chat sent on a model of the other backend runs on it |
 | `file-change-preview` | replaces a `fileChange` item's changes with each `item/fileChange/patchUpdated`, adding the item if it has none of that id, and redraws its card while it is in progress; the approval card shows the changes the item holds | a long new file Claude writes shows up and grows while Claude writes it, and the approval shows the whole file |
 | `memories-settings` | shows its Memories settings and `/memories` only while `experimentalFeature/list` lists `memories` enabled; sets `memories: false` for the connection with `experimentalFeature/enablement/set`; writes `features.memories` and the `memories.*` switches with `config/batchWrite` and reads them from `config/read`; sends a chat's switch as `memories.*` config on `thread/start` or as `thread/memoryMode/set`; Delete calls `memory/reset` | with `CLAUDE_CODEX_MEMORIES=1` and Memories turned on in Settings > Personalization, the switch survives a reload and `/memories` shows in a chat; without the switch, no Memories settings show |
-| `mcp-settings` | lists Settings > MCP servers from `config/read` `mcp_servers` and saves to the file the `mcp_servers` origin names, saying the settings are unavailable without one; adds, edits and deletes a server with a `config/batchWrite` replace edit of `mcp_servers.<name>`, and switches it with `config/value/write` of `mcp_servers.<name>.enabled`; shows a refused save's error message under the form | with `CLAUDE_CODEX_APP_MCP_SERVERS=1`, a stdio server added there stays listed after a reload and its tools work in a Claude chat, and switched off, they are gone in the next turn; without it, saving a server shows the message naming the switch |
-| `desktop-mcp-servers` | writes `mcp_servers.node_repl` and `mcp_servers.cua_repl`, its desktop servers with its own environment, into the user config with `config/batchWrite` each time it starts | the main process still writes only those two |
+| `mcp-settings` | lists Settings > MCP servers from `config/read` `mcp_servers` and saves to the file the `mcp_servers` origin names, saying the settings are unavailable without one; adds and deletes a server with a `config/batchWrite` replace edit of `mcp_servers.<name>`, and edits one with it too up to 26.1013 (26.1111: one edit per changed field, with quoted keys such as `mcp_servers."<name>"."env"."<KEY>"`), and switches it with `config/value/write` of `mcp_servers.<name>.enabled`; shows a refused save's error message under the form | with `CLAUDE_CODEX_APP_MCP_SERVERS=1`, a stdio server added there stays listed after a reload and its tools work in a Claude chat, and switched off, they are gone in the next turn; without it, saving a server shows the message naming the switch |
+| `desktop-mcp-servers` | writes `mcp_servers.node_repl` and `mcp_servers.cua_repl`, its desktop servers with its own environment, into the user config with `config/batchWrite` each time it starts | the main process still writes only those two servers |
 | `settings-write-errors` | writes Settings > Configuration with `config/value/write`, reads the values back from `config/read`, and shows "Couldn't update this setting" next to a setting whose write fails; a skill switch on the Skills page sends `skills/config/write` and, when it fails, puts the switch back and shows "Failed to update skill" | picking a verbosity, or turning network access off, shows the error; turning a Claude skill off shows "Failed to update skill" and the switch stays on |
-| `permission-presets` | takes `config/read`'s `on-request` with `workspace-write` for its Default permissions preset only while `sandbox_workspace_write` is null, or has no `writable_roots` and `network_access` and both exclude flags false (app-shared `y4e`/`v4e`; `$_t`/`Q_t` in 26.930); otherwise lists Custom (config.toml) and preselects it for a new chat; Settings shows network access as that table's `network_access`, off when null | a new chat with no permissions picked before shows Default permissions, and the menu lists no Custom (config.toml) |
+| `permission-presets` | takes `config/read`'s `on-request` with `workspace-write` for its Default permissions preset only while `sandbox_workspace_write` is null, or has no `writable_roots` and `network_access` and both exclude flags false (app-shared `vXOR` export `Ns` in 26.1111, `y4e`/`v4e` in 26.1013, `$_t`/`Q_t` in 26.930); otherwise lists Custom (config.toml) and preselects it for a new chat; Settings shows network access as that table's `network_access`, off when null | a new chat with no permissions picked before shows Default permissions, and the menu lists no Custom (config.toml) |
 | `dynamic-tools` | registers its own tools as `thread/start` `dynamicTools` only on hosts that do not use its desktop MCP server, such as remote ones, and runs an `item/tool/call` request only while the turn it names is in progress | on a remote host with `CLAUDE_CODEX_DYNAMIC_TOOLS=1`, a tool call Claude makes to the App shows as a dynamic tool call card with its result |
 | `command-output-after-completion` | appends `item/commandExecution/outputDelta` to the command item with that id in any turn, completed or not, keeping its last 20000 characters, and drops a delta for an item it cannot find | a background command's item keeps showing new lines after its turn ends |
-| `explored-commands` | folds command items whose `commandActions` are all `read`, `listFiles` or `search` into one "Explored" row, and shows an item with no actions, an `unknown` one or a declined one as its command | Claude's Read, Grep and Glob calls and a `cat` or `rg` it runs fold into one "Explored" row |
-| `command-approval-actions` | shows a command approval as the commands of its `commandActions` joined with `&&` in place of `command`, and offers its own decisions whatever `availableDecisions` says | with approvals on, the card for `cat README.md && touch x` shows the whole command |
+| `explored-commands` | folds command items whose `commandActions` are all `read`, `listFiles` or `search` into one "Explored" row (26.1111: a "Read files" activity group), and shows an item with no actions, an `unknown` one or a declined one as its command | Claude's Read, Grep and Glob calls and a `cat` or `rg` it runs fold into one "Explored" row (26.1111: "Read files" group) |
+| `command-approval-actions` | shows a command approval as the commands of its `commandActions` joined with `&&` (26.1111: spaces) in place of `command`, and offers its own decisions whatever `availableDecisions` says | with approvals on, the card for `cat README.md && touch x` shows the whole command |
 | `turn-notices` | shows an `error` with `willRetry` as a dim row of its own under the turn it names, running or ended, without failing the turn; does not keep the row on reload, and ignores `warning` | a tool call a background task makes after the turn ended shows a row under that turn saying it was denied |
-| `compaction-marker` | draws a `contextCompaction` as "Context compacted" once completed or stored, and an open one as compacting in a running turn and as "Compaction interrupted" after it | an interrupted `/compact` shows as interrupted, a finished one as compacted, also after a reload, and one Claude Code could not do is not stored and sends no `thread/compacted` |
+| `compaction-marker` | draws a `contextCompaction` as compacted once completed or stored (26.1111: "Context compacted" only for its own `/compact`, else "Context automatically compacted"), and an open one as compacting in a running turn and as "Compaction interrupted" after it | an interrupted `/compact` shows as interrupted, a finished one as compacted, also after a reload, and one Claude Code could not do is not stored and sends no `thread/compacted` |
 | `item-completed-replaces` | replaces the item with the same id on `item/completed`, whatever type it started as | an image Read of a missing file shows as the failed Read, not an empty image; a compaction Claude could not do, within a turn or for a `/compact`, leaves no marker |
-| `command-approval-card` | draws a command approval from its params alone, but a file change approval only for a `fileChange` item with the request's `itemId` | a WebFetch approval in a Claude chat names the tool and the URL |
+| `command-approval-card` | draws a command approval from its params alone (26.1111 offers no session approval on it but for network access), but a file change approval only for a `fileChange` item with the request's `itemId` | a WebFetch approval in a Claude chat names the tool and the URL |
 | `command-approval-amendment` | offers "Allow similar commands" on a command approval whenever `proposedExecpolicyAmendment` is an array, whatever `availableDecisions` lists, and answers `acceptWithExecpolicyAmendment` with that array | after "Allow similar commands" for `npm test`, the project's `.claude/settings.local.json` allows `Bash(npm test *)` and the next `npm test` does not ask |
-| `mcp-tool-approval` | draws an `mcpServer/elicitation/request` with `_meta.codex_approval_kind` `mcp_tool_call` as a tool approval card, offering "Allow for this session" and "Always allow" as `_meta.persist` lists them, and answers with `_meta.persist` `session` or `always` | an MCP tool call asks to allow the server to run the tool; after "Allow for this session" the next call does not ask; after "Always allow" the project's `.claude/settings.local.json` allows `mcp__<server>__<tool>` |
+| `mcp-tool-approval` | draws an `mcpServer/elicitation/request` with `_meta.codex_approval_kind` `mcp_tool_call` as a tool approval card, offering "Allow for this session" (26.1111: "Allow this conversation") and "Always allow" as `_meta.persist` lists them, and answers with `_meta.persist` `session` or `always` | an MCP tool call asks to allow the server to run the tool; after "Allow for this session" the next call does not ask; after "Always allow" the project's `.claude/settings.local.json` allows `mcp__<server>__<tool>` |
 | `declined-tool-items` | shows a `commandExecution` or `fileChange` item with status `declined` as declined, without output or an exit code | a declined command shows as declined and Claude goes on; a cancelled one stops the turn |
-| `auto-review` | sends its auto-review preset as `approvalsReviewer` `guardian_subagent` (`auto_review` in newer builds), sets its picker from the `approvalsReviewer` of thread responses and `thread/settings/updated`, and draws `item/autoApprovalReview/completed` as a review card on the item named by `targetItemId` | on a model with auto mode the picker stays on auto-review and a call Claude's classifier blocks shows as declined with its reason; on one without, the picker goes back to the default with a config warning |
+| `auto-review` | sends its auto-review preset as `approvalsReviewer` `guardian_subagent` (26.1111 too; `auto_review` only for its hosted threads), sets its picker from the `approvalsReviewer` of thread responses and `thread/settings/updated`, and draws `item/autoApprovalReview/completed` as a review card on the item named by `targetItemId` | on a model with auto mode the picker stays on auto-review and a call Claude's classifier blocks shows as declined with its reason; on one without, the picker goes back to the default with a config warning |
 | `thread-read-state` | with `threadReadState` on, syncs a thread's unread dot with the server only once `thread/read` or `thread/list` returned a `readState` for it, and keeps the dot to itself after `thread/readState/update` fails with `-32601` | the bundle still gives up before the update without a `readState`; a chat that finishes a turn in the background shows its unread dot, and opening it clears the dot, for a native Codex chat too |
 
 The full text of each rule, including the adapter side, is in
@@ -135,17 +135,27 @@ and prints:
   the client requests among them, and the names in a protocol namespace that
   the protocol does not have (methods of the App's other hosts, MIME types
   such as `model/obj`). A client request the App names that the adapter
-  answers with `-32601` is a problem. With `--bundle-only`, so is a newly
+  answers with `-32601` is a problem, unless the case says why with an
+  `// App rule: <id>` comment right above it: the report lists such a
+  request as "-32601 by design" (a case answers `-32601` with
+  `methodNotFound(method)` or with an `RpcError` carrying
+  `METHOD_NOT_FOUND`, as Codex does for a feature it lacks). With
+  `--bundle-only`, so is a newly
   named method outside the baseline's protocol that the adapter has no `case`
   for, since it may be a new request; otherwise it is a note.
 - **Feature gates** — the App's gate table, each marked on or off for the
-  version the adapter reports, with new, changed and removed gates, and the
-  minimum app-server version the App accepts. A gate that is on while the
+  version the adapter reports (a gate without a version shows as "never"),
+  with new, changed and removed gates, and the minimum app-server version the
+  App accepts. A gate that was on and is now off for that version is a note,
+  and a gate listed in `KEPT_OFF_GATES` that the version turns on is a
+  problem. A gate that is on while the
   adapter answers one of its methods in `GATED_METHODS` with `-32601` is a
   problem; a new gate that is on and not in `GATED_METHODS` gets a note to
   find its methods and add them there (an empty list for a gate that needs
   none).
-- **clientInfo names** — the names the App sends in `initialize`.
+- **clientInfo names** — the names the App sends in `initialize`. One of them
+  must be a desktop App name the adapter knows (`DESKTOP_CLIENT_NAMES`), or
+  an unverified build would go unreported.
 - **App rules** — the checklist above, to go through by hand with the App
   connected to the adapter.
 
@@ -165,8 +175,7 @@ is clean and the rules hold:
 The App decides which features to use from the app-server version in the
 `initialize` userAgent, which the adapter takes from
 `CLAUDE_CODEX_COMPAT_VERSION`. The default, `0.163.0-alpha.10.2`, is the Codex
-build of the baseline App, 26.1013 (`codexVersion` in
-`scripts/app-baseline.json`), so every gate that build knows is on. Codex
+build of App 26.1013, so every gate that build knows is on. Codex
 `0.163.0` has the same app-server protocol. Every gate App 26.930 knows needs
 `0.159.0-alpha.12.1`, its own Codex build, or less, so it turns the same
 features on as before. Against the previous default, `0.159.0-alpha.12.1`,
@@ -186,14 +195,61 @@ these gates of App 26.1013 are newly on:
   `instantInterrupt`, `outputTokenReplay` and `preserveForkPrefix`, which only
   let a Codex feature key through in the config the App sends.
 
+App 26.1111 ships Codex `0.169.0-alpha.11.1`, still accepts `0.141.0` and up,
+and adds gates. At the default version these of them are on:
+
+- `threadReadState`: on any host but its hosted `durable` one, the App reads
+  a thread's unread state as `readState` from `thread/read` and `thread/list`
+  and writes it back with `thread/readState/update`. It asks `thread/read` first and writes nothing
+  while that returns no `readState`, and it stops trying on the connection
+  once `thread/readState/update` answers method not found.
+- `threadGoalProvenance`: `origin` (`user` or `automatic`) on
+  `thread/goal/set` and `thread/goal/clear`, which the adapter ignores.
+- `computerAudio`: with the App's computer-use audio switched on, its main
+  process pages `model/list` (`includeHidden`) for models whose
+  `inputModalities` include `audio`, and sets the audio variables of the
+  `node_repl` server it writes into the config (rule `desktop-mcp-servers`).
+  No Claude model lists audio.
+- `capacityErrorRetries`: the App no longer schedules its own retry
+  (after 10, 30, 120 and 300 seconds) of a turn that failed with
+  `serverOverloaded`, leaving retries to the server; the Claude CLI retries an
+  overloaded API itself before the turn fails (rule `error-codes`).
+- `initialDaybreakEnabled`: `daybreakEnabled` on `thread/start`, only for a
+  config whose `model_provider` is `openai`; the adapter's is `claude-code`.
+
+`asyncCompaction` now needs `0.163.0-alpha.11`, so it is off: the App drops
+the `async_compaction` key from the config it sends, which Claude threads
+ignore anyway. The other new gates stay off at the default, because they need
+a newer Codex: `feedbackSave`, `threadSample`, `threadSampleInterruptOnCancel`,
+`gcpSetup`, `modelProviderSetup`, `threadMemorySummary`, `attachedThreads`,
+`attachedThreadSearch`, `persistentSideChats`, `threadCallableApps`,
+`skillCatalogDeltas`, `incrementalToolsLegacy`,
+`guardianNativeMultiAgentHistory`, `threadRealtimeVoiceBackend` and
+`realtimeVoiceSessionId`. Three gates, `commandSessionsWorldState`,
+`desktopMcpSocket` and `incrementalToolsLegacyGcp`, have no version at all
+(`null` in the gate table, "never" in the upgrade check), so no Codex release
+turns them on. Raising the default to `0.169.0-alpha.11.1` would turn the
+others on, and with them features Claude threads cannot serve: from
+`0.164.0-alpha.11`, for one, the App saves its diagnostics on a local
+connection through `feedback/save`, and every save would fail ("Choose a new
+filename and try again") whatever the adapter answered; `gcpSetup` and
+`modelProviderSetup` offer sign-ins the adapter refuses. Each needs a look at
+what it makes the App send before the default goes past it. `KEPT_OFF_GATES`
+in `src/app-compat.mts` lists these gates with why each stays off (the
+others: not examined yet); `check:app-upgrade` reports a version that turns
+one on as a problem, and a test keeps the default below all of them.
+`threadSample` and `threadMemorySummary` are in `GATED_METHODS` instead:
+predictions stop before `thread/sample` for a thread whose provider is not
+`openai`, and `thread/memory/read` answers with no summary.
+
 On macOS the App's LaTeX preview, a separate app-server client, needs
 `0.149.0-alpha.4` or newer, and `0.162.0-alpha.20` for a project under `/tmp`
 or `/var/tmp`; below that it says LaTeX previews need a newer Codex. The
 default meets both. Raising the default for a newer App changes
 `DEFAULT_CODEX_COMPAT_VERSION` in `src/util.mts` and the matching default in
-`scripts/codex-shim`; tests keep the two equal and the default at the
-baseline's `codexVersion`, and check:app-upgrade lists what each gate it
-turns on needs.
+`scripts/codex-shim`; tests keep the two equal and the default no newer
+than the baseline's `codexVersion`, and check:app-upgrade lists what each
+gate it turns on needs.
 
 `GATED_METHODS` in `src/app-compat.mts` maps each gate to the requests it adds
 or changes, and `test/app-compat.test.mts` checks that the adapter answers
@@ -226,7 +282,9 @@ A Claude chat has no read state: its `thread/read` carries no `readState`,
 and `thread/readState/update` gets `-32601`, as from a Codex without its state
 database (rule `thread-read-state`); a native Codex chat's read state is its
 Codex child's, which answers both. `thread/prediction/request` gets `-32601`
-too, since Codex does not implement it either.
+too, since Codex does not implement it either, and so do three requests of
+the 0.169 protocol that App 26.1111 never sends: `account/securitySetup/read`,
+`thread/guardianReview` and `thread/prepareApprovedPlan`.
 
 ### What the gates change
 

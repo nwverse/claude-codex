@@ -11,6 +11,7 @@ import {
   appMcpServers,
   appMcpServersEnabled,
   appMcpServerTable,
+  type ConfigEdit,
   editMcpServers,
   pruneLegacySettings,
   unsupportedSettingWrite,
@@ -1561,6 +1562,13 @@ export class CodexClaudeAppServer {
         throw new RpcError('durable thread read state unavailable', undefined, METHOD_NOT_FOUND)
       // Codex itself answers this with method not found; no App build sends it.
       case 'thread/prediction/request':
+      // Requests of the 0.169 protocol that App 26.1111 never sends, for
+      // features Claude threads do not have (a ChatGPT account's security
+      // setup, guardian reviews on demand, an approved plan carried into a
+      // new thread): answered as by a Codex without them.
+      case 'account/securitySetup/read':
+      case 'thread/guardianReview':
+      case 'thread/prepareApprovedPlan':
         throw methodNotFound(method)
       default: {
         const result = hostMethod(method, asRecord(params))
@@ -10065,6 +10073,7 @@ export class CodexClaudeAppServer {
     const overrides = structuredClone(this.configOverrides)
     let model = this.configModel
     let effort = this.configReasoningEffort
+    const serverEdits: ConfigEdit[] = []
     for (const edit of configEdits(params)) {
       const { keyPath, value } = edit
       if (keyPath === 'model' && typeof value === 'string' && value.length > 0) {
@@ -10074,7 +10083,7 @@ export class CodexClaudeAppServer {
         effort = normalizeCodexReasoningEffort(value) ?? effort
         edits.model_reasoning_effort = effort
       } else if (keyPath === 'mcp_servers' || keyPath.startsWith('mcp_servers.')) {
-        editMcpServers(overrides, edit)
+        serverEdits.push(edit)
       } else {
         const unsupported = unsupportedSettingWrite(edit)
         if (unsupported instanceof RpcError) throw unsupported
@@ -10088,6 +10097,7 @@ export class CodexClaudeAppServer {
         }
       }
     }
+    if (serverEdits.length > 0) editMcpServers(overrides, serverEdits)
     if (!isDeepStrictEqual(overrides, this.configOverrides)) edits.overrides = overrides
     this.persistConfig(saved, edits)
     this.configOverrides = overrides

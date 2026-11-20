@@ -270,3 +270,37 @@ function isTable(value: unknown): value is Table {
 function setKey(table: Table, key: string, value: unknown): void {
   Object.defineProperty(table, key, { value, enumerable: true, writable: true, configurable: true })
 }
+
+// The keys of a dotted key path, as config/value/write and config/batchWrite
+// take it. A key may be quoted as in TOML, with \" and \\ escapes, and then
+// holds any character (the Codex App writes mcp_servers."name"."env"."KEY").
+// null for a path that is not well formed.
+export function dottedKeyParts(keyPath: string): string[] | null {
+  const parts: string[] = []
+  let i = 0
+  while (i <= keyPath.length) {
+    let part = ''
+    if (keyPath[i] === '"') {
+      i += 1
+      while (keyPath[i] !== '"') {
+        if (i >= keyPath.length) return null
+        if (keyPath[i] === '\\') {
+          i += 1
+          if (keyPath[i] !== '"' && keyPath[i] !== '\\') return null
+        }
+        part += keyPath[i]
+        i += 1
+      }
+      i += 1
+      if (i < keyPath.length && keyPath[i] !== '.') return null
+    } else {
+      const end = keyPath.indexOf('.', i)
+      part = keyPath.slice(i, end < 0 ? keyPath.length : end)
+      if (part.length === 0 || part.includes('"')) return null
+      i += part.length
+    }
+    parts.push(part)
+    i += 1
+  }
+  return parts
+}

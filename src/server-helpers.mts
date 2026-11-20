@@ -4,6 +4,7 @@ import { createInterface } from 'node:readline'
 import type { ConfigEdit } from './app-settings.mjs'
 import type { AppSkill } from './claude-capabilities.mjs'
 import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
+import { dottedKeyParts } from './toml.mjs'
 import { type AppToolNoteOptions, appToolAvailabilityNote } from './turn-context.mjs'
 import type {
   ApprovalsReviewer,
@@ -231,10 +232,13 @@ const CREDENTIAL_HOLDER_KEY = /^(env|headers|http_headers|env_http_headers|args|
 const CREDENTIAL_KEY = /token|secret|passw|api.?key|auth|cookie|credential|bearer|private.?key/i
 const REDACTED = '[redacted]'
 
-// `value`, written at `keyPath` (dotted, as in config/value/write) of the
-// config, as the debug log may show it.
+// `value`, written at `keyPath` (dotted, as in config/value/write, with
+// TOML-quoted keys as App 26.1111 writes MCP server fields) of the config,
+// as the debug log may show it.
 function redactConfigValue(keyPath: string, value: unknown): unknown {
-  const segments = keyPath.split('.')
+  const segments = keyPath === '' ? [] : dottedKeyParts(keyPath)
+  // A path that does not parse may still name a credential's key in quotes.
+  if (!segments) return redactLeaves(value)
   if (
     segments.some((segment) => CREDENTIAL_HOLDER_KEY.test(segment) || CREDENTIAL_KEY.test(segment))
   )

@@ -17,23 +17,29 @@ export interface AppRule {
 }
 
 // App builds every rule below was checked against.
-export const VERIFIED_APP_VERSIONS: readonly string[] = ['26.930.21537', '26.1013.40934']
+export const VERIFIED_APP_VERSIONS: readonly string[] = [
+  '26.930.21537',
+  '26.1013.40934',
+  '26.1111.21308',
+]
 
-// initialize.clientInfo.name of the desktop App. Its other app-server clients
-// (the LaTeX preview, for one) use their own names and versions.
-export const DESKTOP_CLIENT_NAME = 'codex_desktop'
+// initialize.clientInfo.name of the desktop App: "Codex Desktop" from 26.1111,
+// "codex_desktop" before. Its other app-server clients (the LaTeX preview,
+// for one) use their own names and versions.
+export const DESKTOP_CLIENT_NAMES: readonly string[] = ['Codex Desktop', 'codex_desktop']
 
 export const APP_RULES: readonly AppRule[] = [
   {
     id: 'client-info',
-    app: `Identifies itself in initialize as clientInfo.name "${DESKTOP_CLIENT_NAME}" with its build as the version.`,
+    app: 'Identifies itself in initialize with its build as clientInfo.version, and as clientInfo.name "Codex Desktop" (26.1111; "codex_desktop" up to 26.1013, which it still uses as its service name).',
     adapter:
-      'Checks that version against VERIFIED_APP_VERSIONS and gates the completed subagent kind on it.',
-    verify: 'check:app-upgrade finds the clientInfo name in the bundle.',
+      'Takes either name for the desktop App, checks its version against VERIFIED_APP_VERSIONS, and gates the completed subagent kind on that version.',
+    verify:
+      'check:app-upgrade finds one of DESKTOP_CLIENT_NAMES as a clientInfo name in the bundle.',
   },
   {
     id: 'feature-gates',
-    app: 'Turns features on by the app-server version in the initialize userAgent (the server-side message queue needs 0.148.0-alpha.14) and rejects a version below its minimum.',
+    app: 'Turns features on by the app-server version in the initialize userAgent (the server-side message queue needs 0.148.0-alpha.14; a gate without a version is never on) and rejects a version below its minimum (0.141.0).',
     adapter:
       'Reports codexCompatVersion() there; CLAUDE_CODEX_COMPAT_VERSION picks which gated features the App uses.',
     verify:
@@ -41,19 +47,19 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'prediction-provider',
-    app: 'From 26.1013, with experimentalPredictionForkMode on, predicts the next composer message in a thread/fork with experimentalPredictionMode, only for a thread whose modelProvider is openai.',
+    app: 'Predicts the next composer message only for a thread whose modelProvider is openai: 26.1013 in a thread/fork with experimentalPredictionMode (experimentalPredictionForkMode gate); 26.1111 only with thread/sample after a thread/resume and with a ChatGPT sign-in (threadSample gate; below it, it predicts nothing and forks nothing). 26.1111 uses experimentalPredictionForkMode for an adaptive title refresh instead, which checks no provider: behind a Statsig experiment, every 5th completed turn of a chat whose title it generated, it forks the chat ephemeral, with experimentalPredictionMode, excludeTurns and no model, and asks the fork for a new title in a turn without an outputSchema.',
     adapter:
-      'Reports modelProvider claude-code for every thread, so the App never forks a Claude thread for a prediction.',
+      "Reports modelProvider claude-code for every thread, so the App never predicts the next message of a Claude thread. A title-refresh fork of a Claude chat is an ephemeral fork on the chat's model (see helper-thread-model).",
     verify:
-      'In the bundle, the prediction path still gives up with unsupported_provider before its thread/fork when modelProvider is not openai.',
+      'In the bundle, the prediction path still gives up with unsupported_provider before thread/sample (or its thread/fork) when modelProvider is not openai, and the title refresh still forks with excludeTurns and leaves the fork when its turn fails.',
   },
   {
     id: 'daemon-version',
-    app: 'With CODEX_APP_SERVER_USE_LOCAL_DAEMON=1 on a local host, runs `codex app-server daemon version` (2.5 s timeout) before connecting. When it prints JSON whose appServerVersion is at least 0.141.0, the App talks to the server on <CODEX_HOME>/app-server-control/app-server-control.sock instead of starting one over stdio; when it fails, the App starts its own.',
+    app: 'With CODEX_APP_SERVER_USE_LOCAL_DAEMON=1 on a local host, runs `codex app-server daemon version` (2.5 s timeout) before connecting. When it prints JSON whose appServerVersion is at least 0.141.0, the App talks to the server on <CODEX_HOME>/app-server-control/app-server-control.sock instead of starting one over stdio; when it fails, the App starts its own. 26.1111 probes only for a connection without -c overrides (and without CODEX_CLI_PATH or a codex_cli_command), and its desktop connection always passes one (plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled), so it always starts its own server.',
     adapter:
-      'Answers the probe without opening the state database: the compat version when a server accepts connections on that socket (the unix daemon listens there by default), a failure otherwise.',
+      'Answers the probe without opening the state database: the compat version when a server accepts connections on that socket (the unix daemon listens there by default), a failure otherwise. 26.1111 never asks.',
     verify:
-      'Find `daemon`,`version` in the network-startup chunk of the bundle and check the socket path and the version check next to it.',
+      'Find `daemon`,`version` in the network-startup chunk of the bundle and check the socket path, the version check next to it, and which connections can reach it.',
   },
   {
     id: 'config-warnings',
@@ -173,16 +179,17 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'completed-wait',
-    app: 'Marks every working agent of the thread done when a wait completes, and never draws the wait itself.',
+    app: "Up to 26.1013 marks every working agent of the thread done when a wait completes; 26.1111 does so only for ChatGPT-hosted conversations and takes a local agent's state from its own thread. Never draws the wait itself.",
     adapter:
       "Closes a wait as failed while another agent of the thread still runs, or once Claude backgrounds the agent; the child's own state carries its outcome.",
     verify: 'Run two agents in parallel: the first to finish does not mark the second done.',
   },
   {
     id: 'agent-states',
-    app: 'Shows agentState interrupted as done and errored as failed.',
+    app: 'Up to 26.1013 shows agentState interrupted as done and errored as failed. 26.1111 keeps only agents that finished in its subagent panel: interrupted, errored, shutdown and notFound agents, and children whose last turn failed or was interrupted, leave it; the transcript row names the state.',
     adapter: 'Marks a stopped agent interrupted and one that ended without a result errored.',
-    verify: 'Stop a running subagent; it shows as done, not failed.',
+    verify:
+      'Stop a running subagent: on 26.1013 it shows as done, not failed; on 26.1111 it leaves the panel and its row says interrupted.',
   },
   {
     id: 'subagent-failure-reason',
@@ -201,7 +208,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'child-prompt',
-    app: 'Creates the child conversation from thread/started with an empty turn and takes its history as loaded while the child runs.',
+    app: 'Creates the child conversation from thread/started, with an empty turn up to 26.1013 and with no turns in 26.1111, which adds an in-progress turn on the first turn/started and items to it as they start.',
     adapter: "Replays the child's prompt as an item lifecycle.",
     verify: 'Open a running subagent before it answers: its prompt shows.',
   },
@@ -223,7 +230,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'rate-limit-banner',
-    app: 'Shows a rate-limit banner for every account/rateLimits/updated notification.',
+    app: 'Showed a rate-limit banner for every account/rateLimits/updated notification up to 26.1013; 26.1111 ignores the notification and reads its usage from ChatGPT.',
     adapter: 'Sends none per turn; account/rateLimits/read answers the snapshot.',
     verify: 'No rate-limit banner appears after an ordinary reply.',
   },
@@ -244,7 +251,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'inline-visualizations',
-    app: 'Renders an HTML fragment inside a reply from a `::codex-inline-vis{path="…"}` line of its own. It takes the date in the thread\'s visualization folder, <CODEX_HOME>/visualizations/<YYYY/MM/DD>/<thread id>, from the thread id and refuses the read for an id that is not a UUIDv7. It reads only a file named like `^[a-z0-9]+(-[a-z0-9]+)*\\.html$`, at an absolute path inside that folder, the thread\'s workspace or writable roots, or /tmp where the sandbox allows it, of at most 5e6 bytes. It installs its bundled plugins, visualize among them, with plugin/install each time it starts.',
+    app: 'Renders an HTML fragment inside a reply from a `::codex-inline-vis{path="…"}` line of its own. It takes the date in the thread\'s visualization folder, <CODEX_HOME>/visualizations/<YYYY/MM/DD>/<thread id>, from the thread id and refuses the read for an id that is not a UUIDv7 (26.1111 also takes its UUIDv8 form). It reads only a file named like `^[a-z0-9]+(-[a-z0-9]+)*\\.html$`, at an absolute path inside that folder, the thread\'s workspace or writable roots, or /tmp where the sandbox allows it, of at most 5e6 bytes. It installs its bundled plugins, visualize among them, with plugin/install each time it starts; 26.1111 only those plugin/list does not report installed and current.',
     adapter:
       "Issues UUIDv7 ids for new threads, forks and subagents. Remembers the visualize plugin from plugin/install, and lists its skill, the directive and the thread's folder in the desktop prompt of a thread with a UUIDv7 id. Lets Claude read inside the skill's folder and the thread's folder without asking.",
     verify:
@@ -260,9 +267,9 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'code-review-plugin-server',
-    app: "Starts a local app-server with -c plugins.code-review@openai-bundled.mcp_servers.code-review.enabled=true and CODEX_MCP_NODE_PATH set to its bundled Node, installs the code-review plugin with plugin/install, and drives its Pull Requests panel, PR search, PR view and code-review settings through mcpServer/tool/call (server code-review, pull_requests.* tools, _meta with the thread id), mcpServer/resource/read (ui://pull-requests/*) and mcpServerStatus/list, which counts the server as started when serverInfo is set and finds the panel entry points in the tools' _meta (ui.resourceUri, openai/ui entrypoints).",
+    app: "Up to 26.1013 (26.1111 has no code-review plugin and runs gh on the host for its pull requests): starts a local app-server with -c plugins.code-review@openai-bundled.mcp_servers.code-review.enabled=true and CODEX_MCP_NODE_PATH set to its bundled Node, installs the code-review plugin with plugin/install, and drives its Pull Requests panel, PR search, PR view and code-review settings through mcpServer/tool/call (server code-review, pull_requests.* tools, _meta with the thread id), mcpServer/resource/read (ui://pull-requests/*) and mcpServerStatus/list, which counts the server as started when serverInfo is set and finds the panel entry points in the tools' _meta (ui.resourceUri, openai/ui entrypoints).",
     adapter:
-      "With CLAUDE_CODEX_APP_PLUGIN_MCP=1, remembers the plugins plugin/install names, reads the -c settings and the Codex config's [plugins] tables, and runs the code-review plugin's .mcp.json server as one long-lived process in the plugin's folder, with Codex's default variables and the ones the entry lists, credentials left out. Lists it with pluginId, serverInfo, runtimeStatus and its tools as the server lists them, _meta included, and sets the thread id in a call's _meta as Codex does. Refuses to start an app-server from inside a plugin server.",
+      "With CLAUDE_CODEX_APP_PLUGIN_MCP=1 (which 26.1111 does not use), remembers the plugins plugin/install names, reads the -c settings and the Codex config's [plugins] tables, and runs the code-review plugin's .mcp.json server as one long-lived process in the plugin's folder, with Codex's default variables and the ones the entry lists, credentials left out. Lists it with pluginId, serverInfo, runtimeStatus and its tools as the server lists them, _meta included, and sets the thread id in a call's _meta as Codex does. Refuses to start an app-server from inside a plugin server.",
     verify:
       'With the switch on and gh signed in, open the Pull Requests panel: it lists pull requests and a PR opens; mcpServerStatus/list shows code-review connected.',
   },
@@ -304,19 +311,19 @@ export const APP_RULES: readonly AppRule[] = [
     adapter:
       "Turns each retry the Claude CLI reports for a chat's main loop (system/api_retry) into an `error` with willRetry, the message \"Reconnecting... n/m\" and the HTTP status and wait in additionalDetails, and does not store it, as Codex does not. A foreground subagent's retry, which the CLI reports as its Agent call's tool_progress with subagent_retry, shows the same way in that subagent's thread while its turn runs, and never in the parent (the CLI reports none for a background agent); retries in a structured-output helper turn show nothing.",
     verify:
-      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10", counting up, and then the reply; a foreground subagent running then shows its own retries in its thread.',
+      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10" (26.1111: "Server is busy, reconnecting 1/10"), counting up, and then the reply; a foreground subagent running then shows its own retries in its thread.',
   },
   {
     id: 'error-codes',
-    app: 'Reads codexErrorInfo on `error` notifications and failed turns: serverOverloaded shows "Server is busy" and may offer a retry, usageLimitExceeded opens a ChatGPT plan upgrade card, cyberPolicy a safety notice, and unauthorized is only counted.',
+    app: 'Reads codexErrorInfo on `error` notifications and failed turns: serverOverloaded shows "Server is busy" on a retry row, and a failed turn with it offers Retry (26.1111 retries such a turn by itself only below the capacityErrorRetries gate, and offers Resume in the empty composer after serverOverloaded, internalServerError, httpConnectionFailed or responseStreamDisconnected), usageLimitExceeded opens a ChatGPT plan upgrade card, cyberPolicy a safety notice, and unauthorized is only counted.',
     adapter:
       "Gives every error a code from what the Claude CLI reported: contextWindowExceeded, serverOverloaded, rateLimitExceeded, badRequest, internalServerError, httpConnectionFailed, responseStreamDisconnected with the HTTP status for a retry, and other for the rest. It never sends usageLimitExceeded or cyberPolicy, and an authentication failure stays other. A CLI that refused to start is httpConnectionFailed when a retry can fix the reason it gave and other when it cannot, with a message the adapter writes and never the CLI's own output.",
     verify:
-      'Let the API stay overloaded until Claude gives up: the failed turn says the server is busy instead of showing a bare error.',
+      'Let the API stay overloaded until Claude gives up: the failed turn says why and offers Retry instead of showing a bare error.',
   },
   {
     id: 'thread-git-info',
-    app: "Shows a thread's gitInfo.branch in the sidebar and uses originUrl for the repository name and pull request flows. When thread/start answers with gitInfo null it looks the workspace up itself; a thread/list refresh keeps what it knows when a row has none, but thread/resume replaces it with the answer's gitInfo. After creating a branch for a thread it sends thread/metadata/update with gitInfo.branch.",
+    app: "Shows a thread's gitInfo.branch in the sidebar and uses originUrl for the repository name and pull request flows. When thread/start answers with gitInfo null it looks the workspace up itself; a thread/list refresh keeps what it knows when a row has none, and so does thread/resume from 26.1111 (26.1013 replaced it with the answer's gitInfo). After creating a branch for a thread it sends thread/metadata/update with gitInfo.branch.",
     adapter:
       "Stores gitInfo on the thread: looked up after thread/start, on a resume of a thread without it, and when a turn ends, so thread/list and thread/read never run git. thread/start answers with null as Codex does, and thread/metadata/update patches gitInfo with Codex's rules.",
     verify:
@@ -328,11 +335,11 @@ export const APP_RULES: readonly AppRule[] = [
     adapter:
       "Reports each main-loop API call as it streams, with that call as last and on top of the settled total, once a result has reported the window for the thread or its model; the turn's result then settles the total. A subagent's tokens add to the total and leave last alone.",
     verify:
-      'Ask for a task with many tool calls in a chat that has finished a turn: the context gauge moves while Claude works instead of jumping when the turn ends.',
+      'With Show context window usage on (26.1111 hides the gauge by default), ask for a task with many tool calls in a chat that has finished a turn: the context gauge moves while Claude works instead of jumping when the turn ends.',
   },
   {
     id: 'collaboration-modes',
-    app: "Enables /plan and the composer's Plan toggle only when collaborationMode/list returns a preset with mode plan, and keeps only the plan and default presets. Sends the chosen mode as collaborationMode through thread/settings/update and on turn/start, where it sets the top-level model and effort to null and puts the picker's model and effort in collaborationMode.settings. Adopts the collaborationMode of thread/settings/updated and of the thread/resume response as the composer's mode.",
+    app: "Enables /plan and the composer's Plan toggle only when collaborationMode/list returns a preset with mode plan, and keeps only the plan and default presets. Sends the chosen mode as collaborationMode through thread/settings/update and on turn/start, where it sets the top-level model and effort to null and puts the picker's model and effort in collaborationMode.settings. Adopts the collaborationMode of thread/settings/updated as the composer's mode, and up to 26.1013 that of the thread/resume response; 26.1111 opens a resumed chat in Default.",
     adapter:
       "Lists a Plan and a Default preset without a model or effort, takes a turn's model and effort from collaborationMode.settings, keeps the mode per thread for turns that name none, also across a restart, and reports the thread's real mode in thread/settings/updated and thread/resume. A fork starts in Default, as a Codex fork does; the App sends the mode it shows for the fork on the fork's turns.",
     verify:
@@ -340,7 +347,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'plan-implementation',
-    app: 'When a turn completes, takes the text of its last plan item and asks "Implement this plan?"; accepting switches the composer to the default mode and sends the plan back as a new turn.',
+    app: 'When a turn completes, takes the text of its last plan item and asks "Implement this plan?"; accepting switches the composer to the default mode and sends a new turn: the plan up to 26.1013; in 26.1111 "Please implement the plan.", with the plan only when the user edited it.',
     adapter:
       'In plan mode turns the plan Claude hands to ExitPlanMode into one plan item (started, one delta, completed) and refuses the tool call without an interrupt, so the turn completes; what Claude writes around it stays agent messages.',
     verify:
@@ -356,7 +363,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'additional-context',
-    app: "Attaches additionalContext ({key: {value, kind}}, kind untrusted or application) to turn/start and turn/steer, for the turn that follows connecting a suggested plugin, an edited page or writing block, and quick chat. It does not show the context in the user's message.",
+    app: "Attaches additionalContext ({key: {value, kind}}, kind untrusted or application) to turn/start and turn/steer, for the turn that follows connecting a suggested plugin, an edited page or writing block, and quick chat; 26.1111 also on nearly every turn (client time, git state, heartbeat and worktree guidance), an untrusted entry may carry a name, and a turn/start after an App update can carry it with empty input. It does not show the context in the user's message.",
     adapter:
       'Adds each entry to the prompt Claude reads as an <app_context key kind> block, capped at 32 KiB, behind a note that untrusted blocks are data and not instructions; the userMessage item and the chat preview leave it out.',
     verify:
@@ -372,7 +379,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'app-tool-availability',
-    app: 'Writes developerInstructions for every local thread that describe its own tools (create_thread, read_thread, automation_update, create_worktree, sidebar tools and others) and the ::created-thread directive, and gives Codex threads those tools.',
+    app: 'Writes developerInstructions for every local thread that describe its own tools (create_thread, read_thread, delete_thread, automation_update, create_worktree, sidebar tools and others) and the ::created-thread directive, and gives Codex threads those tools.',
     adapter:
       'Gives Claude threads none of them, so it appends a short "# Tool availability" section after the developer instructions naming the tools they mention, and asks Claude not to look for them or write their directives and to send the user to the App instead. appToolAvailabilityNote in src/turn-context.mts builds it, and leaves out the tools and the directive advice a thread is given as having.',
     verify:
@@ -380,7 +387,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'prewarmed-threads',
-    app: "Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits. It sends the chat's first message to that thread whatever model was picked meanwhile, comparing only permissions, instructions and feature overrides.",
+    app: "Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes (26.1111: unsubscribes from it with thread/unsubscribe instead, after 10 minutes, or 285 seconds in the window, or when a model is picked, and then prewarms another). It forgets such threads when the app-server connection drops or the App quits. It sends the chat's first message to that thread whatever model was picked meanwhile, comparing only permissions, instructions and feature overrides.",
     adapter:
       'Lists and searches a thread only once it has a turn or a preview, as Codex lists a thread only once it has a user message, so a prewarmed chat the App forgot does not show up empty in the sidebar. The archive, a chosen section and subagent queries still list every thread. A thread with no conversation yet takes the backend (and model process profile) of the model its first turn names, so that message runs on the model picked.',
     verify:
@@ -404,19 +411,18 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'mcp-settings',
-    app: 'Lists the servers of Settings > MCP servers from config/read mcp_servers, and saves to the file of the first user layer, or else of the user, system or project origin of mcp_servers (or of mcp_servers.<name>); with neither it says "MCP server settings are unavailable". Adding, editing or deleting a server sends config/batchWrite with one replace edit of mcp_servers.<name> (null deletes); its switch sends config/value/write of mcp_servers.<name>.enabled with upsert. A server whose origin is a project file cannot be edited, and a server mcpServerStatus/list reports that config/read does not list shows apart from the others. A refused save shows the error message under the form.',
+    app: 'Lists the servers of Settings > MCP servers from config/read mcp_servers, and saves to the file of the first user layer, or else of the user, system or project origin of mcp_servers (or of mcp_servers.<name>); with neither it says "MCP server settings are unavailable". Adding or deleting a server sends config/batchWrite with one replace edit of mcp_servers.<name> (null deletes), and so did editing one up to 26.1013; 26.1111 saves an edited server with one replace edit per changed field, and per changed entry of its env and headers, with TOML-quoted keys (mcp_servers."<name>"."env"."<KEY>"). Its switch sends config/value/write of mcp_servers.<name>.enabled with upsert. A server whose origin is a project file cannot be edited, and a server mcpServerStatus/list reports that config/read does not list shows apart from the others. A refused save shows the error message under the form.',
     adapter:
-      "Reports the user config file as the origin of mcp_servers. Only with CLAUDE_CODEX_APP_MCP_SERVERS=1: lists the servers the App added with that origin each, keeps them in its own config file, and starts the enabled ones in Claude threads; a write naming no command or URL, a field of the wrong type, or the switch of a server the App never added is refused. Without it, config/read lists no server and every write that would add, change or delete one is refused with a message naming the switch and Claude Code's own MCP config.",
+      "Reports the user config file as the origin of mcp_servers. Only with CLAUDE_CODEX_APP_MCP_SERVERS=1: lists the servers the App added with that origin each, keeps them in its own config file, and starts the enabled ones in Claude threads; a write naming no command or URL, a field of the wrong type, or the switch of a server the App never added is refused. Without it, config/read lists no server and every write that would add, change or delete one is refused with a message naming the switch and Claude Code's own MCP config. Reads quoted keys, checks a server once all edits of a write are made, and keeps the values of such keys out of the debug log as it does for plain ones.",
     verify:
       'With CLAUDE_CODEX_APP_MCP_SERVERS=1, add a stdio server under Settings > MCP servers: it stays listed after a reload, mcpServerStatus/list reports it, and a Claude chat can call its tools; switching it off takes the tools away in the next turn. Without it, saving a new server shows the message under the form.',
   },
   {
     id: 'desktop-mcp-servers',
-    app: "Writes mcp_servers.node_repl (its desktop REPL, with the App's own environment) and mcp_servers.cua_repl into the user config with config/batchWrite each time it starts, for its own Codex threads, and treats both names as its desktop servers.",
+    app: "Writes mcp_servers.node_repl (its desktop REPL, with the App's own environment) and mcp_servers.cua_repl into the user config with config/batchWrite each time it starts, for its own Codex threads, and treats both names as its desktop servers (26.1111: its MCP settings hide codex_app and cua_repl, and it also clears shell_environment_policy.set entries for node_repl in the same write).",
     adapter:
       'Accepts those writes and keeps neither, so Claude threads never start them and the App settings list does not show them.',
-    verify:
-      'In the bundle, the main process still writes only those two servers, and the MCP settings page still treats them as desktop servers.',
+    verify: 'In the bundle, the main process still writes only those two servers.',
   },
   {
     id: 'settings-write-errors',
@@ -428,7 +434,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'permission-presets',
-    app: "Takes config/read's approval_policy on-request with sandbox_mode workspace-write for its Default permissions preset only while sandbox_workspace_write is null, or a table with no writable_roots and network_access, exclude_tmpdir_env_var and exclude_slash_tmp all false (app-shared y4e/v4e; $_t/Q_t in 26.930). Otherwise it lists Custom (config.toml) in the composer's permissions menu and preselects it for a new chat with no stored choice. Settings > Configuration shows network access as that table's network_access, off when it is null.",
+    app: "Takes config/read's approval_policy on-request with sandbox_mode workspace-write for its Default permissions preset only while sandbox_workspace_write is null, or a table with no writable_roots and network_access, exclude_tmpdir_env_var and exclude_slash_tmp all false (app-shared module vXOR export Ns, re-exported as NsC, in 26.1111; y4e/v4e in 26.1013; $_t/Q_t in 26.930). Otherwise it lists Custom (config.toml) in the composer's permissions menu and preselects it for a new chat with no stored choice. Settings > Configuration shows network access as that table's network_access, off when it is null.",
     adapter:
       'Reports sandbox_workspace_write as null, as Codex does without a [sandbox_workspace_write] table, although Claude threads always have network access; Settings shows network access off for them, and turning it off is refused under settings-write-errors.',
     verify:
@@ -452,15 +458,15 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'explored-commands',
-    app: 'Folds consecutive commandExecution items whose commandActions are all read, listFiles or search into one "Explored" row counting the files, searches and lists, labelling a search "Searched for <query> in <path>" and a list "Listed files in <path>". An item with no actions, an unknown one, or a declined one shows as its command.',
+    app: 'Folds consecutive commandExecution items whose commandActions are all read, listFiles or search into one "Explored" row counting the files, searches and lists (26.1111: into an activity group of tool items headed "Read files", one row per action), labelling a search "Searched for <query> in <path>" and a list "Listed files in <path>". An item with no actions, an unknown one, or a declined one shows as its command.',
     adapter:
       "Shows Claude's Read, Grep, Glob and LS calls as commandExecution items with one matching action, and gives a Bash command the actions Codex's own parser would; a command it cannot parse is one unknown action.",
     verify:
-      'Ask Claude to look around a repository: its Read, Grep and Glob calls and a `cat` or `rg` it runs fold into one "Explored" row.',
+      'Ask Claude to look around a repository: its Read, Grep and Glob calls and a `cat` or `rg` it runs fold into one "Explored" row (26.1111: one "Read files" group).',
   },
   {
     id: 'command-approval-actions',
-    app: "Shows a command approval as the commands of its commandActions joined with ' && ' in place of command when it has any, and offers its own decisions whatever availableDecisions says.",
+    app: "Shows a command approval as the commands of its commandActions joined with ' && ' (26.1111: with spaces) in place of command when it has any, and offers its own decisions whatever availableDecisions says. 26.1111 at its Everyday detail level shows a card that has a reason without the command.",
     adapter:
       'Sends the actions only when a single one spells out the whole command, else one unknown action with the command, so the card never hides part of what runs. Only a Bash command is remembered for the session; an acceptForSession on any other card accepts that call only.',
     verify:
@@ -476,7 +482,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'compaction-marker',
-    app: 'Draws a contextCompaction item as "Context compacted" once item/completed arrives or when it is stored in a turn, and an open one as compacting while its turn is in progress and as "Compaction interrupted" once the turn has ended.',
+    app: 'Draws a contextCompaction item as compacted once item/completed arrives or when it is stored in a turn, and an open one as compacting while its turn is in progress and as "Compaction interrupted" once the turn has ended (26.1111: once it was interrupted or failed; an open one in a completed turn shows as compacted). 26.1111 says "Context compacted" only for a /compact of its own and "Context automatically compacted" otherwise, also after a reload.',
     adapter:
       'Stores a contextCompaction only when the compaction completes, in the place it started, as Codex keeps only finished compactions. A compaction an interrupt or a failed turn cuts short stays open, so it shows as interrupted until the chat is reopened, where it is gone. A /compact Claude Code could not do is neither stored nor completed as a contextCompaction (see item-completed-replaces), and sends no thread/compacted.',
     verify:
@@ -492,7 +498,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'command-approval-card',
-    app: "Draws an item/commandExecution/requestApproval card from its params alone (command, cwd, reason, availableDecisions), but draws an item/fileChange/requestApproval card only for a fileChange item with the request's itemId; without one the request shows nothing and the turn waits.",
+    app: "Draws an item/commandExecution/requestApproval card from its params alone (command, cwd, reason, availableDecisions; 26.1111 takes the cwd from the turn and offers no session approval on it but for network access, only in its desktop notification), but draws an item/fileChange/requestApproval card only for a fileChange item with the request's itemId; without one the request shows nothing and the turn waits.",
     adapter:
       'Asks for an Edit, Write or MultiEdit (a fileChange item) as a file change, and for any other Claude tool as a command: Bash with its command, other tools with their name and what they touch ("WebFetch https://…"). Claude\'s reason for asking is the card\'s reason. "Allow for this session" approves the same command or tool input again, as Codex keys its session approvals; the rules and folders Claude offers for the session go along only with CLAUDE_CODEX_SESSION_SUGGESTIONS=1.',
     verify:
@@ -508,7 +514,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'mcp-tool-approval',
-    app: 'Draws an mcpServer/elicitation/request whose _meta.codex_approval_kind is mcp_tool_call as a tool approval card: the message as its title, _meta.reason, the tool_params, an "Allow for this session" choice when _meta.persist offers session and an "Always allow" button when it offers always (a string, or an array for both). It answers accept, decline or cancel, with _meta.persist "session" or "always" for those choices.',
+    app: 'Draws an mcpServer/elicitation/request whose _meta.codex_approval_kind is mcp_tool_call as a tool approval card: the message as its title, _meta.reason, the tool_params, an "Allow for this session" choice (26.1111: "Allow this conversation") when _meta.persist offers session and an "Always allow" button when it offers always (a string, or an array for both). It answers accept, decline or cancel, with _meta.persist "session" or "always" for those choices.',
     adapter:
       'Asks for an mcp__<server>__<tool> call with that elicitation, as Codex does for its MCP tools, offering session approval unless Claude offers no "always allow" for the call, and "always" as well when Claude offers to save a rule. "Allow for this session" approves that tool for the rest of the thread in this adapter process; "Always allow" has Claude Code save a rule naming that tool of that server, mcp__<server>__<tool>, to the project\'s .claude/settings.local.json.',
     verify:
@@ -524,7 +530,7 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'auto-review',
-    app: 'Its auto-review permissions preset sends approvalsReviewer guardian_subagent (auto_review in newer builds) on thread/settings/update and turn/start, and on turn/settings/update while a turn runs. Its picker follows the approvalsReviewer of thread responses and thread/settings/updated, and it draws item/autoApprovalReview/completed as a review card on the item named by targetItemId.',
+    app: 'Its auto-review permissions preset sends approvalsReviewer guardian_subagent (26.1111 too; auto_review only for its hosted threads) on thread/settings/update and turn/start, and on turn/settings/update while a turn runs. Its picker follows the approvalsReviewer of thread responses and thread/settings/updated, and it draws item/autoApprovalReview/completed as a review card on the item named by targetItemId.',
     adapter:
       "Stores the reviewer per thread and runs a Claude thread that asks for auto_review in Claude Code's auto permission mode, when its model supports it. Otherwise approvals stay with the user: it stores and echoes 'user' and sends a configWarning saying why. A call the auto-mode classifier denies ends declined, with a denied review naming the classifier's reason; a call Claude Code says only the user may answer always asks, in every mode.",
     verify:
@@ -556,10 +562,19 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   // An access-key option in the Bedrock sign-in form, which signs in with
   // account/login/start; account/read already reports a Bedrock account.
   bedrockAccessKeysLogin: ['account/login/start'],
+  // 26.1111: the App no longer retries a turn that failed with
+  // serverOverloaded on a timer of its own, leaving retries to the server;
+  // the Claude CLI retries an overloaded API before a turn fails.
+  capacityErrorRetries: [],
+  // 26.1111: with the App's computer-use audio on, its main process pages
+  // model/list for models that take audio input, which no Claude model does.
+  computerAudio: ['model/list'],
   diagnostics: ['server/diagnostics'],
-  // Composer predictions fork only a thread whose modelProvider is openai;
-  // every thread here reports claude-code.
-  experimentalPredictionForkMode: [],
+  // 26.1013 forks only a thread whose modelProvider is openai for composer
+  // predictions, and every thread here reports claude-code. 26.1111 forks any
+  // chat for its adaptive title refresh (rule prediction-provider), an
+  // ephemeral fork the adapter keeps on the chat's model.
+  experimentalPredictionForkMode: ['thread/fork'],
   gatewayOAuth: [
     'account/gatewayOAuth/read',
     'account/gatewayOAuth/login',
@@ -567,6 +582,9 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   ],
   guardianV2DecisionsComparison: [],
   incrementalTools: [],
+  // 26.1111: daybreakEnabled on thread/start, only for a config whose
+  // model_provider is openai; the adapter's is claude-code.
+  initialDaybreakEnabled: ['thread/start'],
   instantInterrupt: [],
   // Whether a configured application requirement still lets the App set up
   // its search MCP (see searchMcpClient).
@@ -614,7 +632,14 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   // thread/fork with beforeTurnId.
   threadForkBeforeTurn: ['thread/fork'],
   // thread/items/list with an { itemId } cursor.
+  // 26.1111: origin (user or automatic) on goal changes, which the adapter
+  // ignores.
+  threadGoalProvenance: ['thread/goal/set', 'thread/goal/clear'],
   threadItemAnchors: ['thread/items/list'],
+  // 26.1111: the memory summary of a thread from thread/memory/read, which
+  // the adapter answers with none, instead of from <CODEX_HOME>/memories
+  // (off at the default).
+  threadMemorySummary: ['thread/memory/read'],
   threadQueue: [
     'thread/queue/add',
     'thread/queue/list',
@@ -623,13 +648,116 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
     'thread/queue/reorder',
     'thread/queue/start',
   ],
+  // 26.1111: the App writes a thread's read state with
+  // thread/readState/update only after thread/read returned a readState,
+  // which a Claude thread never does; the update answers -32601 by design
+  // (rule thread-read-state).
+  threadReadState: ['thread/readState/update'],
   threadRevert: ['thread/revert'],
+  // 26.1111: composer predictions with thread/sample, asked only after a
+  // thread/resume shows modelProvider openai, which no thread here reports
+  // (off at the default; rule prediction-provider).
+  threadSample: ['thread/sample', 'thread/sample/cancel'],
   threadTimeline: ['thread/timeline/list'],
   turnApprovalsReviewer: ['turn/settings/update'],
   // parentTurnId and rootTurnId on turn/start; the turn reports its
   // rootTurnId back.
   turnLineage: ['turn/start'],
   turnToolOutput: ['turn/start'],
+}
+
+export interface DispatchCases {
+  // Every method a case names.
+  readonly cases: ReadonlySet<string>
+  // The ones whose case only answers "method not found".
+  readonly notFound: ReadonlySet<string>
+  // Those of them a comment among the case labels explains with an App rule
+  // (`// App rule: <id>`), by method.
+  readonly byDesign: ReadonlyMap<string, string>
+}
+
+// The cases of a request switch in `source` (server.mts, host-methods.mts), as
+// check:app-upgrade and the tests read them. A case only answers "method not
+// found" when its body is `throw methodNotFound(method)` or throws an RpcError
+// with METHOD_NOT_FOUND (Codex's own text for a feature it lacks); the labels
+// above it may be separated by comments and blank lines, and an
+// `// App rule: <id>` comment among them explains the labels below it.
+export function dispatchCases(source: string): DispatchCases {
+  const cases = new Set<string>()
+  const notFound = new Set<string>()
+  const byDesign = new Map<string, string>()
+  for (const match of source.matchAll(/case '([A-Za-z][\w/]*)':/g)) cases.add(match[1] as string)
+  const lines = source.split('\n')
+  for (const [index, line] of lines.entries()) {
+    const thrown = /^\s*throw (methodNotFound\(method\)|new RpcError\()/.exec(line)
+    if (!thrown) continue
+    if (thrown[1] !== 'methodNotFound(method)' && !throwsMethodNotFound(lines, index)) continue
+    // The labels and App rules above the throw, bottom up.
+    const group: Array<{ label: string } | { rule: string }> = []
+    for (let above = index - 1; above >= 0; above -= 1) {
+      const text = lines[above] as string
+      const label = /^\s*case '([^']+)':\s*$/.exec(text)?.[1]
+      const rule = /^\s*\/\/.*App rule: ([a-z0-9-]+)/.exec(text)?.[1]
+      if (label) group.push({ label })
+      else if (rule) group.push({ rule })
+      else if (!/^\s*\/\//.test(text) && text.trim() !== '') break
+    }
+    // A rule covers the labels below it, so a comment above one case does
+    // not explain another.
+    let rule: string | undefined
+    for (const entry of group.reverse()) {
+      if ('rule' in entry) rule = entry.rule
+      else {
+        notFound.add(entry.label)
+        if (rule) byDesign.set(entry.label, rule)
+      }
+    }
+  }
+  return { cases, notFound, byDesign }
+}
+
+// Whether the `new RpcError(` call that starts on line `index` passes
+// METHOD_NOT_FOUND.
+function throwsMethodNotFound(lines: readonly string[], index: number): boolean {
+  let depth = 0
+  for (let at = index; at < lines.length; at += 1) {
+    const text =
+      at === index
+        ? (lines[at] as string).slice((lines[at] as string).indexOf('new RpcError('))
+        : (lines[at] as string)
+    for (const char of text) {
+      if (char === '(') depth += 1
+      else if (char === ')') depth -= 1
+    }
+    if (/\bMETHOD_NOT_FOUND\b/.test(text)) return true
+    if (depth <= 0) return false
+  }
+  return false
+}
+
+// Gates of the verified App that the adapter's version must keep off, each
+// with why: turned on, they make the App offer what Claude threads cannot do,
+// or they are not examined yet. check:app-upgrade reports a version that
+// turns one on as a problem, and a test keeps the default below them all.
+// None of them is in GATED_METHODS.
+export const KEPT_OFF_GATES: Readonly<Record<string, string>> = {
+  // Saving diagnostics on a local connection goes through feedback/save, and
+  // fails ("Choose a new filename and try again") whatever the adapter
+  // answers; it refuses it, having no feedback bundle.
+  feedbackSave: 'the App would save its diagnostics through feedback/save, which fails',
+  gcpSetup: 'onboarding would offer a Google Cloud sign-in, which account/gcp/setup refuses',
+  modelProviderSetup:
+    'onboarding would offer a model provider sign-in, which modelProvider/config/write refuses',
+  attachedThreads: 'not examined',
+  attachedThreadSearch: 'not examined',
+  persistentSideChats: 'not examined',
+  threadCallableApps: 'not examined',
+  skillCatalogDeltas: 'not examined',
+  incrementalToolsLegacy: 'not examined',
+  guardianNativeMultiAgentHistory: 'not examined',
+  threadRealtimeVoiceBackend: 'not examined',
+  realtimeVoiceSessionId: 'not examined',
+  threadSampleInterruptOnCancel: 'not examined',
 }
 
 // App rule: subagent-completed-kind
@@ -649,7 +777,8 @@ export function unverifiedAppWarning(clientInfo: {
   name?: unknown
   version?: unknown
 }): AppVersionWarning | null {
-  if (clientInfo.name !== DESKTOP_CLIENT_NAME) return null
+  if (typeof clientInfo.name !== 'string' || !DESKTOP_CLIENT_NAMES.includes(clientInfo.name))
+    return null
   const version = typeof clientInfo.version === 'string' ? clientInfo.version.trim() : ''
   if (VERIFIED_APP_VERSIONS.includes(version)) return null
   return {
