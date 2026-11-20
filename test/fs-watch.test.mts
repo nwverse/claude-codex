@@ -1,5 +1,13 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -14,12 +22,17 @@ import { type InProcessApp, withInProcessApp } from './fixtures/in-process-app.m
 // path the App sent, follows the file across renames, and accepts a file that
 // does not exist yet.
 
-// A fresh `.git` with HEAD, under the tmpdir path as given (not its realpath).
+// A fresh folder, under the tmpdir path as given (not its realpath).
 const roots: string[] = []
-function gitDir(): string {
+function tempRoot(): string {
   const root = mkdtempSync(join(tmpdir(), 'fs-watch-'))
   roots.push(root)
-  const git = join(root, '.git')
+  return root
+}
+
+// A fresh `.git` with HEAD.
+function gitDir(): string {
+  const git = join(tempRoot(), '.git')
   mkdirSync(git)
   writeFileSync(join(git, 'HEAD'), 'ref: refs/heads/main\n')
   return git
@@ -31,23 +44,21 @@ test.afterEach(() => {
 
 // Watches `path` and waits until the watch is live. On macOS a directory watch
 // starts asynchronously, so a write right after fs/watch can be missed: write
-// to `probe` (the target itself, or an entry of a watched directory) until the
-// first fs/changed arrives, then forget what was seen.
+// to `probe` (the target itself, or an entry of a watched directory), or call
+// it, until the first fs/changed arrives, then forget what was seen.
 async function watchLive(
   app: InProcessApp,
   watchId: string,
   path: string,
-  probe: string,
+  probe: string | ((attempt: number) => void),
 ): Promise<void> {
   assert.deepEqual(await app.request('fs/watch', { watchId, path }), { path })
+  await probeChange(app, watchId, (attempt) =>
+    typeof probe === 'string' ? writeFileSync(probe, String(attempt)) : probe(attempt),
+  )
+  await delay(300) // let the probe's debounce window close
   const isMine = (message: any): boolean =>
     message.method === 'fs/changed' && message.params.watchId === watchId
-  for (let attempt = 0; !app.messages.some(isMine); attempt++) {
-    if (attempt >= 100) throw new Error('watch never went live')
-    writeFileSync(probe, String(attempt))
-    await delay(50)
-  }
-  await delay(300) // let the probe's debounce window close
   for (let index = app.messages.length - 1; index >= 0; index--) {
     if (isMine(app.messages[index])) app.messages.splice(index, 1)
   }
@@ -69,6 +80,22 @@ function changes(app: InProcessApp, watchId: string): string[][] {
 // The changes for the watch once one more batch arrives after `seen` batches.
 async function nextChange(app: InProcessApp, watchId: string, seen: number): Promise<string[]> {
   return app.waitFor(() => changes(app, watchId)[seen])
+}
+
+// Calls `probe` every 50 ms until the watch reports one more batch, which it
+// returns. A watch set up during the test may not be live at once on macOS.
+async function probeChange(
+  app: InProcessApp,
+  watchId: string,
+  probe: (attempt: number) => void,
+): Promise<string[]> {
+  const seen = changes(app, watchId).length
+  for (let attempt = 0; changes(app, watchId).length === seen; attempt++) {
+    if (attempt >= 100) throw new Error(`no fs/changed for ${watchId}`)
+    probe(attempt)
+    await delay(50)
+  }
+  return changes(app, watchId)[seen] as string[]
 }
 
 test('a watched file reports its own path after each atomic rename', async () => {
@@ -103,6 +130,58 @@ test('a missing file can be watched and fires once it appears', async () => {
     gitUpdate(fetchHead, 'abc\tbranch main\n')
     assert.deepEqual(await nextChange(app, 'fetch', 0), [fetchHead])
     await app.request('fs/unwatch', { watchId: 'fetch' })
+  })
+})
+
+test('a symlinked file reports its own path when its target changes, also once re-pointed', async () => {
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    const root = tempRoot()
+    for (const dir of ['dotfiles', 'home', 'other']) mkdirSync(join(root, dir))
+    const target = join(root, 'dotfiles', 'config.toml')
+    writeFileSync(target, 'model = "a"\n')
+    const link = join(root, 'home', 'config.toml')
+    symlinkSync(target, link)
+    // A write to the target, in another folder, is a change of the link.
+    await watchLive(app, 'cfg', link, target)
+    gitUpdate(target, 'model = "b"\n')
+    assert.deepEqual(await nextChange(app, 'cfg', 0), [link])
+    await delay(250)
+
+    // Replacing the link is a change too, and the watch moves to the new target.
+    const moved = join(root, 'other', 'config.toml')
+    writeFileSync(moved, 'model = "c"\n')
+    symlinkSync(moved, `${link}.tmp`)
+    renameSync(`${link}.tmp`, link)
+    assert.deepEqual(await nextChange(app, 'cfg', 1), [link])
+    await delay(250)
+    assert.deepEqual(
+      await probeChange(app, 'cfg', (attempt) => writeFileSync(moved, `model = "${attempt}"\n`)),
+      [link],
+    )
+    await app.request('fs/unwatch', { watchId: 'cfg' })
+  })
+})
+
+test('a file whose folder does not exist yet is watched from the nearest existing one', async () => {
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    const git = join(tempRoot(), '.git')
+    const head = join(git, 'HEAD')
+    assert.deepEqual(await app.request('fs/watch', { watchId: 'head', path: head }), { path: head })
+    // `git init` creates .git and HEAD at once; touch .git until the watch sees it.
+    const init = await probeChange(app, 'head', (attempt) => {
+      if (attempt > 0) {
+        utimesSync(git, new Date(), new Date())
+      } else {
+        mkdirSync(git)
+        writeFileSync(head, 'ref: refs/heads/main\n')
+      }
+    })
+    assert.deepEqual(init, [head])
+    await delay(300)
+    // From then on the watch follows HEAD in the new .git.
+    const update = await probeChange(app, 'head', () => gitUpdate(head, 'ref: refs/heads/a\n'))
+    assert.deepEqual(update, [head])
+    await app.request('fs/unwatch', { watchId: 'head' })
   })
 })
 

@@ -30,8 +30,10 @@ export class MockRuntime implements ClaudeRuntime {
   private turnSettings = new Map<string, RuntimeTurnSettings>()
   private listener: RuntimeBackgroundListener | null = null
   private backgroundTasks = new Map<string, { threadId: string; cancel: () => void }>()
-  // What Claude says, unprompted, once a background agent reports back.
+  // What Claude says, unprompted, once a background agent reports back, and
+  // how long it takes to say it (`background subagent check answer=500`).
   private continuations = new Map<string, string>()
+  private answerDelays = new Map<string, number>()
   private steered = new Map<string, string[]>()
   // Foreground agents waiting to be stopped by task id.
   private foregroundStops = new Map<string, () => void>()
@@ -278,6 +280,9 @@ export class MockRuntime implements ClaudeRuntime {
     if (context.continuation) {
       const text = this.continuations.get(context.threadId) ?? null
       this.continuations.delete(context.threadId)
+      const answerMs = this.answerDelays.get(context.threadId)
+      this.answerDelays.delete(context.threadId)
+      if (answerMs) await sleep(answerMs)
       if (text) await handlers.onEvent({ type: 'text_delta', delta: text })
       await handlers.onEvent({ type: 'completed', success: true, result: text })
       return
@@ -1190,6 +1195,8 @@ export class MockRuntime implements ClaudeRuntime {
         content: `Async agent launched successfully.\nagentId: ${agentId}`,
         structured: { isAsync: true, status: 'async_launched', agentId, prompt },
       })
+      const answerMs = Number(/\banswer=(\d+)/.exec(context.prompt)?.[1] ?? 0)
+      if (answerMs) this.answerDelays.set(context.threadId, answerMs)
       this.scheduleBackgroundReport(
         context.threadId,
         agentId,
