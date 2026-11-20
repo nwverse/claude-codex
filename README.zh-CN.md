@@ -417,7 +417,9 @@ npm run workflow -- complete --task task-id
 
 运行事件默认追加到适配器主目录中的 `runs.jsonl`。注册表写入前会脱敏
 提示词类字段、模型回复和看似密钥的值。`CLAUDE_CODEX_RUN_LOG=0` 可关闭日志，
-`CLAUDE_CODEX_RUN_LOG=/path/log` 可选择其他 JSONL 文件。
+`CLAUDE_CODEX_RUN_LOG=/path/log` 可选择其他 JSONL 文件。该文件与调试日志一样轮转：
+达到 `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES`（默认 50 MiB）时移为 `runs.jsonl.1`，
+保留 `CLAUDE_CODEX_DEBUG_LOG_KEEP` 个旧文件（默认 3 个），更早的事件会被删除。
 
 逐线程 worktree 隔离默认关闭。设置 `CLAUDE_CODEX_AUTO_WORKTREE=1` 可启用，`CLAUDE_CODEX_WORKTREE_ROOT` 可指定目录，默认为适配器主目录下的 `worktrees`。启用后，Git 仓库内的新建或派生线程会使用独立的 `claude-codex/<label>` 分支。标签由线程 ID 生成，限制在根目录内，并避免冲突。已有 worktree 会复用。若创建失败，适配器会记录错误并继续使用原来的工作目录。详见 [worktree 隔离](https://nwverse.github.io/claude-codex/guide/configuration#worktree-isolation)。
 

@@ -1368,13 +1368,8 @@ test('Claude threads report the claude-code model provider', async () => {
 test('host methods answer truthfully: empty, disabled or unavailable', async () => {
   await withServer(async (server) => {
     // The App treats -32601 as "not supported here" and falls back quietly;
-    // these three are Codex methods its App builds do not use.
-    for (const method of [
-      'x/y',
-      'thread/items/read',
-      'thread/prediction/request',
-      'thread/readState/update',
-    ]) {
+    // Codex itself does not implement thread/prediction/request.
+    for (const method of ['x/y', 'thread/prediction/request']) {
       await assert.rejects(server.request(method), (error: unknown) => {
         assert.ok(error instanceof RpcError)
         assert.equal(error.code, -32601)
@@ -1435,6 +1430,96 @@ test('host methods answer truthfully: empty, disabled or unavailable', async () 
     assert.deepEqual(histories.data[0].successes, [
       { title: null, itemType: 'SKILLS', cwd: null, source: '/a2', target: '/b' },
     ])
+  })
+})
+
+test('the requests Codex App 26.1111 adds get answers instead of "method not found"', async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+    const turnId = await server.runTurn(threadId, 'first')
+    const rejects = (method: string, params: Record<string, unknown>, code: number, text: RegExp) =>
+      assert.rejects(server.request(method, params), (error: unknown) => {
+        assert.ok(error instanceof RpcError, method)
+        assert.equal(error.code, code, method)
+        assert.match(error.message, text, method)
+        return true
+      })
+
+    // An item the App asks for by id, as stored.
+    const listed = await server.request('thread/items/list', { threadId, turnId })
+    const wanted = listed.data.map((entry: any) => entry.item.id).reverse()
+    const read = await server.request('thread/items/read', {
+      threadId,
+      turnId,
+      itemIds: [...wanted, 'gone'],
+    })
+    assert.deepEqual(read.data, listed.data)
+    await rejects(
+      'thread/items/read',
+      { threadId, turnId, itemIds: [] },
+      -32600,
+      /itemIds must contain 1 to 100 IDs/,
+    )
+    await rejects(
+      'thread/items/read',
+      { threadId: 'nope', turnId, itemIds: ['x'] },
+      -32600,
+      /unknown thread: nope/,
+    )
+
+    // No memory summary, no read state, no samples.
+    assert.deepEqual(await server.request('thread/memory/read', { threadId }), { summary: null })
+    await rejects('thread/memory/read', { threadId: 'nope' }, -32600, /unknown thread: nope/)
+    await rejects(
+      'thread/readState/update',
+      { threadId, operation: { type: 'read' }, expectedRevision: '1' },
+      -32601,
+      /^durable thread read state unavailable$/,
+    )
+    await rejects(
+      'thread/sample',
+      { threadId, expectedTurnId: turnId, prompt: 'next?' },
+      -32600,
+      /thread\/sample is not supported/,
+    )
+    await rejects(
+      'thread/sample',
+      { threadId: 'nope', expectedTurnId: turnId, prompt: 'next?' },
+      -32600,
+      /unknown thread: nope/,
+    )
+    assert.deepEqual(await server.request('thread/sample/cancel', { requestId: 7 }), {})
+
+    // Codex's providers and ChatGPT sign-ins: none here.
+    assert.deepEqual(await server.request('modelProvider/list', {}), {
+      data: [],
+      defaultProviderId: 'claude-code',
+      canChangeDefault: false,
+    })
+    assert.deepEqual(await server.request('accountSession/list', {}), {
+      activeSessionId: null,
+      sessions: [],
+    })
+    await rejects('account/gcp/setup', { projectId: 'p' }, -32600, /configured in Claude Code/)
+    await rejects(
+      'modelProvider/config/write',
+      { settings: { type: 'customGateway', name: 'g', baseUrl: 'https://g.example' } },
+      -32600,
+      /configured in Claude Code/,
+    )
+    await rejects(
+      'accountSession/switch',
+      { sessionId: 's', accountId: 'a' },
+      -32600,
+      /no ChatGPT sign-in/,
+    )
+    await rejects(
+      'feedback/save',
+      { savePath: join(server.home, 'feedback.zip'), classification: 'bug' },
+      -32600,
+      /feedback bundle/,
+    )
+    await assert.rejects(stat(join(server.home, 'feedback.zip')), { code: 'ENOENT' })
   })
 })
 
