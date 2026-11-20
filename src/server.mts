@@ -539,8 +539,9 @@ function threadIdList(value: unknown): string[] {
   return value
 }
 
-// command/exec answers a timed-out command with Codex's EXEC_TIMEOUT_EXIT_CODE,
-// and waits this long for its pipes after it exits (Codex's IO_DRAIN_TIMEOUT_MS).
+// command/exec answers a timed-out command with Codex's EXEC_TIMEOUT_EXIT_CODE.
+// It and process/spawn wait this long for a process's pipes after it exits
+// (Codex's IO_DRAIN_TIMEOUT_MS).
 const COMMAND_EXEC_TIMEOUT_EXIT_CODE = 124
 const COMMAND_EXEC_IO_DRAIN_MS = 2_000
 
@@ -4541,6 +4542,8 @@ export class CodexClaudeAppServer {
     // Claim before publishing a preview, a policy change, or a model run. A
     // local side turn that crossed an await can still accept this input.
     for (;;) {
+      // As for a side turn (claimSideTurn), also after the input waited.
+      if (this.stopped) throw invalidRequest('server stopped')
       // A turn that ended while this input waited may still have its
       // refused terminal write pending; settle it so it is not taken for an
       // owner in another process.
@@ -9447,6 +9450,9 @@ export class CodexClaudeAppServer {
   }
 
   private async commandExec(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
+    // stop() has stopped the processes it knew of; one started now would
+    // outlive the adapter in its own process group.
+    if (this.stopped) throw invalidRequest('server stopped')
     const processId = typeof params.processId === 'string' ? params.processId : newId()
     const command = commandArray(params.command)
     if (command.length === 0) throw invalidRequest('command/exec requires command')
@@ -9607,6 +9613,8 @@ export class CodexClaudeAppServer {
   }
 
   private processSpawn(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    // As for command/exec.
+    if (this.stopped) throw invalidRequest('server stopped')
     const processHandle = stringOr(params.processHandle, '')
     if (!processHandle) throw invalidRequest('process/spawn requires processHandle')
     if (this.processHandles.has(processHandle))
@@ -9765,31 +9773,42 @@ export class CodexClaudeAppServer {
       )
     })
 
-    child.once('close', (code, signal) => {
-      if (exited) return
-      exited = true
-      debugLog('process.spawn.close', {
-        processHandle,
-        code,
-        signal,
-        stdoutBytes,
-        stderrBytes,
-        stdoutCapReached,
-        stderrCapReached,
-      })
+    // Reported when the process itself exits. Processes it left in the
+    // background may hold its pipes open: as for command/exec, they get a
+    // bounded drain, not its handle, which process/kill and timeoutMs could no
+    // longer free once the process they would signal has gone.
+    child.once('exit', (code, signal) => {
       if (timeout) clearTimeout(timeout)
-      forgetProcess(this.processHandles, processHandle, child)
-      this.notify(peer, {
-        method: 'process/exited',
-        params: {
+      const finish = () => {
+        clearTimeout(drain)
+        if (exited) return
+        exited = true
+        child.stdout?.destroy()
+        child.stderr?.destroy()
+        debugLog('process.spawn.close', {
           processHandle,
-          exitCode: code ?? 1,
-          stdout: streamOutput ? '' : Buffer.concat(stdout).toString('utf8'),
+          code,
+          signal,
+          stdoutBytes,
+          stderrBytes,
           stdoutCapReached,
-          stderr: streamOutput ? '' : Buffer.concat(stderr).toString('utf8'),
           stderrCapReached,
-        },
-      })
+        })
+        forgetProcess(this.processHandles, processHandle, child)
+        this.notify(peer, {
+          method: 'process/exited',
+          params: {
+            processHandle,
+            exitCode: code ?? 1,
+            stdout: streamOutput ? '' : Buffer.concat(stdout).toString('utf8'),
+            stdoutCapReached,
+            stderr: streamOutput ? '' : Buffer.concat(stderr).toString('utf8'),
+            stderrCapReached,
+          },
+        })
+      }
+      const drain = setTimeout(finish, COMMAND_EXEC_IO_DRAIN_MS)
+      child.once('close', finish)
     })
     return {}
   }
@@ -11054,6 +11073,8 @@ export class CodexClaudeAppServer {
 
   // A standalone shell, review, compaction or continuation is also a turn.
   private claimSideTurn(turn: TurnRecord): void {
+    // stop() has settled the turns it knew of; one claimed now would never end.
+    if (this.stopped) throw invalidRequest('server stopped')
     this.flushPendingTurnEnds(turn.threadId)
     this.keepQueueHold(turn.threadId)
     const claim = this.store.claimTurn(turn)

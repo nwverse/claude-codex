@@ -340,6 +340,16 @@ versioning or publishing metadata.
   included, instead of losing only its pty bridge. For `command/exec` too,
   the SIGKILL now comes as soon as the command exits if that is before the
   1 s grace ends, and never later. (#334)
+- A stopping adapter refuses `command/exec`, `process/spawn`, `turn/start`,
+  `review/start` and `thread/compact/start` with "server stopped". A `unix://`
+  or `ws://` client still connected while it waited for process groups could
+  start a command that outlived the adapter in its own process group, or a
+  turn that stayed in progress until the next start. (#342)
+- A `process/spawn` without a pty whose process exits while a child it left in
+  the background holds its output open now reports `process/exited` after at
+  most a 2 s drain, as `command/exec` answers, and its handle is free again.
+  It used to stay taken, with no exit, until that child ended: `process/kill`
+  and `timeoutMs` could not end the wait. (#342)
 - A terminal with a TTY (`process/spawn` with `tty`) reports `process/exited`
   as soon as its command exits, after the rest of its output, with the real
   exit code (128+N for a signal, 127 when the command cannot start). It used
@@ -575,6 +585,12 @@ versioning or publishing metadata.
   removes a socket at its path only when the socket refuses a connection, so
   of two daemons that do start, the one that binds second leaves the socket
   to the first and exits. (#329)
+- An adapter starting on a new state directory creates its state database in
+  one commit instead of 56. With every commit flushed to disk, that took over
+  200 fsyncs before the first daemon listened, which a busy disk stretched to
+  seconds. The debug log now records when each startup step ends
+  (`adapter.startup`, in ms since the process started), so a slow start shows
+  where the time went. (#345)
 - With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
   Code processes one at a time: a new session waits until the previous
   launch has sent its first SDK message, has ended, or has held the slot for
@@ -1503,6 +1519,14 @@ versioning or publishing metadata.
   Codex harness and the shared process-group and JSON-file helpers, and the
   root AGENTS.md points to the configuration reference table for the full
   list of variables. (#338)
+- `npm audit --omit=dev` reports no known advisories; it reported 9
+  packages (1 critical, 5 high). The lockfile takes fixed versions within the
+  existing ranges: zod 4.6.7, which checks the arguments of the adapter's
+  in-process MCP tools, and the MCP SDK 1.32.2 that npm installs as a peer of
+  the Claude Agent SDK, with its HTTP server packages (`express`'s
+  `body-parser`, `qs` and `proxy-addr`, `hono`, `@hono/node-server`,
+  `ip-address`, `fast-uri`), which the adapter does not load. The Claude Agent
+  SDK stays at 0.3.322. (#340)
 
 ### Validation and release gates
 

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { MockRuntime } from '../src/mock-runtime.mjs'
+import { SessionStore } from '../src/store.mjs'
 import { type InProcessApp, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 // Keep debug.jsonl out of the developer's ~/.codex.
@@ -144,9 +145,96 @@ test('stopping the server waits for the stops a disconnect started', {
   })
 })
 
+// A unix or ws client stays connected while stop() waits for the process
+// groups (up to about a second, and for the runtime). What it starts then would
+// run in a process group of its own, after the maps stop() emptied, and
+// outlive the adapter; a turn would stay in progress in the store.
+test('a server that is stopping starts no process or turn', { timeout: 20_000 }, async () => {
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    // A turn, a review and a compaction, one thread each.
+    const threads = [
+      await app.startThread({ cwd: app.home }),
+      await app.startThread({ cwd: app.home }),
+      await app.startThread({ cwd: app.home }),
+    ]
+    const pidFile = (name: string) => join(app.home, `${name}.pid`)
+    let running = 0
+    const late: number[] = []
+    try {
+      // Ignores SIGTERM: stop() waits for its SIGKILL.
+      app
+        .call('command/exec', {
+          processId: 'running',
+          command: ['sh', '-c', 'trap "" TERM; echo $$; while :; do sleep 0.1; done'],
+          cwd: app.home,
+          streamStdoutStderr: true,
+          disableTimeout: true,
+        })
+        .catch(() => {})
+      running =
+        (
+          await app.waitFor(() =>
+            printedPids(app, 'command/exec/outputDelta', 'processId', 'running'),
+          )
+        )[0] ?? 0
+
+      const stopping = app.server.stop()
+      await delay(100)
+      const script = 'echo $$ > "$0"; exec sleep 30'
+      const replies = [
+        app.call('command/exec', {
+          processId: 'late',
+          command: ['sh', '-c', script, pidFile('exec')],
+          cwd: app.home,
+          disableTimeout: true,
+        }),
+        app.call('process/spawn', {
+          processHandle: 'late',
+          command: ['sh', '-c', script, pidFile('spawn')],
+          cwd: app.home,
+          streamStdoutStderr: true,
+          streamStdin: true,
+        }),
+        app.call('turn/start', {
+          threadId: threads[0],
+          input: [{ type: 'text', text: 'late', text_elements: [] }],
+        }),
+        app.call('review/start', {
+          threadId: threads[1],
+          delivery: 'inline',
+          target: { type: 'custom', instructions: 'late' },
+        }),
+        app.call('thread/compact/start', { threadId: threads[2] }),
+      ]
+      await stopping
+      // Long enough for a late process to have written its pid.
+      await delay(500)
+      for (const name of ['exec', 'spawn'])
+        if (existsSync(pidFile(name))) late.push(Number(readFileSync(pidFile(name), 'utf8')))
+      const refused = await Promise.race([
+        Promise.all(replies).then((all) => all.map((reply) => reply.error?.message)),
+        delay(5_000, 'no reply to every request'),
+      ])
+      const store = new SessionStore(join(app.home, 'state.sqlite'))
+      const inProgress = threads
+        .flatMap((threadId) => store.listTurns(threadId))
+        .filter((turn) => turn.status === 'inProgress')
+        .map((turn) => turn.id)
+      store.close()
+      assert.deepEqual(
+        { started: late.filter(isAlive), refused, inProgress },
+        { started: [], refused: Array(5).fill('server stopped'), inProgress: [] },
+      )
+    } finally {
+      for (const pid of [running, ...late]) if (pid && isAlive(pid)) process.kill(pid, 'SIGKILL')
+    }
+  })
+})
+
 // A terminal's process can exit while a child it left in the background holds
-// its pipes, and so its handle, open. Its pid is free by then: a signal to it,
-// or to the group of that id, could reach another process.
+// its pipes open, and its handle stays taken while they drain. Its pid is free
+// by then: a signal to it, or to the group of that id, could reach another
+// process.
 test('a terminal whose process has exited is not signalled again', {
   timeout: 20_000,
 }, async (t) => {
@@ -170,12 +258,6 @@ test('a terminal whose process has exited is not signalled again', {
       background = sleep
       // Gone once the server has reaped it.
       assert.ok(await exits(shell, 5_000), `shell ${shell} still runs`)
-      const again = await app.call('process/spawn', {
-        processHandle: 'terminal',
-        command: ['true'],
-        cwd: app.home,
-      })
-      assert.match(again.error?.message ?? '', /already active/, 'the handle is still taken')
 
       const signalled: unknown[] = []
       const kill = process.kill
@@ -184,7 +266,8 @@ test('a terminal whose process has exited is not signalled again', {
         signalled.push([pid, signal])
         return true
       })
-      await app.request('process/kill', { processHandle: 'terminal' })
+      // Within the drain, or, on a busy machine, past it with the handle free.
+      await app.call('process/kill', { processHandle: 'terminal' })
       await app.server.stop()
       app.server.closePeer({ id: 'app', send: () => {}, close: () => {} })
       // Past the SIGKILL that follows a SIGTERM.
