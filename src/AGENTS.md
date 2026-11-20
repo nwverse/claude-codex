@@ -17,11 +17,13 @@ Protocol and server:
   profiles, turn errors, token usage, approval keys, diffs).
 - `host-methods.mts` — JSON-RPC error codes (`RpcError`, `invalidRequest`) and
   inert answers for methods backed by OpenAI services or the Codex host
-  (connectors, plugin catalog, remote control, passkeys, account extras).
+  (connectors, plugin catalog, remote control, passkeys, account extras,
+  model providers, feedback bundles).
 - `cli-probes.mts` — one-shot `app-server` probes (`--print-startup-config`,
   `daemon version`, config requirements) answered before any state is opened.
 - `thread-history.mts` — paged history views: `thread/turns/list`,
-  `thread/items/list`, `thread/timeline/list`, searches and fork turns.
+  `thread/items/list`, `thread/items/read`, `thread/timeline/list`, searches
+  and fork turns.
 - `fs-watch.mts` — `fs/watch` the Codex way: non-recursive, debounced
   `fs/changed` under the requested path, following a file across renames and
   symlinks.

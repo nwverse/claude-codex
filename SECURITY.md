@@ -5,10 +5,10 @@ best-effort basis by the maintainers.
 
 ## Reporting a vulnerability
 
-If GitHub private vulnerability reporting is available for this repository, use
-that channel for sensitive reports. If private reporting is not available and
-the issue does not expose secrets or exploitable details, open a GitHub issue
-with a minimal, non-sensitive summary and ask for a private coordination path.
+Report security problems as a regular GitHub issue. This project has no
+private reporting channel, and its issues are public, so describe the problem
+and its impact (what someone could do, and with which setup) without a
+ready-to-run exploit. Maintainers follow up in the issue.
 
 Do not post API keys, OAuth session data, local credential files, private host
 names, or reproducible exploit payloads in public issues, pull requests, logs,

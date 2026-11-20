@@ -139,6 +139,29 @@ test('startup repairs legacy thread rows once and leaves a clean store unwritten
   }
 })
 
+// Every commit is a few fsyncs (synchronous=FULL). Statement by statement a
+// new schema took over 50 commits, which kept a new daemon from listening for
+// seconds on a busy CI disk.
+test('a new store gets its whole schema in one commit', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-store-startup-'))
+  const path = join(home, 'state.sqlite')
+  try {
+    new SessionStore(path).close()
+    assert.equal(changeCounter(path), 1)
+    const check = new DatabaseSync(path)
+    const sections = check.prepare('SELECT id FROM thread_sections').all()
+    check.close()
+    assert.deepEqual(
+      sections.map((row) => row.id),
+      [PINNED_SECTION_ID],
+    )
+    new SessionStore(path).close()
+    assert.equal(changeCounter(path), 1, 'reopening a new store must not write')
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 // One legacy row per store, so a wrong term in a probe cannot hide behind
 // another legacy row that opens the same probe.
 const legacyRows: Array<[string, Record<string, unknown>]> = [
