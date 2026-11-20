@@ -1,6 +1,5 @@
-import { appendFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { adapterHome, ensureParent } from './util.mjs'
+import { adapterHome, appendLogLine } from './util.mjs'
 
 export type RunRegistryEventName =
   | 'thread.started'
@@ -33,10 +32,9 @@ export function recordRunEvent(
   const path = runRegistryPath(env)
   if (!path) return { ok: true, path: null, error: null }
   try {
-    ensureParent(path)
-    appendFileSync(path, `${JSON.stringify(runRegistryEntry(event, data))}\n`, {
-      mode: 0o600,
-    })
+    // A daemon appends on every turn and may never restart, so the file
+    // rotates as debug.jsonl does.
+    appendLogLine(path, `${JSON.stringify(runRegistryEntry(event, data))}\n`, env)
     return { ok: true, path, error: null }
   } catch (error) {
     if (error instanceof Error) return { ok: false, path, error: error.message }

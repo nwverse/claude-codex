@@ -498,7 +498,8 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 
 # Rotate once the log reaches this many bytes (default 52428800, 50 MiB;
 # 0 never rotates), keeping this many old files as debug.jsonl.1, .2, ...
-# (default 3, at least 1, at most 100).
+# (default 3, at least 1, at most 100). The run registry (runs.jsonl)
+# rotates by the same two settings.
 export CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES="52428800"
 export CLAUDE_CODEX_DEBUG_LOG_KEEP="3"
 ```
@@ -678,8 +679,8 @@ the profile's `env` or env file.
 | `CLAUDE_CODEX_MOCK` | Run the protocol without Claude credentials. |
 | `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS` | How long a state-database write waits for another connection's lock before it fails (default `5000`). |
 | `CLAUDE_CODEX_DEBUG_LOG` | Debug log path (default `debug.jsonl` in the adapter home); `0` or `false` turns it off. See [Debug log](#debug-log). |
-| `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` / `_KEEP` | Size at which the debug log rotates (default 50 MiB; `0` never rotates) and how many rotated files stay (default `3`). |
-| `CLAUDE_CODEX_RUN_LOG` | Run registry, the JSON Lines file of thread, turn and subagent events (default `runs.jsonl` in the adapter home); `0` or `false` turns it off. See [Run registry](/reference/workflow-operations#run-registry). |
+| `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` / `_KEEP` | Size at which the debug log and the run registry rotate (default 50 MiB; `0` never rotates) and how many rotated files of each stay (default `3`). |
+| `CLAUDE_CODEX_RUN_LOG` | Run registry, the JSON Lines file of thread, turn and subagent events (default `runs.jsonl` in the adapter home, owner-only, rotated like the debug log); `0` or `false` turns it off. See [Run registry](/reference/workflow-operations#run-registry). |
 | `CLAUDE_CODEX_HTTP_*`, `CLAUDE_CODEX_CLAUDE_P_*` | Tuning for the `agent-http`, `agentapi` and `claude-p` backends. See [agent-http and agentapi settings](/guide/backends#agent-http-and-agentapi-settings) and [claude-p](/guide/backends#claude-p). |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | Claude auth / custom endpoint configuration. Keep real values out of git. |
 | `CLAUDE_CODE_FORK_SUBAGENT` | Claude Code's own switch, passed on from the adapter's environment: `0` keeps Claude from starting fork subagents (`subagent_type: "fork"`), which Claude Code 2.1.302 and later offer by default. With model process profiles, only a profile that inherits or sets it passes it on. See [Claude Code variables](#claude-code-variables). |

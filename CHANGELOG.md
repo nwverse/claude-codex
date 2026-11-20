@@ -968,6 +968,17 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- `runs.jsonl`, the run registry, rotates like `debug.jsonl`: at
+  `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` (50 MiB by default) it moves to
+  `runs.jsonl.1`, and `CLAUDE_CODEX_DEBUG_LOG_KEEP` old files (3 by default)
+  stay, all readable by their owner alone. An adapter appends to it on every
+  thread, turn and subagent event, and it used to grow for as long as the
+  adapter home existed. (#PR)
+- When the background cleanup of the turn diffs older versions stored stops
+  on a failed write, such as another adapter holding the state database past
+  its busy timeout, the debug log says so (`store.diff_clear_stopped`, with
+  the error). It used to stop without a trace; the next start still goes on
+  where it stopped. (#PR)
 - Settings saves from adapters whose `config.json` is a link to one shared
   file all stay. Each save is now locked next to the file the link points to,
   in an empty owner-only `config.json.lock.sqlite`, as the shared Claude model
@@ -1177,6 +1188,12 @@ versioning or publishing metadata.
 
 ### Provider and multi-agent boundaries
 
+- A long-running adapter no longer keeps every background agent it ran, each
+  with its full prompt, until its chat is deleted. It keeps the 256 that
+  finished last, without their prompts, which their child threads hold. A
+  SendMessage to an older agent reopens its child thread as one to an agent
+  from before a restart does, and that lookup now finds the agent by name,
+  also in a chat with more than 200 agents. (#PR)
 - Follow-up turns of a Codex (`gpt-*`) chat on the `codex-proxy` route run
   in the thread's folder with its sandbox mode and extra writable roots
   (`CLAUDE_CODEX_ADD_DIRS`) again. `codex exec resume` was run without `-C`,
