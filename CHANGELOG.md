@@ -937,11 +937,12 @@ versioning or publishing metadata.
   pre-approved WebFetch, Task and TodoWrite, so a read-only chat could fetch
   any URL with no card. (#331)
 - On the Agent SDK route, `CLAUDE_CODEX_ALLOWED_TOOLS` pre-approves in a
-  read-only sandbox or plan mode only the tools on it that read (Read, Grep,
-  Glob, LS, WebSearch); the others ask or are refused there, as unlisted
-  tools are. A listed Bash used to run in those threads with no card, and in
-  a read-only sandbox a listed Write too. Other sandboxes keep the whole
-  list. (#339)
+  read-only sandbox or plan mode only the rules on it for tools that read
+  (Read, Grep, Glob, LS, WebSearch); the others, `Bash(git log:*)`, WebFetch
+  and MCP tools included, ask or are refused there, as unlisted tools are. A
+  listed Bash used to run in those threads with no card, a listed Write too
+  in a read-only sandbox, and in plan mode a listed WebFetch ran instead of
+  being refused. Other sandboxes keep the whole list. (#339)
 
 ### Trustworthy history and settings
 

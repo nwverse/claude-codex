@@ -3183,8 +3183,28 @@ test('native SDK pre-approves only the reads of CLAUDE_CODEX_ALLOWED_TOOLS in a 
   delete process.env.CLAUDE_CODEX_PERMISSION_MODE
   const runtime = new NativeClaudeRuntime()
   const buildOptions = Reflect.get(runtime, 'buildOptions')
+  // The CLI splits --allowedTools again at commas and at spaces outside
+  // parentheses, without tracking nesting: each of these is a read rule and
+  // another rule after it.
+  const smuggled = [
+    'Read(./docs/**) Bash',
+    'Grep(x) Write',
+    'Read(./docs/**) Bash(rm -rf:*)',
+    'Read(x)) Bash',
+    'Read(a(b) Bash()',
+  ]
   // The turn's allowedTools are CLAUDE_CODEX_ALLOWED_TOOLS.
-  const listed = ['Bash', 'Write', 'Read(./docs/**)', 'Grep', 'WebFetch', 'mcp__docs__update']
+  const listed = [
+    'Bash',
+    'Bash(git log:*)',
+    'Write',
+    'Read(./docs/**)',
+    'Grep',
+    'WebFetch',
+    'Agent',
+    'mcp__docs__update',
+    ...smuggled,
+  ]
   const reads = ['Read(./docs/**)', 'Grep']
   const launch = (overrides: Partial<RuntimeTurnContext>, allowedTools = listed) => {
     const context = nativeTurnContext({ allowedTools, ...overrides })
@@ -3201,6 +3221,10 @@ test('native SDK pre-approves only the reads of CLAUDE_CODEX_ALLOWED_TOOLS in a 
       assert.deepEqual(plan.allowed, reads)
     }
     assert.equal(launch({ sandboxMode: 'read-only' }, ['Bash', 'Write']).allowed, undefined)
+    for (const rule of smuggled) {
+      assert.equal(launch({ sandboxMode: 'read-only' }, [rule]).allowed, undefined, rule)
+      assert.equal(launch({ planMode: true }, [rule]).allowed, undefined, rule)
+    }
     // Elsewhere the list stands as it is.
     for (const sandboxMode of ['workspace-write', 'danger-full-access', null])
       assert.deepEqual(launch({ approvalPolicy: 'on-request', sandboxMode }).allowed, listed)

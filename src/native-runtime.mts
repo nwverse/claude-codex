@@ -4612,7 +4612,17 @@ function inheritedAllowedTools(context: RuntimeTurnContext): string[] {
 function configuredAllowedTools(context: RuntimeTurnContext): string[] {
   const rules = context.allowedTools ?? []
   if (inheritedApprovals(context)) return rules
-  return rules.filter((rule) => readsOnly(rule.split('(', 1)[0]?.trim() ?? ''))
+  return rules.filter(readRule)
+}
+
+// One rule, `Tool` or `Tool(specifier)`, for a tool that reads. The CLI
+// splits --allowedTools again at commas and at spaces outside parentheses,
+// without tracking nesting, so an entry with a space outside them or another
+// parenthesis (`Read(./docs/**) Bash`, `Read(a(b) Bash()`) would also
+// pre-approve the rule after it.
+function readRule(rule: string): boolean {
+  const name = /^(\w+)(?:\([^()]*\))?$/.exec(rule)?.[1]
+  return name !== undefined && readsOnly(name)
 }
 
 // Options a live CLI process cannot change in place. A turn whose signature
