@@ -236,7 +236,9 @@ const REDACTED = '[redacted]'
 // TOML-quoted keys as App 26.1111 writes MCP server fields) of the config,
 // as the debug log may show it.
 function redactConfigValue(keyPath: string, value: unknown): unknown {
-  const segments = dottedKeyParts(keyPath) ?? keyPath.split('.')
+  const segments = keyPath === '' ? [] : dottedKeyParts(keyPath)
+  // A path that does not parse may still name a credential's key in quotes.
+  if (!segments) return redactLeaves(value)
   if (
     segments.some((segment) => CREDENTIAL_HOLDER_KEY.test(segment) || CREDENTIAL_KEY.test(segment))
   )

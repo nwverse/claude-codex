@@ -274,7 +274,9 @@ versioning or publishing metadata.
   turns on (26.1111's `asyncCompaction` needs `0.163.0-alpha.11`), counts a
   case that throws an `RpcError` with `METHOD_NOT_FOUND` as answering
   "method not found", and lists one whose `// App rule:` comment says why as
-  "-32601 by design" instead of as a problem. (#347)
+  "-32601 by design" instead of as a problem. A version that turns on a gate
+  listed in `KEPT_OFF_GATES` (26.1111's `feedbackSave`, `gcpSetup`,
+  `modelProviderSetup` and the gates not examined yet) is a problem. (#347)
 - With `CLAUDE_CODEX_APP_MCP_SERVERS=1`, editing a server under Settings >
   MCP servers works with Codex App 26.1111, which saves the changed fields one
   by one with quoted keys (`mcp_servers."name"."env"."KEY"`). Every such save

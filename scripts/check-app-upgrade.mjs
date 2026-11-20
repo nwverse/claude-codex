@@ -81,9 +81,16 @@ const recorded = existsSync(baselinePath) ? JSON.parse(readFileSync(baselinePath
 if (bundleOnly && !recorded)
   fail(`--bundle-only takes the protocol from ${baselinePath}, which is missing`)
 
-const { APP_RULES, DESKTOP_CLIENT_NAMES, GATED_METHODS, VERIFIED_APP_VERSIONS } = await import(
-  join(root, 'dist', 'src', 'app-compat.mjs')
-).catch(() => fail('dist/ is missing; run it through `npm run check:app-upgrade`'))
+const {
+  APP_RULES,
+  DESKTOP_CLIENT_NAMES,
+  dispatchCases,
+  GATED_METHODS,
+  KEPT_OFF_GATES,
+  VERIFIED_APP_VERSIONS,
+} = await import(join(root, 'dist', 'src', 'app-compat.mjs')).catch(() =>
+  fail('dist/ is missing; run it through `npm run check:app-upgrade`'),
+)
 const { codexCompatVersion } = await import(join(root, 'dist', 'src', 'util.mjs'))
 
 // --- App bundle ------------------------------------------------------------
@@ -205,13 +212,21 @@ function minimumIn(text) {
   return found
 }
 
-// The module a minified name was bound to in a script (`lr=r(87329)`,
-// `e2=n("N2rm")`), and the constant `key` that module exports.
-function moduleOf(text, name) {
+// The module a minified name used at `at` was bound to in a script
+// (`lr=r(87329)`, `e2=n("N2rm")`): the binding closest before the use, as
+// minified names repeat across modules. Then the constant `key` that module
+// exports.
+function moduleOf(text, name, at) {
   const binding = new RegExp(
     String.raw`(?:^|[^\w$.])${asPattern(name)}=${KEY}\(\s*"?([\w$]+)"?\s*\)`,
-  ).exec(text)
-  return binding?.[1] ?? null
+    'g',
+  )
+  let found = null
+  for (const match of text.matchAll(binding)) {
+    if (found && match.index > at) break
+    found = match[1]
+  }
+  return found
 }
 
 function exportedConstant(text, id, key) {
@@ -258,7 +273,7 @@ function bundleFacts(app) {
         for (const match of text.matchAll(CLIENT_NAME)) {
           if (match[1]) clientNames.add(match[1])
           else {
-            const id = moduleOf(text, match[2])
+            const id = moduleOf(text, match[2], match.index)
             const dir = SCRIPT_DIRS.find((prefix) => file.path.startsWith(prefix))
             if (id) exported.push({ id, key: match[3], dir, expression: match[0] })
             else notes.push(`could not tell which module ${match[2]} is in ${file.path}`)
@@ -524,15 +539,9 @@ function facts(app, { codex, source } = {}) {
 // The files whose switch answers the App's requests.
 const DISPATCH_FILES = new Set(['server.mts', 'host-methods.mts'])
 
-// Cases that only answer "method not found": `throw methodNotFound(method)`,
-// or an RpcError with METHOD_NOT_FOUND (Codex's own text for a feature it
-// lacks), with the comment lines right before them.
-const NOT_FOUND_CASES =
-  /((?:[ \t]*\/\/[^\n]*\n)*)[ \t]*((?:case '[^']+':\s*)+)throw (?:methodNotFound\(method\)|new RpcError\((?:[^()]|\([^()]*\))*?\bMETHOD_NOT_FOUND\b)/g
-
 // handled: the requests a case answers, leaving out the cases that only
-// answer "method not found". byDesign: those of them whose comment names the
-// App rule that says the App copes with it.
+// answer "method not found" (dispatchCases in src/app-compat.mts). byDesign:
+// those of them an App rule says the App copes with.
 function adapterFacts() {
   const handled = new Set()
   const byDesign = new Map()
@@ -542,14 +551,10 @@ function adapterFacts() {
     if (!file.endsWith('.mts')) continue
     const text = readFileSync(join(srcDir, file), 'utf8')
     if (DISPATCH_FILES.has(file)) {
-      for (const match of text.matchAll(/case '([A-Za-z][\w/]*)':/g)) handled.add(match[1])
-      for (const block of text.matchAll(NOT_FOUND_CASES)) {
-        const rule = /App rule: ([a-z0-9-]+)/.exec(block[1])?.[1]
-        for (const match of block[2].matchAll(/case '([^']+)':/g)) {
-          handled.delete(match[1])
-          if (rule) byDesign.set(match[1], rule)
-        }
-      }
+      const switchCases = dispatchCases(text)
+      for (const method of switchCases.cases)
+        if (!switchCases.notFound.has(method)) handled.add(method)
+      for (const [method, rule] of switchCases.byDesign) byDesign.set(method, rule)
     }
     for (const match of text.matchAll(
       /method: '([a-zA-Z]+(?:\/[a-zA-Z_]+)+|configWarning|error|warning)'/g,
@@ -710,7 +715,7 @@ function appMethodsReport() {
   list(
     '-32601 by design',
     unanswered.filter((m) => adapter.byDesign.has(m)),
-    notFound,
+    (m) => `${m} (rule ${adapter.byDesign.get(m)})`,
   )
   for (const method of unanswered.filter((m) => !adapter.byDesign.has(m)))
     problems.push(`the App calls ${method}, which the adapter answers with "method not found"`)
@@ -781,8 +786,18 @@ if (!next.gates) {
         `the adapter's version turns on ${name}, but it does not answer ${unanswered.join(', ')}`,
       )
   }
+  for (const [name, reason] of Object.entries(KEPT_OFF_GATES)) {
+    if (!(name in next.gates)) {
+      notes.push(`KEPT_OFF_GATES lists ${name}, which App ${next.appVersion} does not gate on`)
+      continue
+    }
+    if (gateOn(next.gates[name]))
+      problems.push(
+        `the adapter's version turns on ${name} (needs ${next.gates[name]}), which KEPT_OFF_GATES keeps off: ${reason}`,
+      )
+  }
   for (const name of Object.keys(next.gates).filter(
-    (name) => !(name in before) && !(name in GATED_METHODS),
+    (name) => !(name in before) && !(name in GATED_METHODS) && !(name in KEPT_OFF_GATES),
   ))
     if (gateOn(next.gates[name]))
       notes.push(

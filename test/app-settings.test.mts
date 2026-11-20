@@ -707,6 +707,12 @@ test('config writes keep credentials out of the debug log', async () => {
             value: 'env-value-20',
             mergeStrategy: 'replace',
           },
+          // A quoted path that does not parse is redacted whole.
+          {
+            keyPath: 'mcp_servers."local"."env"."BROKEN',
+            value: 'env-value-22',
+            mergeStrategy: 'replace',
+          },
           {
             keyPath: 'mcp_servers."remote"."url"',
             value: 'https://example.com/u/url-path-21',
@@ -793,6 +799,7 @@ test('config writes keep credentials out of the debug log', async () => {
       'url-path-19',
       'env-value-20',
       'url-path-21',
+      'env-value-22',
     ]
     assert.deepEqual(
       secrets.filter((secret) => log.includes(secret)),

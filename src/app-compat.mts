@@ -575,17 +575,11 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   // chat for its adaptive title refresh (rule prediction-provider), an
   // ephemeral fork the adapter keeps on the chat's model.
   experimentalPredictionForkMode: ['thread/fork'],
-  // 26.1111: saving diagnostics on a local connection goes through
-  // feedback/save, which the adapter refuses as it has no feedback bundle;
-  // the default version keeps this gate off (see app-compat.md).
-  feedbackSave: ['feedback/save'],
   gatewayOAuth: [
     'account/gatewayOAuth/read',
     'account/gatewayOAuth/login',
     'account/gatewayOAuth/cancel',
   ],
-  // 26.1111: a Google Cloud sign-in in onboarding (off at the default).
-  gcpSetup: ['account/gcp/setup'],
   guardianV2DecisionsComparison: [],
   incrementalTools: [],
   // 26.1111: daybreakEnabled on thread/start, only for a config whose
@@ -601,8 +595,6 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   // Reviews a turn that failed with codexErrorInfo
   // misalignmentPolicyViolation, which no turn here reports.
   misalignmentReviewTarget: [],
-  // 26.1111: a model provider sign-in in onboarding (off at the default).
-  modelProviderSetup: ['modelProvider/list', 'modelProvider/config/write'],
   multiAgentWaitToolConfig: [],
   outputTokenReplay: [],
   preserveForkPrefix: [],
@@ -644,8 +636,9 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   // ignores.
   threadGoalProvenance: ['thread/goal/set', 'thread/goal/clear'],
   threadItemAnchors: ['thread/items/list'],
-  // 26.1111: the memory summary of a thread, else read from
-  // <CODEX_HOME>/memories (off at the default).
+  // 26.1111: the memory summary of a thread from thread/memory/read, which
+  // the adapter answers with none, instead of from <CODEX_HOME>/memories
+  // (off at the default).
   threadMemorySummary: ['thread/memory/read'],
   threadQueue: [
     'thread/queue/add',
@@ -659,10 +652,11 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   // thread/readState/update only after thread/read returned a readState,
   // which a Claude thread never does; the update answers -32601 by design
   // (rule thread-read-state).
-  threadReadState: [],
+  threadReadState: ['thread/readState/update'],
   threadRevert: ['thread/revert'],
-  // 26.1111: composer predictions with thread/sample, only for a thread
-  // whose modelProvider is openai (off at the default).
+  // 26.1111: composer predictions with thread/sample, asked only after a
+  // thread/resume shows modelProvider openai, which no thread here reports
+  // (off at the default; rule prediction-provider).
   threadSample: ['thread/sample', 'thread/sample/cancel'],
   threadTimeline: ['thread/timeline/list'],
   turnApprovalsReviewer: ['turn/settings/update'],
@@ -670,6 +664,92 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   // rootTurnId back.
   turnLineage: ['turn/start'],
   turnToolOutput: ['turn/start'],
+}
+
+export interface DispatchCases {
+  // Every method a case names.
+  readonly cases: ReadonlySet<string>
+  // The ones whose case only answers "method not found".
+  readonly notFound: ReadonlySet<string>
+  // Those of them a comment among the case labels explains with an App rule
+  // (`// App rule: <id>`), by method.
+  readonly byDesign: ReadonlyMap<string, string>
+}
+
+// The cases of a request switch in `source` (server.mts, host-methods.mts), as
+// check:app-upgrade and the tests read them. A case only answers "method not
+// found" when its body is `throw methodNotFound(method)` or throws an RpcError
+// with METHOD_NOT_FOUND (Codex's own text for a feature it lacks); the labels
+// above it may be separated by comments and blank lines.
+export function dispatchCases(source: string): DispatchCases {
+  const cases = new Set<string>()
+  const notFound = new Set<string>()
+  const byDesign = new Map<string, string>()
+  for (const match of source.matchAll(/case '([A-Za-z][\w/]*)':/g)) cases.add(match[1] as string)
+  const lines = source.split('\n')
+  for (const [index, line] of lines.entries()) {
+    const thrown = /^\s*throw (methodNotFound\(method\)|new RpcError\()/.exec(line)
+    if (!thrown) continue
+    if (thrown[1] !== 'methodNotFound(method)' && !throwsMethodNotFound(lines, index)) continue
+    const labels: string[] = []
+    let rule: string | undefined
+    for (let above = index - 1; above >= 0; above -= 1) {
+      const text = lines[above] as string
+      const label = /^\s*case '([^']+)':\s*$/.exec(text)
+      if (label) labels.push(label[1] as string)
+      else if (/^\s*\/\//.test(text)) rule ??= /App rule: ([a-z0-9-]+)/.exec(text)?.[1]
+      else if (text.trim() !== '') break
+    }
+    for (const method of labels) {
+      notFound.add(method)
+      if (rule) byDesign.set(method, rule)
+    }
+  }
+  return { cases, notFound, byDesign }
+}
+
+// Whether the `new RpcError(` call that starts on line `index` passes
+// METHOD_NOT_FOUND.
+function throwsMethodNotFound(lines: readonly string[], index: number): boolean {
+  let depth = 0
+  for (let at = index; at < lines.length; at += 1) {
+    const text =
+      at === index
+        ? (lines[at] as string).slice((lines[at] as string).indexOf('new RpcError('))
+        : (lines[at] as string)
+    for (const char of text) {
+      if (char === '(') depth += 1
+      else if (char === ')') depth -= 1
+    }
+    if (/\bMETHOD_NOT_FOUND\b/.test(text)) return true
+    if (depth <= 0) return false
+  }
+  return false
+}
+
+// Gates of the verified App that the adapter's version must keep off, each
+// with why: turned on, they make the App offer what Claude threads cannot do,
+// or they are not examined yet. check:app-upgrade reports a version that
+// turns one on as a problem, and a test keeps the default below them all.
+// None of them is in GATED_METHODS.
+export const KEPT_OFF_GATES: Readonly<Record<string, string>> = {
+  // Saving diagnostics on a local connection goes through feedback/save, and
+  // fails ("Choose a new filename and try again") whatever the adapter
+  // answers; it refuses it, having no feedback bundle.
+  feedbackSave: 'the App would save its diagnostics through feedback/save, which fails',
+  gcpSetup: 'onboarding would offer a Google Cloud sign-in, which account/gcp/setup refuses',
+  modelProviderSetup:
+    'onboarding would offer a model provider sign-in, which modelProvider/config/write refuses',
+  attachedThreads: 'not examined',
+  attachedThreadSearch: 'not examined',
+  persistentSideChats: 'not examined',
+  threadCallableApps: 'not examined',
+  skillCatalogDeltas: 'not examined',
+  incrementalToolsLegacy: 'not examined',
+  guardianNativeMultiAgentHistory: 'not examined',
+  threadRealtimeVoiceBackend: 'not examined',
+  realtimeVoiceSessionId: 'not examined',
+  threadSampleInterruptOnCancel: 'not examined',
 }
 
 // App rule: subagent-completed-kind

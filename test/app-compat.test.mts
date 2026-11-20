@@ -4,7 +4,9 @@ import test from 'node:test'
 import {
   APP_RULES,
   DESKTOP_CLIENT_NAMES,
+  dispatchCases,
   GATED_METHODS,
+  KEPT_OFF_GATES,
   rendersCompletedSubagentActivity,
   unverifiedAppWarning,
   VERIFIED_APP_VERSIONS,
@@ -55,7 +57,7 @@ test('the App baseline is a verified build', () => {
 // The methods the adapter's request switches have a case for, the ones whose
 // case answers "method not found", and those of them an App rule explains,
 // as check:app-upgrade reads them.
-function dispatchCases(): {
+function adapterCases(): {
   cases: Set<string>
   notFound: Set<string>
   byDesign: Map<string, string>
@@ -64,24 +66,69 @@ function dispatchCases(): {
   const notFound = new Set<string>()
   const byDesign = new Map<string, string>()
   for (const file of ['server.mts', 'host-methods.mts']) {
-    const text = readFileSync(new URL(`src/${file}`, root), 'utf8')
-    for (const match of text.matchAll(/case '([A-Za-z][\w/]*)':/g)) cases.add(match[1] as string)
-    for (const block of text.matchAll(
-      /((?:[ \t]*\/\/[^\n]*\n)*)[ \t]*((?:case '[^']+':\s*)+)throw (?:methodNotFound\(method\)|new RpcError\((?:[^()]|\([^()]*\))*?\bMETHOD_NOT_FOUND\b)/g,
-    )) {
-      const rule = /App rule: ([a-z0-9-]+)/.exec(block[1] as string)?.[1]
-      for (const match of (block[2] as string).matchAll(/case '([^']+)':/g)) {
-        notFound.add(match[1] as string)
-        if (rule) byDesign.set(match[1] as string, rule)
-      }
-    }
+    const found = dispatchCases(readFileSync(new URL(`src/${file}`, root), 'utf8'))
+    for (const method of found.cases) cases.add(method)
+    for (const method of found.notFound) notFound.add(method)
+    for (const [method, rule] of found.byDesign) byDesign.set(method, rule)
   }
   return { cases, notFound, byDesign }
 }
 
+test('dispatchCases finds the cases that answer "method not found"', () => {
+  const { notFound, byDesign } = adapterCases()
+  // Labels with comments between them, as server.mts groups them.
+  for (const method of [
+    'thread/prediction/request',
+    'account/securitySetup/read',
+    'thread/guardianReview',
+    'thread/prepareApprovedPlan',
+    'thread/readState/update',
+  ])
+    assert.ok(notFound.has(method), `${method} answers method not found`)
+  assert.equal(byDesign.get('thread/readState/update'), 'thread-read-state')
+  assert.equal(byDesign.has('thread/prediction/request'), false)
+
+  const found = dispatchCases(
+    [
+      "      case 'a/answered':",
+      '        return {}',
+      '      // Why the next ones fail.',
+      "      case 'a/first':",
+      '',
+      '      // More about the second.',
+      '      // App rule: some-rule',
+      "      case 'a/second':",
+      '        throw new RpcError(',
+      "          'not here',",
+      '          undefined,',
+      '          METHOD_NOT_FOUND,',
+      '        )',
+      "      case 'b/invalid':",
+      "        throw new RpcError('refused', undefined, INVALID_REQUEST)",
+      "      case 'c/plain':",
+      '        throw methodNotFound(method)',
+    ].join('\n'),
+  )
+  assert.deepEqual([...found.cases].sort(), [
+    'a/answered',
+    'a/first',
+    'a/second',
+    'b/invalid',
+    'c/plain',
+  ])
+  assert.deepEqual([...found.notFound].sort(), ['a/first', 'a/second', 'c/plain'])
+  assert.deepEqual(
+    [...found.byDesign],
+    [
+      ['a/second', 'some-rule'],
+      ['a/first', 'some-rule'],
+    ],
+  )
+})
+
 test('every request the verified App can send has a case', () => {
   const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
-  const { cases } = dispatchCases()
+  const { cases } = adapterCases()
   assert.deepEqual(
     baseline.clientRequests.filter((method: string) => !cases.has(method)),
     [],
@@ -90,7 +137,7 @@ test('every request the verified App can send has a case', () => {
 
 test('the adapter answers every request the scripts of the verified App name', () => {
   const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
-  const { cases, notFound, byDesign } = dispatchCases()
+  const { cases, notFound, byDesign } = adapterCases()
   assert.ok(baseline.appRequests.length > 100, 'the baseline records the requests the App names')
   assert.ok(notFound.size > 0, 'the cases that answer "method not found" are found')
   // Unless an App rule says how the App copes with "method not found".
@@ -109,12 +156,16 @@ test('the adapter answers every request the scripts of the verified App name', (
 
 test('GATED_METHODS names the baseline gates and their requests', () => {
   const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
-  const { cases, notFound } = dispatchCases()
+  const { cases, notFound, byDesign } = adapterCases()
   for (const [gate, methods] of Object.entries(GATED_METHODS)) {
     assert.ok(gate in baseline.gates, `${gate} is not a gate of the baseline App`)
     for (const method of methods) {
       assert.ok(baseline.clientRequests.includes(method), `${method} is not an App request`)
-      assert.ok(cases.has(method) && !notFound.has(method), `${gate} needs an answer to ${method}`)
+      // An answer, or "method not found" an App rule explains.
+      assert.ok(
+        cases.has(method) && (!notFound.has(method) || byDesign.has(method)),
+        `${gate} needs an answer to ${method}`,
+      )
     }
   }
 })
@@ -191,6 +242,31 @@ test('the adapter reports no newer a Codex version than the baseline App has', (
   assert.ok(compareVersions('0.163.0-alpha.10.2', '0.163.0-alpha.11') < 0)
   assert.ok(compareVersions('0.163.0', '0.163.0-alpha.11') > 0)
   assert.equal(compareVersions('0.163.0-alpha.10.2', '0.163.0-alpha.10.2'), 0)
+})
+
+test('the default version keeps every gate of KEPT_OFF_GATES off', () => {
+  const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
+  const saved = {
+    CLAUDE_CODEX_COMPAT_VERSION: process.env.CLAUDE_CODEX_COMPAT_VERSION,
+    CODEX_SHIM_COMPAT_VERSION: process.env.CODEX_SHIM_COMPAT_VERSION,
+  }
+  delete process.env.CLAUDE_CODEX_COMPAT_VERSION
+  delete process.env.CODEX_SHIM_COMPAT_VERSION
+  try {
+    for (const [gate, reason] of Object.entries(KEPT_OFF_GATES)) {
+      assert.ok(reason.trim(), `${gate} says why it stays off`)
+      assert.ok(gate in baseline.gates, `${gate} is not a gate of the baseline App`)
+      assert.ok(!(gate in GATED_METHODS), `${gate} is both kept off and gated`)
+      const needs = baseline.gates[gate] as string | null
+      assert.ok(
+        needs === null || compareVersions(codexCompatVersion(), needs) < 0,
+        `${codexCompatVersion()} turns on ${gate} (${needs})`,
+      )
+    }
+  } finally {
+    for (const [name, value] of Object.entries(saved))
+      if (value !== undefined) process.env[name] = value
+  }
 })
 
 test('unverifiedAppWarning only speaks up for an unlisted desktop build', () => {

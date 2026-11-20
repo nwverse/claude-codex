@@ -146,7 +146,9 @@ and prints:
 - **Feature gates** — the App's gate table, each marked on or off for the
   version the adapter reports (a gate without a version shows as "never"),
   with new, changed and removed gates, and the minimum app-server version the
-  App accepts. A gate that was on and is now off for that version is a note. A gate that is on while the
+  App accepts. A gate that was on and is now off for that version is a note,
+  and a gate listed in `KEPT_OFF_GATES` that the version turns on is a
+  problem. A gate that is on while the
   adapter answers one of its methods in `GATED_METHODS` with `-32601` is a
   problem; a new gate that is on and not in `GATED_METHODS` gets a note to
   find its methods and add them there (an empty list for a gate that needs
@@ -232,7 +234,13 @@ others on, and with them features Claude threads cannot serve: from
 connection through `feedback/save`, and every save would fail ("Choose a new
 filename and try again") whatever the adapter answered; `gcpSetup` and
 `modelProviderSetup` offer sign-ins the adapter refuses. Each needs a look at
-what it makes the App send before the default goes past it.
+what it makes the App send before the default goes past it. `KEPT_OFF_GATES`
+in `src/app-compat.mts` lists these gates with why each stays off (the
+others: not examined yet); `check:app-upgrade` reports a version that turns
+one on as a problem, and a test keeps the default below all of them.
+`threadSample` and `threadMemorySummary` are in `GATED_METHODS` instead:
+predictions stop before `thread/sample` for a thread whose provider is not
+`openai`, and `thread/memory/read` answers with no summary.
 
 On macOS the App's LaTeX preview, a separate app-server client, needs
 `0.149.0-alpha.4` or newer, and `0.162.0-alpha.20` for a project under `/tmp`

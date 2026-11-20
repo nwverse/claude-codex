@@ -21,10 +21,11 @@ function bundle(version: string, files: Record<string, string>): string {
   return dir
 }
 
-function check(app: string) {
+function check(app: string, compatVersion?: string) {
   const env = { ...process.env }
   delete env.CLAUDE_CODEX_COMPAT_VERSION
   delete env.CODEX_SHIM_COMPAT_VERSION
+  if (compatVersion) env.CLAUDE_CODEX_COMPAT_VERSION = compatVersion
   const result = spawnSync(process.execPath, [script, '--app', app, '--bundle-only'], {
     encoding: 'utf8',
     env,
@@ -92,9 +93,12 @@ test('check:app-upgrade reads the gates, the minimum and the client name of a 26
     '.vite/build/early-bootstrap-631-c364.js':
       '12(e,t,n){n.d(t,{},{EW:"Something Else"})},87329(e,t,n){"use strict";n.d(t,{},{$o:"codex_desktop:browser-page-event",EW:"Codex Desktop",d9:"codex_desktop"})}',
     '.vite/build/early-bootstrap-226-2f6b.js': [
+      // The same minified name bound in an earlier module, and in a later one.
+      'var lr=r(12);function x(){return lr.EW}',
       'var lr=r(87329);class ln{}',
       'u=new e6.R$j(this.options.messageChannel,{clientInfo:{name:lr.EW,title:"Codex Desktop",version:c},defaultServiceName:lr.d9});',
       'E("initialize",{clientInfo:{name:"codex_latex_preview",title:null,version:"1"}});',
+      'var lr=r(12);',
     ].join(''),
     // The renderer's copy imports the minimum.
     'webview/assets/async/976185.js':
@@ -147,9 +151,34 @@ test('check:app-upgrade lists a request the adapter answers -32601 by design apa
     assert.equal(status, 0, out)
     assert.match(
       out,
-      /-32601 by design:\n {4}thread\/readState\/update \(by design, rule thread-read-state\)/,
+      /-32601 by design:\n {4}thread\/readState\/update \(rule thread-read-state\)\n/,
     )
     assert.doesNotMatch(out, /problem:/)
+  } finally {
+    rmSync(app, { recursive: true, force: true })
+  }
+})
+
+test('check:app-upgrade reports a version that turns on a gate the adapter keeps off', () => {
+  // feedbackSave is in KEPT_OFF_GATES: the App would save diagnostics
+  // through feedback/save, which fails.
+  const app = bundle('26.1199.3', {
+    '.vite/build/main.js': [
+      `o=${gateTable('"', 'feedbackSave:"0.164.0-alpha.11",')};`,
+      'let ef="0.141.0",eg="codex-app-server-version-unsupported:";',
+      'x({minRequiredVersion:ef});send({clientInfo:{name:"Codex Desktop",version:c}});',
+    ].join(''),
+  })
+  try {
+    const kept = check(app)
+    assert.equal(kept.status, 0, kept.out)
+    assert.match(kept.out, /off feedbackSave +0\.164\.0-alpha\.11/)
+    const raised = check(app, '0.169.0-alpha.11.1')
+    assert.equal(raised.status, 1, raised.out)
+    assert.match(
+      raised.out,
+      /problem: the adapter's version turns on feedbackSave \(needs 0\.164\.0-alpha\.11\), which KEPT_OFF_GATES keeps off/,
+    )
   } finally {
     rmSync(app, { recursive: true, force: true })
   }
