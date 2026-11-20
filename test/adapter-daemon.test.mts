@@ -702,7 +702,6 @@ test('startup recovery terminalizes persisted in-progress item liveness', async 
           durationMs: null,
         },
       ],
-      diff: '',
       error: null,
     })
 
@@ -853,7 +852,6 @@ test('startup recovery repairs stale items on already-terminal turns and is idem
           durationMs: null,
         },
       ],
-      diff: '',
       error: { message: 'already interrupted' },
     })
 
@@ -918,7 +916,6 @@ test('startup recovery keeps markers of finished agents and ends the ones it cut
       completedAt: status === 'completed' ? now - 1 : null,
       durationMs: status === 'completed' ? 3000 : null,
       items: [],
-      diff: '',
       error: null,
     })
   const spawn = (id: string) => ({
@@ -972,7 +969,6 @@ test('startup recovery keeps markers of finished agents and ends the ones it cut
         },
         activity(finished, 'completed'),
       ],
-      diff: '',
       error: null,
     })
 
@@ -1066,7 +1062,6 @@ test('startup recovery fails only the turns of servers that are gone', async () 
           completedAt: null,
           durationMs: null,
           items: [],
-          diff: '',
           error: null,
         })
       }
@@ -1391,7 +1386,9 @@ test('app-server --print-startup-config prints one JSON line without opening the
 test('app-server daemon version reports the unix daemon on the control socket, and fails without one', {
   timeout: 30_000,
 }, async (t) => {
-  const home = await mkdtemp(join(tmpdir(), 'ccx-'))
+  // The control socket sits under CODEX_HOME, so keep the home itself short:
+  // macOS's per-user temp dir leaves no room for the socket path under it.
+  const home = await mkdtemp(join(process.platform === 'darwin' ? '/tmp' : tmpdir(), 'ccx-'))
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     CODEX_HOME: home,

@@ -1,3 +1,4 @@
+import './support/hermetic-env.mjs'
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'

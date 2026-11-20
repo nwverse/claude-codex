@@ -230,6 +230,20 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- A file the turn diff leaves out (too large, binary or past the size limit)
+  shows as a binary change with the reason after it, which renderers show
+  without content and `git apply` refuses. It used to be a one-line hunk that
+  `git apply` accepted, writing `[omitted: …]` into the file; that includes
+  `gitDiffToRemote`, which the App sends as a cloud task's starting diff. New
+  files in a chat that runs in a subfolder are named from the repository root,
+  as the changed tracked files are, also where `diff.relative` is set, and a
+  tracked diff over the 5 MB limit is no longer empty with a git older than
+  2.28. (#336)
+- A folder that becomes a repository after a chat first diffed it shows its
+  changes in `turn/diff/updated` and `gitDiffToRemote` within 30 seconds,
+  and one whose `git` timed out once on a busy machine at the next diff. The
+  adapter used to remember either as no repository until it restarted.
+  (#336)
 - Untracked symlinks show in the turn diff as `new file mode 120000` entries
   whose content is the link target, as `git diff` shows them. The adapter no
   longer reads through a link, so a file outside the workspace no longer leaks
@@ -334,10 +348,11 @@ versioning or publishing metadata.
   still working is refused with "this agent is still working; message it from
   its parent chat or wait for it to report", instead of naming an active turn
   in another adapter process that does not exist. (#335)
-- A `turn/start` sent while another is still starting on the same thread, or
-  a goal continuation that waited on it, joins that turn instead of opening a
-  second run whose answer was dropped, and a late cleanup from an older turn
-  no longer clears the newer one or marks the thread idle. (#241)
+- A `turn/start` sent while another turn runs or is still starting on the
+  same thread, or a goal continuation that waited on it, joins that turn
+  instead of opening a second run that orphaned it or whose answer was
+  dropped, and a late cleanup from an older turn no longer clears the newer
+  one or marks the thread idle. (#241)
 - `thread/loaded/list` honors its cursor: following `nextCursor` returns the
   next page instead of the first one again, the last page's cursor is
   `null`, `limit: 0` counts as 1 instead of looping on empty pages, and a
@@ -435,8 +450,7 @@ versioning or publishing metadata.
   in progress with an unhandled rejection.
 - Goals, steer and the message queue follow the Codex App: `thread/goal/*`
   with continuation turns, token and time budgets and goal tools for Claude;
-  steer errors in Codex's wording; `thread/queue/*`; and a `turn/start` that
-  races a running turn joins it instead of orphaning it.
+  steer errors in Codex's wording; and `thread/queue/*`.
 - A queued message that starts after the App disconnected is no longer killed
   by the unix daemon's idle exit 15 s into its turn, with the message already
   gone from the queue; nor is any other turn that starts while the daemon
@@ -501,15 +515,18 @@ versioning or publishing metadata.
   to when neither names one (by default
   `app-server-control/app-server-control.sock` under `CODEX_HOME`); an
   explicit `--listen unix://PATH` or `proxy --sock PATH` still wins. Both
-  commands read it, so set it where both run. The daemon makes the socket's
-  folder private to the user, so give the socket a folder of its own.
+  commands read it, so set it where both run. The daemon creates a missing
+  folder with mode 700 and leaves an existing folder's permissions as they
+  are; it refuses to start in a folder that group or other users can write
+  to unless the folder is sticky, as `/tmp` is.
 - `app-server proxy` takes `--sock=PATH` as well as `--sock PATH`; a `--sock`
   with no path is an error instead of quietly using the default socket. A
   bad `--listen` (`tcp://...`, `ws://host:abc`, or `--listen` with no value)
   now fails with one line before the state database opens, instead of a
   stack trace after it, or a silent `stdio://`. The unix daemon no longer
-  refuses to start over a pid file that is empty, holds `0`, or names a
-  process that is not listening on the socket.
+  refuses to start over a pid file that is empty or holds `0`, nor over one
+  naming a process that has not listened on the socket within the startup
+  limit described next.
 - A unix daemon that takes more than 10 seconds to start no longer gets a
   second daemon beside it. A second `--listen unix://` used to take it for
   stale after 10 seconds and start too; one of the two then removed the
@@ -922,6 +939,18 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- A turn no longer stores the whole uncommitted `git diff` of its folder,
+  which nothing read back. In a repository with a large uncommitted change
+  every turn added megabytes to `state.sqlite`, every fork copied them, and
+  every history read or search decoded them: five turns in a repository with
+  a 3.5 MB diff grew the file to 21 MB, now 160 KB. Clients that listen still
+  get `turn/diff/updated`; the turn's end no longer runs `git diff` when every
+  client opted out of it, as the App does. After the upgrade the adapter
+  empties the diffs older versions stored gradually, a few turns per write in
+  the background once it serves, so a large state file neither delays its
+  start nor locks out another adapter for long; reads skip them meanwhile.
+  SQLite reuses the space (the file does not shrink), and an older version
+  still opens the state. (#336)
 - A Claude chat keeps its conversation when its workspace folder is moved or
   renamed. The adapter looks for the transcript under the workspace it last
   recorded, in the chat's own Claude config folder, and resumes an
@@ -1416,6 +1445,13 @@ versioning or publishing metadata.
   `CLAUDE_CODEX_SESSION_CHANGES` and the summary model, the backends guide
   the shim's and `claude-codex-mode`'s own variables, and the worktree docs
   say that `CLAUDE_CODEX_AUTO_WORKTREE=1` turns isolation on. (#304)
+- The capability matrix no longer says `CLAUDE_CODEX_ALLOWED_TOOLS` restricts
+  Claude's tools: the listed tools are pre-approved and run without an
+  approval card, and a Claude Code deny rule is what takes a tool away. The
+  `src/` AGENTS.md map lists the modules added since, such as the native
+  Codex harness and the shared process-group and JSON-file helpers, and the
+  root AGENTS.md points to the configuration reference table for the full
+  list of variables. (#338)
 
 ### Validation and release gates
 
@@ -1424,15 +1460,27 @@ versioning or publishing metadata.
   fixture drift gate.
 - The docs build no longer ignores dead links, so a link to a page that does not
   exist fails CI.
-- `npm test` passes in a developer's or Claude Code's shell as it does on CI:
-  `CLAUDE_CODE_WORKFLOWS=1`, `umask 077` and a global
-  `commit.gpgsign = true` no longer fail tests, the ~105 mock adapters the
-  suites on `test/support/adapter-harness.mts` start no longer get the
-  shell's `ANTHROPIC_*`, `CLAUDE*` or `CODEX_*` variables, and no suite
-  writes to the real `~/.codex` debug log. Daemon and fixture tests allow for
-  a busy machine, `npm run build` clears `dist/test` so a deleted suite stops
-  running, and a hung test fails after 2 minutes instead of holding
-  `npm test` (CI jobs stop after 20).
+- `npm test` passes in a developer's or Claude Code's shell as it does on CI,
+  and leaves that shell's adapter and Claude state alone. It preloads
+  `dist/test/support/hermetic-env.mjs` into every suite, and the suites that
+  start adapters or run adapter code in-process import it too, for a direct
+  `node --test` run. No suite, and no adapter a suite starts, gets the
+  shell's `ANTHROPIC_*`, `CLAUDE*` or `CODEX_*` variables. Before, only the
+  `adapter-*` suites dropped them, and from a shell or chat that exports
+  `CLAUDE_CODEX_HOME` (as `claude-codex-isolated` does) the others wrote
+  dozens of mock threads, debug and run logs, and an
+  `approval_policy = never`, `danger-full-access` default into that live
+  adapter home. No suite writes to `~/.codex` either: a session store for a
+  database elsewhere no longer creates the adapter home, a thread's git
+  lookup that outlives its server no longer logs, and an MCP test no longer
+  reads `~/.codex/config.toml`. The relative `CLAUDE_CODEX_SOCKET_PATH` test
+  passes in a checkout deeper than about 84 bytes, and the
+  `app-server daemon version` test runs on macOS instead of skipping under
+  its long temp folder (#330). `CLAUDE_CODE_WORKFLOWS=1`, `umask 077` and a
+  global `commit.gpgsign = true` no longer fail tests. Daemon and fixture
+  tests allow for a busy machine, `npm run build` clears `dist/test` so a
+  deleted suite stops running, and a hung test fails after 2 minutes instead
+  of holding `npm test` (the CI job that runs it stops after 20 minutes).
 - The mock adapter suites, once one `adapter.test.mts`, run as parallel
   `adapter-*` suites, and tests that failed on a busy machine or with the
   long macOS temp folder pass there (#130, #193, #213, #214). Biome is 2.6,
@@ -1473,6 +1521,5 @@ versioning or publishing metadata.
   bypass behavior.
 - The App's worktree tools (its `threadAttachments` gate) on a local host,
   where the App names them for its bundled `codex_app` MCP server instead of
-  sending them as `dynamicTools`, MCP tool-call progress, and Claude Code
-  plugin skills in the "/" popup are not included. Hook runs are shown live
-  but not kept in history.
+  sending them as `dynamicTools`, and MCP tool-call progress are not
+  included. Hook runs are shown live but not kept in history.

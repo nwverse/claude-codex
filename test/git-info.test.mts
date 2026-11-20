@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import test from 'node:test'
 import { gitInfoFor, patchGitInfo, sanitizeGitRemoteUrl } from '../src/git-info.mjs'
+import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync(
@@ -178,3 +180,35 @@ esac
     }
   })
 }
+
+test('a thread git lookup that outlives its server logs nothing', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-codex-git-late-')))
+  const previousPath = process.env.PATH
+  const previousLog = process.env.CLAUDE_CODEX_DEBUG_LOG
+  const log = join(root, 'debug.jsonl')
+  try {
+    // A git that hangs: the lookup thread/start begins fails a second later.
+    await writeFile(join(root, 'git'), '#!/bin/sh\nexec /bin/sleep 5\n', { mode: 0o755 })
+    process.env.PATH = `${root}${delimiter}${previousPath ?? ''}`
+    await withInProcessApp(
+      scriptedRuntime(async () => {}),
+      async (app) => {
+        await app.startThread({ cwd: root })
+      },
+    )
+    // The server is stopped and the test's environment is back: a late line
+    // would go to the debug log of whatever adapter home that names, as the
+    // developer's ~/.codex.
+    process.env.CLAUDE_CODEX_DEBUG_LOG = log
+    // The thread's lookup still waits on git. gitInfoFor hands this caller the
+    // same lookup, so once it fails here the server has seen it fail too.
+    await assert.rejects(gitInfoFor(root))
+    assert.equal(existsSync(log), false)
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH
+    else process.env.PATH = previousPath
+    if (previousLog === undefined) delete process.env.CLAUDE_CODEX_DEBUG_LOG
+    else process.env.CLAUDE_CODEX_DEBUG_LOG = previousLog
+    await rm(root, { recursive: true, force: true })
+  }
+})

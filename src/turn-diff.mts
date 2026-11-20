@@ -11,6 +11,10 @@ const DIFF_FILE_BYTES = 256 * 1024
 const DIFF_INLINE_BYTES = 2 * 1024 * 1024
 const MAX_LISTED_FILES = 256
 const MAX_PER_FILE_DIFFS = 32
+// `git diff` names files from the top of the work tree even where the user
+// set diff.relative. As config rather than --no-relative (git 2.28), so an
+// older git, which has no diff.relative, still runs it.
+const GIT_DIFF = ['-c', 'diff.relative=false', 'diff', '--no-ext-diff']
 
 // `git diff` failing is expected outside a repo, so we still return '' to keep
 // turns working — but the reason is written to the debug log instead of being
@@ -24,23 +28,43 @@ export function isNotAGitRepo(error: unknown): boolean {
 // `git diff` spawn entirely. Without this guard a non-git workspace (App
 // Remote pointing at $HOME or any arbitrary dir) was spamming debug.jsonl
 // with multi-KB "not a git repository" failures on every turn cycle, since
-// gitDiff runs from runRuntimeTurn after each tool result.
-const gitRepoCache = new Map<string, boolean>()
-export async function isGitWorkTree(cwd: string): Promise<boolean> {
-  if (gitRepoCache.has(cwd)) return gitRepoCache.get(cwd) as boolean
-  let inside = false
+// gitDiff runs from runRuntimeTurn after each tool result. A work tree is
+// cached, with cwd's path from its top ('' or ending in '/'). A folder git
+// says is none is cached for a while only, as it can become one (`git init`),
+// and a timeout or failed spawn on a loaded machine, which says nothing about
+// the folder, is not cached at all (as in git-info.mts).
+const NOT_A_WORK_TREE_TTL_MS = 30_000
+const workTreePrefixes = new Map<string, string>()
+const notWorkTreesAt = new Map<string, number>()
+async function workTreePrefix(cwd: string): Promise<string | null> {
+  const cached = workTreePrefixes.get(cwd)
+  if (cached !== undefined) return cached
+  const at = notWorkTreesAt.get(cwd)
+  if (at !== undefined && Date.now() - at < NOT_A_WORK_TREE_TTL_MS) return null
+  notWorkTreesAt.delete(cwd)
+  let stdout: string
   try {
-    const { stdout } = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
-      cwd,
-      timeout: 3_000,
-      maxBuffer: 1024,
-    })
-    inside = stdout.trim() === 'true'
-  } catch {
-    inside = false
+    const args = ['rev-parse', '--is-inside-work-tree', '--show-prefix']
+    stdout = (await execFileAsync('git', args, { cwd, timeout: 3_000, maxBuffer: 64 * 1024 }))
+      .stdout
+  } catch (error) {
+    // Git ran and exited with a status: outside a repository.
+    if (typeof (error as { code?: unknown } | null)?.code === 'number')
+      notWorkTreesAt.set(cwd, Date.now())
+    return null
   }
-  gitRepoCache.set(cwd, inside)
-  return inside
+  const [inside, prefix = ''] = stdout.split('\n')
+  if (inside !== 'true') {
+    // Inside a .git folder.
+    notWorkTreesAt.set(cwd, Date.now())
+    return null
+  }
+  workTreePrefixes.set(cwd, prefix)
+  return prefix
+}
+
+export async function isGitWorkTree(cwd: string): Promise<boolean> {
+  return (await workTreePrefix(cwd)) !== null
 }
 
 export function addedFileDiff(path: string, text: string, mode = '100644'): string {
@@ -61,14 +85,17 @@ export function addedFileDiff(path: string, text: string, mode = '100644'): stri
   ].join('\n')
 }
 
+// A file whose content the diff leaves out, as git shows a binary change: a
+// renderer shows no content, and `git apply` refuses it (no full index)
+// instead of writing a placeholder into the file. The reason follows outside
+// any hunk, where git skips it.
 function omittedFileDiff(path: string, reason: string, added = false): string {
   return [
     `diff --git a/${path} b/${path}`,
-    ...(added ? ['new file mode 100644', 'index 0000000..0000000'] : []),
-    added ? '--- /dev/null' : `--- a/${path}`,
-    `+++ b/${path}`,
-    '@@ -0,0 +1 @@',
-    `+[omitted: ${reason}]`,
+    ...(added ? ['new file mode 100644'] : []),
+    'index 0000000..0000000',
+    `Binary files ${added ? '/dev/null' : `a/${path}`} and b/${path} differ`,
+    `[omitted: ${reason}]`,
     '',
   ].join('\n')
 }
@@ -100,7 +127,7 @@ function listGitRecords(
     child.once('error', reject)
     child.once('close', (code) => {
       if (code === 0) resolve({ records, omitted })
-      else reject(new Error(`git ${args[0]} exited with ${code ?? 'a signal'}`))
+      else reject(new Error(`git ${args.join(' ')} exited with ${code ?? 'a signal'}`))
     })
   })
 }
@@ -112,7 +139,7 @@ function bufferOverflow(error: unknown): boolean {
 }
 
 async function trackedDiffFallback(cwd: string, budget: InlineBudget): Promise<string> {
-  const args = ['diff', '--no-ext-diff', '--no-renames', '--no-relative']
+  const args = [...GIT_DIFF, '--no-renames']
   const { records, omitted } = await listGitRecords(cwd, [...args, '--numstat', '-z', '--'])
   const files = records.map((record) => {
     const first = record.indexOf('\t')
@@ -163,7 +190,7 @@ export async function gitDiff(cwd: string): Promise<string> {
   const budget = { remaining: DIFF_INLINE_BYTES }
   let tracked: string
   try {
-    const { stdout } = await execFileAsync('git', ['diff', '--no-ext-diff', '--'], {
+    const { stdout } = await execFileAsync('git', [...GIT_DIFF, '--'], {
       cwd,
       timeout: 10_000,
       maxBuffer: TRACKED_DIFF_BYTES,
@@ -188,8 +215,16 @@ export async function gitDiff(cwd: string): Promise<string> {
   return tracked + (await gitUntrackedDiff(cwd, budget))
 }
 
-async function untrackedFileDiff(cwd: string, path: string, budget: InlineBudget): Promise<string> {
-  const fullPath = join(cwd, path)
+// `listed` is relative to cwd, as ls-files lists it; the diff names the file
+// from the top of the work tree, as `git diff` does.
+async function untrackedFileDiff(
+  cwd: string,
+  prefix: string,
+  listed: string,
+  budget: InlineBudget,
+): Promise<string> {
+  const fullPath = join(cwd, listed)
+  const path = prefix + listed
   const info = await lstat(fullPath)
   if (info.isSymbolicLink()) return addedFileDiff(path, await readlink(fullPath), '120000')
   if (!info.isFile()) return ''
@@ -231,6 +266,8 @@ export async function gitUntrackedDiff(
   budget: InlineBudget = { remaining: DIFF_INLINE_BYTES },
 ): Promise<string> {
   try {
+    const prefix = await workTreePrefix(cwd)
+    if (prefix === null) return ''
     const { records, omitted } = await listGitRecords(cwd, [
       'ls-files',
       '--others',
@@ -240,7 +277,7 @@ export async function gitUntrackedDiff(
     const patches: string[] = []
     for (const path of records) {
       try {
-        patches.push(await untrackedFileDiff(cwd, path, budget))
+        patches.push(await untrackedFileDiff(cwd, prefix, path, budget))
       } catch (error) {
         // A disappearing or unreadable path must not hide the other new files.
         debugLog('git.untrackedDiff.fileFailed', { cwd, path, error: String(error) })
