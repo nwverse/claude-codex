@@ -465,10 +465,13 @@ versioning or publishing metadata.
   stale after 10 seconds and start too; one of the two then removed the
   other's socket, and the daemon left without one kept the state database and
   its Claude runtime open and never exited. The process the pid file names now
-  counts as the daemon for as long as it runs, unless it started after the
-  file was written (a reused pid), and a daemon never removes a socket that
-  still accepts connections: the second one says `app-server already starting`
-  or `already running` and exits 0. (#329)
+  gets up to 60 seconds from the file's date to start listening, unless it
+  started after the file was written (a reused pid); when `ps` cannot report
+  its start time, the 10 seconds still apply. Meanwhile a second daemon says
+  `app-server already starting` (or `already running`) and exits 0. A daemon
+  removes a socket at its path only when the socket refuses a connection, so
+  of two daemons that do start, the one that binds second leaves the socket
+  to the first and exits. (#329)
 - With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
   Code processes one at a time: a new session waits until the previous
   launch has sent its first SDK message, has ended, or has held the slot for

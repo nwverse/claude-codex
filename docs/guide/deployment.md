@@ -159,6 +159,17 @@ client disconnects it shuts down after an idle grace period (deferred if a turn
 is still active; reconnecting during that window reattaches notifications). Tune
 with `CLAUDE_CODEX_IDLE_EXIT_MS` (default `15000`; `0` keeps it running).
 
+One daemon serves a socket. Its pid is in the `.pid` file next to the socket. A
+second `app-server --listen unix://` for the same socket prints
+`app-server already running at <socket> (pid N)` and exits 0 when the daemon
+listens. If the daemon is still starting, the second one waits up to 10 seconds
+for it to listen, then prints `app-server already starting` and exits 0. It starts in the
+daemon's place when that process has exited, when the pid now belongs to a
+process started after the file was written, or when the daemon has not
+listened within 60 seconds of the file's date (10 seconds when `ps` cannot
+report process start times). A socket that still answers is never removed. A
+daemon that finds the socket taken when it binds exits 0 as well.
+
 Several clients can follow one thread at once. A client follows the threads it
 starts, resumes, forks or sends a turn to, until it disconnects or sends
 `thread/unsubscribe`, which drops only that client; every follower gets the

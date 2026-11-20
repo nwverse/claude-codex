@@ -6,7 +6,7 @@ import { reapOrphanedCliChildren } from './cli-orphans.mjs'
 import { daemonProbe, listening, startupConfigProbe } from './cli-probes.mjs'
 import { inheritedHooksWarning } from './inherited-config.mjs'
 import { replaceJsonFile } from './json-file.mjs'
-import { startedBy } from './process-owner.mjs'
+import { processStartTime } from './process-owner.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
 import { SessionStore } from './store.mjs'
@@ -338,7 +338,15 @@ function configArgs(args: string[]): string[] {
 
 // How long a second daemon waits for one that is still starting to listen,
 // or to exit so that it can take its place, before it leaves it to finish.
-const DAEMON_STARTUP_WAIT_MS = 10_000
+// A pid whose process start time ps cannot read gets only this long from
+// the pid file's date, as it may belong to no daemon at all.
+const DAEMON_STARTUP_GRACE_MS = 10_000
+// How long the daemon a pid file names may go without listening before it is
+// taken for hung (or a zombie no one reaps) and replaced. Counted from the
+// file's date, which a touch, a restore or a sync can make later than the
+// daemon's start. A slow daemon replaced this way is safe: whichever binds
+// the socket second finds it taken and exits.
+const DAEMON_STARTUP_LIMIT_MS = 60_000
 
 async function ensureSingleUnixDaemon(listen: string): Promise<UnixDaemon> {
   const socketPath = listen === 'unix://' ? defaultSocketPath() : listen.slice('unix://'.length)
@@ -352,8 +360,8 @@ async function ensureSingleUnixDaemon(listen: string): Promise<UnixDaemon> {
     )
     process.exit(0)
   }
-  // The pid file may be stale. Only a socket that accepts no connection can
-  // be reclaimed at the listen path.
+  // The pid file may be stale. Only a socket that refuses a connection can be
+  // reclaimed at the listen path.
   if (!(await removeStaleSocket(socketPath, shared).catch(optionError))) {
     process.stderr.write(`[claude-codex-adapter] app-server already running at ${socketPath}\n`)
     process.exit(0)
@@ -389,10 +397,9 @@ function readDaemonPid(pidFile: string, shared: boolean): number | null {
 // Whether the daemon the pid file names is running, still starting, or gone
 // (null). A live pid is that daemon only if its process had started by the
 // time the file was written; one that started later got the pid of a daemon
-// that is gone, as after a reboot. The daemon itself is never taken for gone
-// while it lives, however long it takes to listen: the store, startup
-// recovery and ps can take well over 10 s on a loaded machine, and a second
-// daemon would serve the same state beside it.
+// that is gone, as after a reboot. The daemon itself is not taken for gone
+// before the startup limit just because it does not listen yet: the store,
+// startup recovery and ps can take well over 10 s on a loaded machine.
 async function daemonState(
   pid: number,
   socketPath: string,
@@ -404,11 +411,20 @@ async function daemonState(
   } catch {
     return null
   }
-  if (!processIsAlive(pid) || !startedBy(pid, writtenAt)) return null
-  const deadline = Date.now() + DAEMON_STARTUP_WAIT_MS
+  if (!processIsAlive(pid)) return null
+  const started = processStartTime(pid)
+  if (started !== null && started > writtenAt) return null
+  // A pid file dated in the future (clock stepped back, network file system)
+  // counts from now, not from its date.
+  const now = Date.now()
+  const staleAt =
+    Math.min(writtenAt, now) +
+    (started === null ? DAEMON_STARTUP_GRACE_MS : DAEMON_STARTUP_LIMIT_MS)
+  const waitUntil = now + DAEMON_STARTUP_GRACE_MS
   for (;;) {
     if (await listening(socketPath)) return 'running'
-    if (Date.now() >= deadline) return 'starting'
+    if (Date.now() >= staleAt) return null
+    if (Date.now() >= waitUntil) return 'starting'
     await sleep(200)
     if (!processIsAlive(pid)) return null
   }

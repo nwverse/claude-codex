@@ -36,15 +36,15 @@ export function otherProcessRunning(owner: ProcessOwner): boolean {
   return started === undefined ? signalable(owner.pid) : started === owner.started
 }
 
-// Whether the process with this pid had started by `time` (ms since the
-// epoch), as the process that wrote a file naming its pid must have; one
-// that started later got the pid of a process that is gone. ps prints whole
-// seconds. Like a live owner above, a process whose start ps cannot read
-// counts as started.
-export function startedBy(pid: number, time: number): boolean {
+// When the process with this pid started, in ms since the epoch to the whole
+// second ps prints, or null when ps cannot tell: the process is gone, or ps
+// is missing, has no lstart (BusyBox), timed out or printed a date that does
+// not parse.
+export function processStartTime(pid: number): number | null {
   const started = startTimes([pid])?.get(pid)
   // In the C locale and UTC, lstart reads "Mon Oct 12 02:52:58 2026".
-  return !(started !== undefined && Date.parse(`${started} UTC`) > time)
+  const time = started === undefined ? Number.NaN : Date.parse(`${started} UTC`)
+  return Number.isFinite(time) ? time : null
 }
 
 function signalable(pid: number): boolean {
