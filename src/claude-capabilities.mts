@@ -9,6 +9,7 @@ import {
   listFolderCommands,
 } from './claude-commands.mjs'
 import { claudeHookFiles, claudeHookScope } from './claude-hooks.mjs'
+import { jsonSyntaxReason } from './json-syntax.mjs'
 import { bridgedClaudeConfigDir, claudeSkillFolders } from './project-instructions.mjs'
 import { isPathInside } from './util.mjs'
 
@@ -298,7 +299,9 @@ export function listClaudeHooks(params: Record<string, unknown>): HooksListEntry
       try {
         parsed = JSON.parse(readFileSync(path, 'utf8'))
       } catch (error) {
-        errors.push({ path, message: messageOf(error) })
+        // The App shows the reason; the parser's excerpt may hold a credential.
+        const message = error instanceof SyntaxError ? jsonSyntaxReason(error) : messageOf(error)
+        errors.push({ path, message })
         continue
       }
       const hookConfig = asRecord(parsed.hooks)

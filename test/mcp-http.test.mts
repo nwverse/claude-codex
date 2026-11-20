@@ -128,12 +128,13 @@ for (const format of ['application/json', 'text/event-stream']) {
     process.env.CLAUDE_CODEX_MCP_SERVERS = JSON.stringify({
       echo: { type: 'http', url: `http://127.0.0.1:${address.port}/mcp` },
     })
+    // inherit: false, or this reads the developer's ~/.codex config and
+    // logs the servers it found to the debug log of the adapter there.
+    const read = () => readMcpResource('echo', 'memo://note', { inherit: false })
     try {
-      await assert.rejects(readMcpResource('echo', 'memo://note'), /no reply for request 2/)
+      await assert.rejects(read(), /no reply for request 2/)
       match = true
-      assert.deepEqual(await readMcpResource('echo', 'memo://note'), {
-        contents: [{ text: 'value' }],
-      })
+      assert.deepEqual(await read(), { contents: [{ text: 'value' }] })
     } finally {
       restoreEnv('CLAUDE_CODEX_MCP_SERVERS', saved)
       server.closeAllConnections()

@@ -498,7 +498,7 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 
 # Rotate once the log reaches this many bytes (default 52428800, 50 MiB;
 # 0 never rotates), keeping this many old files as debug.jsonl.1, .2, ...
-# (default 3, at least 1).
+# (default 3, at least 1, at most 100).
 export CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES="52428800"
 export CLAUDE_CODEX_DEBUG_LOG_KEEP="3"
 ```
@@ -510,7 +510,12 @@ cut at 1200 characters. The App's prompts and steers, streamed text and output
 deltas, diffs, file writes, terminal input and injected items are logged as
 sizes, counts and ids instead of their text. Writing is best-effort: a log that
 cannot be written never fails a turn. Everything else, such as commands, paths
-and bridge URLs, is written as is, so keep the file private.
+and bridge URLs, is written as is, so the adapter creates the log and its
+rotated copies readable by their owner alone (0600). When it starts writing to
+the log it also tightens a log or rotated copy an earlier version left
+readable, if that is a regular file the adapter owns; a symbolic link and its
+target, a device such as `/dev/stderr` and another user's file keep their mode.
+Keep any copy you make private too.
 
 ## WebSocket listener
 
@@ -631,7 +636,7 @@ the profile's `env` or env file.
 | `CLAUDE_CODEX_CODEX_AUTO_COMPACT` | `1` takes `model_auto_compact_token_limit` from the Codex config files (user `config.toml` and trusted project `.codex/config.toml`) as the auto-compact window of Claude threads; off otherwise, since users set it there for Codex models and it would replace their Claude Code window. See [Context compaction](#context-compaction). |
 | `CLAUDE_CODEX_APP_PLUGIN_MCP` | `1` runs the MCP server of the Codex App's bundled `code-review` plugin for the App's Pull Requests panel calls, from the plugin's folder with a short environment allowlist; a comma-separated list names other plugins instead (`codex-app-tools` and `browser-use` never run). Off otherwise; Claude threads never get these servers. The plugin uses the host's GitHub credentials, such as an existing `gh` login; the adapter passes it no token. See [Pull Requests panel](/guide/gui#pull-requests-panel). |
 | `CLAUDE_CODEX_APP_MCP_SERVERS` | `1` lets the App's Settings > MCP servers add, edit, switch off and delete servers, which the adapter keeps in its own config and starts in Claude threads' own turns, below `CLAUDE_CODEX_MCP_SERVERS`. Off otherwise (the default): the page lists no server and every save, switch or delete there fails with a message naming this switch and Claude Code's own MCP config; servers saved earlier stay saved, unused. See [MCP, tools & directories](#mcp-tools-directories). |
-| `CLAUDE_CODEX_ALLOWED_TOOLS` | Pre-approved tools. |
+| `CLAUDE_CODEX_ALLOWED_TOOLS` | Pre-approved tools, comma-separated, which run without an approval card. In a read-only sandbox or plan mode only the single `Tool` or `Tool(specifier)` rules for tools that read (Read, Grep, Glob, LS, WebSearch) stay pre-approved; anything else listed, such as `Bash(git log:*)`, WebFetch or an MCP tool, asks or is refused there as an unlisted tool is. A thread switched to read-only while background work or session cron jobs keep its Claude Code process running keeps the old list until that process ends. |
 | `CLAUDE_CODEX_ADD_DIRS` | Extra directories exposed to Claude. |
 | `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` | Claude Code config folder (such as `~/.claude`) whose `CLAUDE.md`, rules and skills the adapter passes to Claude itself, together with the project's `CLAUDE.md` files, rules and skills. For a Claude CLI started with its setting sources turned off. `AGENTS.md` files reach Claude either way. Its MCP servers, subagents, permission rules and command hooks come along only with the switches below. |
 | `CLAUDE_CODEX_CLAUDE_MCP_SERVERS` | `1` starts the bridged Claude Code config's MCP servers (with approved project `.mcp.json` servers) in Claude threads and lists them in the App's MCP panel; off otherwise. Needs `CLAUDE_CODEX_CLAUDE_CONFIG_DIR`. See [Inherited configuration](https://github.com/nwverse/claude-codex#inherited-configuration). |

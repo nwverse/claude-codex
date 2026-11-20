@@ -3178,6 +3178,75 @@ test('native SDK plan mode carries ExitPlanMode and AskUserQuestion to the App',
   assert.equal(events.length, 1)
 })
 
+test('native SDK pre-approves only the reads of CLAUDE_CODEX_ALLOWED_TOOLS in a read-only sandbox or plan mode', () => {
+  const previous = process.env.CLAUDE_CODEX_PERMISSION_MODE
+  delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  // The CLI splits --allowedTools again at commas and at spaces outside
+  // parentheses, without tracking nesting: each of these is a read rule and
+  // another rule after it.
+  const smuggled = [
+    'Read(./docs/**) Bash',
+    'Grep(x) Write',
+    'Read(./docs/**) Bash(rm -rf:*)',
+    'Read(x)) Bash',
+    'Read(a(b) Bash()',
+  ]
+  // The turn's allowedTools are CLAUDE_CODEX_ALLOWED_TOOLS.
+  const listed = [
+    'Bash',
+    'Bash(git log:*)',
+    'Write',
+    'Read(./docs/**)',
+    'Grep',
+    'WebFetch',
+    'Agent',
+    'mcp__docs__update',
+    ...smuggled,
+  ]
+  const reads = ['Read(./docs/**)', 'Grep']
+  const launch = (overrides: Partial<RuntimeTurnContext>, allowedTools = listed) => {
+    const context = nativeTurnContext({ allowedTools, ...overrides })
+    const options = buildOptions.call(runtime, {}, context, new AbortController(), () => null)
+    return { allowed: options.allowedTools, signature: sessionSignature(context) }
+  }
+  try {
+    // Claude Code runs a pre-approved tool without asking canUseTool: a listed
+    // Bash or Write would run in these threads with no card.
+    for (const approvalPolicy of ['on-request', 'never', 'untrusted'])
+      assert.deepEqual(launch({ approvalPolicy, sandboxMode: 'read-only' }).allowed, reads)
+    for (const sandboxMode of ['workspace-write', 'danger-full-access']) {
+      const plan = launch({ planMode: true, approvalPolicy: 'never', sandboxMode })
+      assert.deepEqual(plan.allowed, reads)
+    }
+    assert.equal(launch({ sandboxMode: 'read-only' }, ['Bash', 'Write']).allowed, undefined)
+    for (const rule of smuggled) {
+      assert.equal(launch({ sandboxMode: 'read-only' }, [rule]).allowed, undefined, rule)
+      assert.equal(launch({ planMode: true }, [rule]).allowed, undefined, rule)
+    }
+    // Elsewhere the list stands as it is.
+    for (const sandboxMode of ['workspace-write', 'danger-full-access', null])
+      assert.deepEqual(launch({ approvalPolicy: 'on-request', sandboxMode }).allowed, listed)
+    // A thread leaving read-only gets a session with the whole list; one
+    // that lists only reads keeps its session.
+    assert.notEqual(
+      launch({ sandboxMode: 'read-only' }).signature,
+      launch({ sandboxMode: 'workspace-write' }).signature,
+    )
+    assert.equal(
+      launch({ sandboxMode: 'read-only' }, reads).signature,
+      launch({ sandboxMode: 'workspace-write' }, reads).signature,
+    )
+    // Plan mode by the env override too.
+    process.env.CLAUDE_CODEX_PERMISSION_MODE = 'plan'
+    assert.deepEqual(launch({ sandboxMode: 'workspace-write' }).allowed, reads)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+    else process.env.CLAUDE_CODEX_PERMISSION_MODE = previous
+  }
+})
+
 test('HTTP agent runtime streams agentapi-compatible message updates', async () => {
   let status: 'running' | 'stable' = 'stable'
   let messages: Array<{ id: number; role: 'user' | 'agent'; content: string; time: string }> = []

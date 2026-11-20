@@ -1,3 +1,4 @@
+import './support/hermetic-env.mjs'
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'

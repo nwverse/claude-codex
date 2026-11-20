@@ -10881,12 +10881,15 @@ export class CodexClaudeAppServer {
       if (this.stopped || (!gitInfo && !options.replace)) return
       this.store.setThreadGitInfo(threadId, gitInfo)
     } catch (error) {
+      // A lookup that outlives the server has no one left to tell. Its debug
+      // log may be gone too: a test's goes with the test's environment.
+      if (this.stopped) return
       debugLog('thread.git_info.failed', {
         threadId,
         error: error instanceof Error ? error.message : String(error),
       })
       // What is stored describes the workspace the thread left.
-      if (options.replace && !this.stopped) this.store.setThreadGitInfo(threadId, null)
+      if (options.replace) this.store.setThreadGitInfo(threadId, null)
     }
   }
 

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -55,6 +55,23 @@ function insertThread(db: InstanceType<typeof DatabaseSync>, id: string, columns
     'appServer', 0, 7, '{"type":"idle"}')`)
   if (columns) db.exec(`UPDATE threads SET ${columns} WHERE id = '${id}'`)
 }
+
+// The default path puts the database in the adapter home. A store anywhere
+// else, as every test's is, used to make the developer's adapter home too.
+test('a store for a database elsewhere leaves the adapter home alone', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-store-home-'))
+  const previous = process.env.CLAUDE_CODEX_HOME
+  process.env.CLAUDE_CODEX_HOME = join(root, 'adapter-home')
+  try {
+    new SessionStore(join(root, 'state.sqlite')).close()
+    assert.equal(existsSync(join(root, 'state.sqlite')), true)
+    assert.equal(existsSync(join(root, 'adapter-home')), false)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_HOME
+    else process.env.CLAUDE_CODEX_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 test('startup repairs legacy thread rows once and leaves a clean store unwritten', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-store-startup-'))

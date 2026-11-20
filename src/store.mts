@@ -1,6 +1,6 @@
 import { mkdirSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { currentProcessOwner, otherProcessRunning } from './process-owner.mjs'
 import { searchPattern } from './thread-history.mjs'
 import type {
@@ -160,7 +160,9 @@ export class SessionStore {
   } | null = null
 
   constructor(path = join(adapterHome(), 'state.sqlite')) {
-    mkdirSync(adapterHome(), { recursive: true, mode: 0o700 })
+    // The folder the database goes in: the adapter home for the default path.
+    // A database elsewhere, as in the tests, leaves the adapter home alone.
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.conn = openDatabase(path)
     this.migrate()
   }

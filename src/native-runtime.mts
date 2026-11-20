@@ -968,7 +968,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       }
     }
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
-    const allowedTools = [...(context.allowedTools ?? []), ...inheritedAllowedTools(context)]
+    const allowedTools = [...configuredAllowedTools(context), ...inheritedAllowedTools(context)]
     if (allowedTools.length > 0) opts.allowedTools = allowedTools
     if (context.disallowedTools && context.disallowedTools.length > 0)
       opts.disallowedTools = context.disallowedTools
@@ -4605,6 +4605,26 @@ function inheritedAllowedTools(context: RuntimeTurnContext): string[] {
   return rules.length > 0 && inheritedApprovals(context) ? rules : []
 }
 
+// The pre-approved tools (CLAUDE_CODEX_ALLOWED_TOOLS) that apply to a turn.
+// Claude Code runs a pre-approved tool without asking canUseTool, so in a
+// read-only sandbox or plan mode only the rules for tools that read stay, as
+// on the claude-p route: a listed Bash or Write would run there with no card.
+function configuredAllowedTools(context: RuntimeTurnContext): string[] {
+  const rules = context.allowedTools ?? []
+  if (inheritedApprovals(context)) return rules
+  return rules.filter(readRule)
+}
+
+// One rule, `Tool` or `Tool(specifier)`, for a tool that reads. The CLI
+// splits --allowedTools again at commas and at spaces outside parentheses,
+// without tracking nesting, so an entry with a space outside them or another
+// parenthesis (`Read(./docs/**) Bash`, `Read(a(b) Bash()`) would also
+// pre-approve the rule after it.
+function readRule(rule: string): boolean {
+  const name = /^(\w+)(?:\([^()]*\))?$/.exec(rule)?.[1]
+  return name !== undefined && readsOnly(name)
+}
+
 // Options a live CLI process cannot change in place. A turn whose signature
 // differs needs a fresh process (unless background work pins the old one).
 export function sessionSignature(context: RuntimeTurnContext): string {
@@ -4618,7 +4638,7 @@ export function sessionSignature(context: RuntimeTurnContext): string {
     context.leaderTools ? LEADER_MCP_SERVER : null,
     context.sessionChanges ? SESSION_MCP_SERVER : null,
     context.addDirs ?? [],
-    context.allowedTools ?? [],
+    configuredAllowedTools(context),
     inheritedAllowedTools(context),
     context.inheritedAskRules ?? null,
     context.disallowedTools ?? [],

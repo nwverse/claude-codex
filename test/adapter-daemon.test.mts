@@ -1386,7 +1386,9 @@ test('app-server --print-startup-config prints one JSON line without opening the
 test('app-server daemon version reports the unix daemon on the control socket, and fails without one', {
   timeout: 30_000,
 }, async (t) => {
-  const home = await mkdtemp(join(tmpdir(), 'ccx-'))
+  // The control socket sits under CODEX_HOME, so keep the home itself short:
+  // macOS's per-user temp dir leaves no room for the socket path under it.
+  const home = await mkdtemp(join(process.platform === 'darwin' ? '/tmp' : tmpdir(), 'ccx-'))
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     CODEX_HOME: home,

@@ -1,8 +1,13 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import {
   appendFileSync,
+  closeSync,
+  constants,
   existsSync,
+  fchmodSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -171,6 +176,10 @@ export function debugLog(event: string, data: Record<string, unknown> = {}): voi
     let file = debugLogFiles.get(path)
     if (!file) {
       ensureParent(path)
+      // The log holds commands, tool input and stderr excerpts. It is created
+      // owner-only below; a log and its rotated copies an older version left
+      // readable are tightened here, once per process.
+      for (let i = 0; i <= debugLogKeep(); i += 1) ownerOnly(i === 0 ? path : `${path}.${i}`)
       file = { size: 0, checkedAt: Number.NEGATIVE_INFINITY }
       debugLogFiles.set(path, file)
     }
@@ -181,12 +190,12 @@ export function debugLog(event: string, data: Record<string, unknown> = {}): voi
       file.checkedAt = now
     }
     try {
-      appendFileSync(path, line)
+      appendFileSync(path, line, { mode: 0o600 })
     } catch (error) {
       // The log's folder was removed while we ran: recreate it once and retry.
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       ensureParent(path)
-      appendFileSync(path, line)
+      appendFileSync(path, line, { mode: 0o600 })
     }
     file.size += Buffer.byteLength(line)
   } catch {}
@@ -196,6 +205,44 @@ export function debugLog(event: string, data: Record<string, unknown> = {}): voi
 // fills, so debugLog rotates it once it reaches this size (0 never rotates).
 function debugLogMaxBytes(): number {
   return numericEnv('CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', 50 * 1024 * 1024)
+}
+
+// At most 100 old logs: rotation and the first write walk every slot.
+function debugLogKeep(): number {
+  return Math.min(100, Math.max(1, Math.floor(numericEnv('CLAUDE_CODEX_DEBUG_LOG_KEEP', 3))))
+}
+
+// Clears the group and other permissions of a regular file this user owns at
+// `path` itself. Checked and changed through one descriptor opened without
+// following a symbolic link, so a link (such as /dev/stderr, or one left at a
+// rotated slot) and its target, a device, a FIFO, another user's file and a
+// file another filesystem shows there (such as /dev/fd/2) keep their mode.
+function ownerOnly(path: string): void {
+  let fd: number
+  try {
+    fd = openSync(
+      path,
+      constants.O_RDONLY |
+        (constants.O_NOFOLLOW ?? 0) |
+        (constants.O_NONBLOCK ?? 0) |
+        (constants.O_NOCTTY ?? 0),
+    )
+  } catch {
+    return
+  }
+  try {
+    const stat = fstatSync(fd)
+    if (
+      stat.isFile() &&
+      stat.uid === process.getuid?.() &&
+      stat.dev === statSync(dirname(path)).dev &&
+      (stat.mode & 0o077) !== 0
+    )
+      fchmodSync(fd, stat.mode & 0o700)
+  } catch {
+  } finally {
+    closeSync(fd)
+  }
 }
 
 // Rotates `path` when it has reached `maxBytes`; returns the active log's size
@@ -208,7 +255,7 @@ function rotateLog(path: string, maxBytes: number): number {
     return 0 // file does not exist yet — nothing to rotate
   }
   if (size < maxBytes) return size
-  const keep = Math.max(1, numericEnv('CLAUDE_CODEX_DEBUG_LOG_KEEP', 3))
+  const keep = debugLogKeep()
   // Drop the oldest slot if it would push us past `keep`.
   const oldest = `${path}.${keep}`
   try {
