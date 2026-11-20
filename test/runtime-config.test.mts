@@ -2904,6 +2904,33 @@ test('native SDK on-failure accepts edits unasked only in a workspace-write sand
   }
 })
 
+test('native SDK tells Claude why a call nobody declined was refused', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const context = nativeTurnContext({
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+  })
+  const answer = (decision: Record<string, unknown>) =>
+    Reflect.get(runtime, 'makeCanUseTool').call(runtime, () => ({
+      current: {
+        context,
+        resolved: false,
+        handlers: { onPermissionRequest: async () => decision },
+      },
+      lastContext: context,
+    }))(
+      'Bash',
+      { command: 'npm test' },
+      { toolUseID: 'bash', signal: new AbortController().signal },
+    )
+  const message = 'Bash was denied because the turn it asked for approval in had ended.'
+  assert.deepEqual(await answer({ decision: 'decline', message }), { behavior: 'deny', message })
+  assert.deepEqual(await answer({ decision: 'decline' }), {
+    behavior: 'deny',
+    message: 'declined by user',
+  })
+})
+
 test('native SDK asks only the user may answer reach the App in every mode', async () => {
   const runtime = new NativeClaudeRuntime()
   const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')

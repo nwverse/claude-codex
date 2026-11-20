@@ -843,9 +843,10 @@ versioning or publishing metadata.
   sandbox, edits in the workspace used to run with no card. (#331)
 - An approval card that a turn ending on its own takes down, such as a
   background agent's request still open when Claude finishes its reply, now
-  declines the call. It used to reach Claude Code as the user's Cancel, which
-  stopped the background agent. Stop, or Cancel on a card, still stops the
-  turn and the call. (#331)
+  declines the call, and Claude is told the turn had ended rather than that
+  the user declined. It used to reach Claude Code as the user's Cancel, which
+  stopped the background agent. Stop, or Cancel on a card (also while the
+  turn is still finishing), still stops the call. (#331)
 - `turn/start`, `thread/settings/update` and `thread/resume` that name a
   custom permissions profile with explicit approval and sandbox fields now
   store those fields as the thread's policy, as `thread/start` does. The turn

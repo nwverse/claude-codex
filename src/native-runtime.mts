@@ -1268,7 +1268,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (decision.decision === 'cancel') {
         return { behavior: 'deny', message: 'cancelled by user', interrupt: true }
       }
-      return { behavior: 'deny', message: 'declined by user' }
+      return { behavior: 'deny', message: decision.message ?? 'declined by user' }
     }
   }
 

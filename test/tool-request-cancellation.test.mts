@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import test from 'node:test'
 import type {
   ElicitationResponse,
@@ -219,11 +221,70 @@ for (const kind of ['command', 'mcp'] as const) {
             .find((message) => message.requestId === request.id && message.threadId === threadId),
         )
         // Declined, not cancelled: Claude Code takes a cancel for the user's
-        // and stops the agent, though nobody stopped anything.
-        assert.deepEqual(await app.waitFor(() => outcome), { decision: 'decline' })
+        // and stops the agent, though nobody stopped anything. Claude is told
+        // why, so it does not report that the user declined.
+        const tool = kind === 'mcp' ? 'mcp__fixture__write' : 'Bash'
+        assert.deepEqual(await app.waitFor(() => outcome), {
+          decision: 'decline',
+          message: `${tool} was denied because the turn it asked for approval in had ended; the user can re-run it in a turn.`,
+        })
         assert.equal(interrupts, 0)
       } finally {
         finishMainLoop()
+      }
+    })
+  })
+
+  test(`the user's Cancel on a background agent's ${kind} card still cancels while the turn winds down`, async () => {
+    let finishMainLoop: () => void = () => {}
+    const mainLoop = new Promise<void>((resolve) => {
+      finishMainLoop = resolve
+    })
+    let mainLoopDone = false
+    let outcome: PermissionDecision | UserInputAnswers | undefined
+    const runtime = scriptedRuntime(async (_context, handlers) => {
+      void askThroughCard(kind, handlers, new AbortController().signal).then((decision) => {
+        outcome = decision
+      })
+      await mainLoop
+      await handlers.onEvent({ type: 'completed', success: true })
+      mainLoopDone = true
+    })
+    await withInProcessApp(runtime, async (app) => {
+      const threadId = await app.startThread({
+        approvalPolicy: 'untrusted',
+        model: 'sonnet',
+        cwd: app.home,
+      })
+      const turnId = await app.startTurn(threadId, 'Launch a background agent')
+      const proceed = join(app.home, 'proceed')
+      try {
+        const request = await app.waitFor(() =>
+          app.messages.find((message) => message.method === cardMethod(kind)),
+        )
+        // A shell the user joined to the turn keeps it open after Claude's
+        // main loop finishes, with the agent's card still up.
+        await app.request('thread/shellCommand', {
+          threadId,
+          command: 'printf ready; while [ ! -f proceed ]; do sleep 0.05; done',
+        })
+        await app.waitFor(() =>
+          app.notified('item/commandExecution/outputDelta').find((p) => p.delta.includes('ready')),
+        )
+        finishMainLoop()
+        await app.waitFor(() => (mainLoopDone ? true : undefined))
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        assert.equal(app.store.getTurn(turnId)?.status, 'inProgress')
+        await app.respond(
+          request.id,
+          kind === 'mcp' ? { action: 'cancel' } : { decision: 'cancel' },
+        )
+        assert.deepEqual(await app.waitFor(() => outcome), { decision: 'cancel' })
+        await writeFile(proceed, '')
+        assert.equal((await app.turnCompleted(turnId)).status, 'completed')
+      } finally {
+        finishMainLoop()
+        await writeFile(proceed, '').catch(() => {})
       }
     })
   })

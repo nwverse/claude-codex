@@ -3213,16 +3213,22 @@ export class CodexClaudeAppServer {
 
     const permissionProfileId = permissionProfileIdFromParams(params)
     const permissionProfile = permissionProfilePolicy(permissionProfileId)
-    if (permissionProfileId) thread.permissionProfileId = permissionProfileId
-    else if (hasLegacyPermissionParams(params)) thread.permissionProfileId = null
-    if (permissionProfile?.approvalPolicy) thread.approvalPolicy = permissionProfile.approvalPolicy
-    if (permissionProfile?.sandboxMode) thread.sandboxMode = permissionProfile.sandboxMode
-    // A custom profile has no policy the adapter knows: the explicit fields
-    // set it.
-    if (typeof params.approvalPolicy === 'string' && !permissionProfile?.approvalPolicy)
-      thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
-    const sandboxMode = sandboxFromTurnParams(params)
-    if (sandboxMode && !permissionProfile?.sandboxMode) thread.sandboxMode = sandboxMode
+    if (permissionProfileId) {
+      thread.permissionProfileId = permissionProfileId
+      // A custom profile has no policy the adapter knows: the explicit fields
+      // set it, as on turn/start.
+      const approvalPolicy =
+        permissionProfile?.approvalPolicy ?? normalizeApprovalPolicy(params.approvalPolicy)
+      if (approvalPolicy) thread.approvalPolicy = approvalPolicy
+      const sandboxMode = permissionProfile?.sandboxMode ?? sandboxFromTurnParams(params)
+      if (sandboxMode) thread.sandboxMode = sandboxMode
+    } else {
+      if (hasLegacyPermissionParams(params)) thread.permissionProfileId = null
+      if (typeof params.approvalPolicy === 'string')
+        thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
+      const sandboxMode = sandboxFromTurnParams(params)
+      if (sandboxMode) thread.sandboxMode = sandboxMode
+    }
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     // App rule: auto-review
     thread.approvalsReviewer =
@@ -5438,10 +5444,15 @@ export class CodexClaudeAppServer {
     // What an approval the turn no longer waits on answers. A turn the user
     // stopped (Stop, or Cancel on another card) stops Claude's call with it;
     // after a turn that ended on its own the call is only declined, so a
-    // background agent that asked as the turn finished keeps running.
-    const endedTurnDecision = (): PermissionDecision => ({
-      decision: this.store.turnStatus(turn.id) === 'interrupted' ? 'cancel' : 'decline',
-    })
+    // background agent that asked as the turn finished keeps running, and
+    // Claude learns nobody refused it.
+    const endedTurnDecision = (toolName: string): PermissionDecision =>
+      this.store.turnStatus(turn.id) === 'interrupted'
+        ? { decision: 'cancel' }
+        : {
+            decision: 'decline',
+            message: `${toolName} was denied because the turn it asked for approval in had ended; the user can re-run it in a turn.`,
+          }
     let resumedAtCheckpoint = false
     const runtimeTurn = this.runtime.runTurn(
       context,
@@ -6443,7 +6454,7 @@ export class CodexClaudeAppServer {
           }
         },
         onPermissionRequest: async (event, signal) => {
-          if (!turnIsActive()) return endedTurnDecision()
+          if (!turnIsActive()) return endedTurnDecision(event.toolName)
           completeMessage()
           // The request can overtake the finished call; the approval must
           // show the whole change, not the part that streamed.
@@ -6497,7 +6508,10 @@ export class CodexClaudeAppServer {
               signal,
             ),
           )
-          if (!turnIsActive()) return endedTurnDecision()
+          // The user's own Cancel still stops the call while the turn winds
+          // down (a card its end took down answers decline, never cancel).
+          if (!turnIsActive())
+            return decision.decision === 'cancel' ? decision : endedTurnDecision(event.toolName)
           if (decision.decision === 'decline' || decision.decision === 'cancel')
             declineToolItem(event.toolUseId)
           if (decision.decision === 'cancel') {

@@ -443,6 +443,13 @@ test('a custom permissions profile stores the explicit policy fields that come w
       sandboxPolicy: { type: 'readOnly' },
     })
     assert.deepEqual(stored(updated), ['on-request', 'read-only', 'locked-down'])
+    // A policy the adapter cannot read leaves the stored one as it was.
+    await app.request('thread/settings/update', {
+      threadId: updated,
+      permissions: 'locked-down',
+      approvalPolicy: 'granular',
+    })
+    assert.deepEqual(stored(updated), ['on-request', 'read-only', 'locked-down'])
     const resumed = await app.startThread(fullAccess)
     await app.request('thread/resume', { threadId: resumed, ...custom, sandbox: 'read-only' })
     assert.deepEqual(stored(resumed), ['on-request', 'read-only', 'locked-down'])
