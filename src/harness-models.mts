@@ -49,11 +49,6 @@ export function bareCodexModel(model: string): string {
   return isAgModel(model) ? model.slice(AG_MODEL_PREFIX.length) : model
 }
 
-export function harnessOfModel(model: string, codexBackend: boolean): HarnessKind {
-  if (!codexBackend) return 'claude'
-  return isAgModel(model) ? 'codex-ag' : 'codex'
-}
-
 export const HARNESS_LABELS: Record<HarnessKind, string> = {
   claude: 'Claude Code',
   codex: 'Codex',

@@ -676,20 +676,6 @@ export function subagentEffortFromInput(value: unknown): string | null {
   return typeof value === 'string' ? normalizeReasoningEffortEnum(value) : null
 }
 
-// Codex App's settings sheet writes the persistent reasoning-effort default
-// under `params.config.model_reasoning_effort` (the same shape as the Codex
-// CLI's `config.toml`). turn/start's top-level `effort` is only set when the
-// user overrides for a single turn — the chosen value from the model picker
-// otherwise lives in the config bag. Read both so the App's effort dropdown
-// actually changes Claude's thinking budget instead of silently no-op'ing.
-export function readConfigReasoningEffort(config: unknown): string | null {
-  if (!config || typeof config !== 'object') return null
-  const cfg = config as Record<string, unknown>
-  const direct = cfg.model_reasoning_effort ?? cfg['model_reasoning_effort']
-  if (typeof direct === 'string' && direct.length > 0) return direct
-  return null
-}
-
 // The Codex App shows a reasoning item only through its summary, so Claude's
 // thinking goes there unless the user turned summaries off, with
 // CLAUDE_CODEX_REASONING_VISIBLE=0 or Codex's model_reasoning_summary = "none".

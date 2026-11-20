@@ -50,7 +50,11 @@ so a remote host needs only `node` — no TS toolchain.
   `npm run build` and `npm run generate:schema`.
 - Formatting/linting is **Biome** (`biome.json`): 2-space, single quotes, no
   semicolons, lineWidth 100. Run `npm run check:fix` before committing.
-- Config is env-driven (`CLAUDE_CODEX_*`); the full list lives in the README.
+- Config is env-driven (`CLAUDE_CODEX_*`); the full list is the reference table
+  in [`docs/guide/configuration.md`](docs/guide/configuration.md#reference-table),
+  with the backend routes' own variables in
+  [`docs/guide/backends.md`](docs/guide/backends.md). Document a new variable
+  there.
 - `CLAUDE_CODEX_MOCK=1` runs the protocol without Claude credentials.
 - Match the comment density and naming of surrounding code. Keep modules
   focused — see the file-length nudge below.

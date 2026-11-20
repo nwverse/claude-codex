@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { autoCompactWindowEnv } from './auto-compact.mjs'
 import { autoMemoryEnv } from './memories.mjs'
+import { READ_ONLY_TOOLS } from './tool-items.mjs'
 import { flatPrompt } from './turn-context.mjs'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
 
@@ -16,8 +17,6 @@ export interface ClaudePRuntimeOptions {
   resume: boolean
   stopTimeoutRetries?: number
 }
-
-const READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch', 'TodoWrite', 'Task']
 
 const execFileAsync = promisify(execFile)
 
@@ -364,6 +363,8 @@ function parseClaudePJson(stdout: string): ParsedClaudePResult | null {
   }
 }
 
+// A read-only thread pre-approves only the tools that read, as the SDK route
+// runs them (readsOnly): no fetch, agent or other tool runs unasked there.
 function allowedToolsForContext(context: RuntimeTurnContext): string | null {
   // A tool the thread must not have is not pre-approved either.
   const denied = new Set(context.disallowedTools ?? [])

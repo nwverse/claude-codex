@@ -22,8 +22,10 @@ export function isExploreTool(toolName: string): boolean {
 
 // The tools a read-only sandbox runs when nobody is asked: they read files or
 // search the web and change nothing.
+export const READ_ONLY_TOOLS: readonly string[] = [...EXPLORE_TOOLS, 'WebSearch']
+
 export function readsOnly(toolName: string): boolean {
-  return EXPLORE_TOOLS.has(toolName) || toolName === 'WebSearch'
+  return READ_ONLY_TOOLS.includes(toolName)
 }
 
 const text = (value: unknown): string => (typeof value === 'string' ? value : '')

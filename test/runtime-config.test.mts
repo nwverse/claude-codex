@@ -2860,6 +2860,77 @@ test('native SDK sessions always launch in an explicit permission mode', () => {
   }
 })
 
+test('native SDK on-failure accepts edits unasked only in a workspace-write sandbox', async () => {
+  const previous = process.env.CLAUDE_CODEX_PERMISSION_MODE
+  delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const launch = (overrides: Partial<RuntimeTurnContext>): unknown =>
+    buildOptions.call(runtime, {}, nativeTurnContext(overrides), new AbortController(), () => null)
+      .permissionMode
+  try {
+    assert.equal(
+      launch({ approvalPolicy: 'on-failure', sandboxMode: 'workspace-write' }),
+      'acceptEdits',
+    )
+    // Claude Code runs an edit in acceptEdits mode without calling
+    // canUseTool, so a read-only sandbox, or none named, asks for it instead.
+    assert.equal(launch({ approvalPolicy: 'on-failure', sandboxMode: 'read-only' }), 'default')
+    assert.equal(launch({ approvalPolicy: 'on-failure', sandboxMode: null }), 'default')
+    const requests: any[] = []
+    const context = nativeTurnContext({ approvalPolicy: 'on-failure', sandboxMode: 'read-only' })
+    const canUseTool = Reflect.get(runtime, 'makeCanUseTool').call(runtime, () => ({
+      current: {
+        context,
+        resolved: false,
+        handlers: {
+          onPermissionRequest: async (event: unknown) => {
+            requests.push(event)
+            return { decision: 'decline' }
+          },
+        },
+      },
+      lastContext: context,
+    }))
+    const edit = { file_path: join(process.cwd(), 'README.md'), old_string: 'a', new_string: 'b' }
+    assert.deepEqual(
+      await canUseTool('Edit', edit, { toolUseID: 'edit', signal: new AbortController().signal }),
+      { behavior: 'deny', message: 'declined by user' },
+    )
+    assert.equal(requests[0]?.toolName, 'Edit')
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+    else process.env.CLAUDE_CODEX_PERMISSION_MODE = previous
+  }
+})
+
+test('native SDK tells Claude why a call nobody declined was refused', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const context = nativeTurnContext({
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+  })
+  const answer = (decision: Record<string, unknown>) =>
+    Reflect.get(runtime, 'makeCanUseTool').call(runtime, () => ({
+      current: {
+        context,
+        resolved: false,
+        handlers: { onPermissionRequest: async () => decision },
+      },
+      lastContext: context,
+    }))(
+      'Bash',
+      { command: 'npm test' },
+      { toolUseID: 'bash', signal: new AbortController().signal },
+    )
+  const message = 'Bash was denied because the turn it asked for approval in had ended.'
+  assert.deepEqual(await answer({ decision: 'decline', message }), { behavior: 'deny', message })
+  assert.deepEqual(await answer({ decision: 'decline' }), {
+    behavior: 'deny',
+    message: 'declined by user',
+  })
+})
+
 test('native SDK asks only the user may answer reach the App in every mode', async () => {
   const runtime = new NativeClaudeRuntime()
   const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
@@ -3556,18 +3627,34 @@ test('claude-p runtime keeps the tools a thread must not have from Claude', asyn
       }),
       run('only-denied', { allowedTools: ['WebSearch'], disallowedTools: ['WebSearch'] }),
     ])
-    assert.deepEqual(readOnly, {
-      allowed: 'Read,Glob,Grep,WebSearch,WebFetch,TodoWrite,Task',
-      disallowed: null,
-    })
+    assert.deepEqual(readOnly, { allowed: 'Read,Grep,Glob,LS,WebSearch', disallowed: null })
     assert.deepEqual(readOnlyOff, {
-      allowed: 'Read,Glob,Grep,WebFetch,TodoWrite,Task',
+      allowed: 'Read,Grep,Glob,LS',
       disallowed: 'WebSearch,mcp__docs__search',
     })
     assert.deepEqual(allowList, { allowed: 'Bash(git status:*)', disallowed: 'WebSearch' })
     assert.deepEqual(onlyDenied, { allowed: null, disallowed: 'WebSearch' })
   } finally {
     await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('claude-p runtime pre-approves in a read-only thread only the tools the SDK route runs there', () => {
+  const runtime = new ClaudePTranscriptRuntime({
+    command: '/bin/false',
+    extraArgs: [],
+    timeoutMs: 20_000,
+    skipPermissions: false,
+    resume: false,
+  })
+  const argsForContext = Reflect.get(runtime, 'argsForContext')
+  for (const approvalPolicy of ['never', 'on-request']) {
+    const context = nativeTurnContext({ approvalPolicy, sandboxMode: 'read-only' })
+    const args: string[] = argsForContext.call(runtime, context, join(tmpdir(), 'prompt.txt'))
+    // No WebFetch, Task or TodoWrite: a fetch could send the workspace out
+    // with nobody asked, even on a thread that asks.
+    assert.equal(args[args.indexOf('--allowedTools') + 1], 'Read,Grep,Glob,LS,WebSearch')
+    assert.equal(args.includes('--dangerously-skip-permissions'), false)
   }
 })
 
@@ -3620,10 +3707,7 @@ test('claude-p runtime skips permissions for a thread that never asks only outsi
       run(true, 'pinned', { approvalPolicy: 'never', sandboxMode: 'read-only' }),
     ])
     // Read-only keeps to the read tools it pre-approves.
-    assert.deepEqual(readOnly, {
-      allowed: 'Read,Glob,Grep,WebSearch,WebFetch,TodoWrite,Task',
-      skip: false,
-    })
+    assert.deepEqual(readOnly, { allowed: 'Read,Grep,Glob,LS,WebSearch', skip: false })
     assert.equal(workspace.skip, true)
     assert.equal(fullAccess.skip, true)
     // The runtime's own skip-permissions setting still wins.
