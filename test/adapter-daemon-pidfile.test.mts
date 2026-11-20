@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { type ChildProcess, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { lstat, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { connect, createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -77,30 +77,64 @@ async function pidFileFor(state: DaemonSetup, ageMs: number): Promise<ChildProce
   return other
 }
 
+interface StartupStep {
+  pid: number
+  step: string
+  atMs: number
+}
+
+// The startup steps the daemons of this home logged as each ended, in ms
+// since the daemon's process started.
+function startupSteps(home: string): StartupStep[] {
+  let log: string
+  try {
+    log = readFileSync(join(home, 'claude-codex-adapter', 'debug.jsonl'), 'utf8')
+  } catch {
+    return []
+  }
+  return log.split('\n').flatMap((line) => {
+    try {
+      const entry = JSON.parse(line)
+      return entry.event === 'adapter.startup' ? [entry] : []
+    } catch {
+      return []
+    }
+  })
+}
+
 // Resolves with the stderr seen once it matches; rejects if the process exits
-// first or nothing matches in time.
-function waitForStderr(proc: ChildProcess, pattern: RegExp, timeoutMs = 8000): Promise<string> {
+// first or nothing matches in time. The error lists the startup steps the
+// daemons of `home` finished, so a slow start shows where the time went.
+function waitForStderr(
+  proc: ChildProcess,
+  pattern: RegExp,
+  home: string,
+  timeoutMs = 8000,
+): Promise<string> {
   const stderr = proc.stderr
   if (!stderr) throw new Error('test process has no stderr')
   stderr.setEncoding('utf8')
   let seen = ''
   return new Promise((resolvePromise, reject) => {
-    const finish = (error: Error | null) => {
+    const finish = (error: string | null) => {
       clearTimeout(timer)
       stderr.off('data', onData)
       proc.off('exit', onExit)
-      if (error) reject(error)
-      else resolvePromise(seen)
+      if (error === null) {
+        resolvePromise(seen)
+        return
+      }
+      const steps = startupSteps(home).map(
+        ({ pid, step, atMs }) => `\n  pid ${pid}: ${step} at ${atMs} ms`,
+      )
+      reject(new Error(`${error}; saw: ${seen}\nstartup steps:${steps.join('') || ' none'}`))
     }
     const onData = (chunk: string) => {
       seen += chunk
       if (pattern.test(seen)) finish(null)
     }
-    const onExit = () => finish(new Error(`exited before stderr matched ${pattern}; saw: ${seen}`))
-    const timer = setTimeout(
-      () => finish(new Error(`timed out waiting for stderr ${pattern}; saw: ${seen}`)),
-      timeoutMs,
-    )
+    const onExit = () => finish(`exited before stderr matched ${pattern}`)
+    const timer = setTimeout(() => finish(`timed out waiting for stderr ${pattern}`), timeoutMs)
     stderr.on('data', onData)
     proc.once('exit', onExit)
   })
@@ -126,7 +160,7 @@ async function assertDaemonReplacesPidFile(
   try {
     // Well inside the 10 s startup grace window, so a pid file wrongly taken
     // for a starting daemon makes this time out.
-    const stderr = await waitForStderr(daemon, /listening on/, 8000)
+    const stderr = await waitForStderr(daemon, /listening on/, state.home, 8000)
     assert.doesNotMatch(stderr, /already running/)
     assert.equal(await readFile(state.pidFile, 'utf8'), `${daemon.pid}\n`)
   } finally {
@@ -175,10 +209,10 @@ test('a running daemon still turns away a second one', { timeout: 15_000 }, asyn
   const state = await setup()
   const first = startDaemon(state)
   try {
-    await waitForStderr(first, /listening on/)
+    await waitForStderr(first, /listening on/, state.home)
     const second = startDaemon(state)
     try {
-      const stderr = await waitForStderr(second, /already running/)
+      const stderr = await waitForStderr(second, /already running/, state.home)
       assert.match(stderr, new RegExp(`\\(pid ${first.pid}\\)`))
       const code = second.exitCode ?? (await once(second, 'exit'))[0]
       assert.equal(code, 0)
@@ -276,7 +310,7 @@ test('a daemon still starting turns away a second one once it listens', {
   const server = createServer((socket) => socket.destroy())
   try {
     await withStartingDaemon(state, async ({ other, second }) => {
-      const stderr = waitForStderr(second, /already running/)
+      const stderr = waitForStderr(second, /already running/, state.home)
       server.listen(state.sock)
       await once(server, 'listening')
       assert.match(await stderr, new RegExp(`\\(pid ${other.pid}\\)`))
@@ -313,7 +347,12 @@ test('a daemon slow to start is left to finish, not joined by a second one', {
       // The process started before its fresh pid file was written, so it is
       // the daemon, still starting. The second one gives up waiting after
       // 10 s and leaves it to finish.
-      const stderr = await waitForStderr(second, /already starting|listening on/, 20_000)
+      const stderr = await waitForStderr(
+        second,
+        /already starting|listening on/,
+        state.home,
+        20_000,
+      )
       assert.match(stderr, new RegExp(`already starting at .*\\(pid ${other.pid}\\)`))
       const code = second.exitCode ?? (await once(second, 'exit'))[0]
       assert.equal(code, 0)
@@ -337,6 +376,31 @@ test('a live pid whose start ps cannot read holds a pid file only 10 s', {
     await assertDaemonReplacesPidFile(state, startDaemon(state, { PATH: empty }))
   } finally {
     await stopProcess(other)
+    await cleanup(state)
+  }
+})
+
+// What a failed wait above lists: when each step of a daemon's start ended.
+test('a daemon logs when each of its startup steps ended', { timeout: 15_000 }, async () => {
+  const state = await setup()
+  try {
+    const daemon = startDaemon(state)
+    try {
+      await waitForStderr(daemon, /listening on/, state.home)
+    } finally {
+      // Stopped first, so its last step is in the log.
+      await stopProcess(daemon)
+    }
+    const steps = startupSteps(state.home)
+    assert.deepEqual(
+      steps.map(({ step }) => step),
+      ['options', 'pidFile', 'store', 'recovery', 'reap', 'server', 'listening'],
+    )
+    for (const [index, { pid, atMs }] of steps.entries()) {
+      assert.equal(pid, daemon.pid)
+      assert.ok(atMs > 0 && atMs >= (steps[index - 1]?.atMs ?? 0), `${atMs} ms`)
+    }
+  } finally {
     await cleanup(state)
   }
 })
@@ -392,7 +456,7 @@ test('a socket that still accepts connections is never removed for a stale pid f
   try {
     const daemon = startDaemon(state)
     try {
-      const stderr = await waitForStderr(daemon, /already running|listening on/)
+      const stderr = await waitForStderr(daemon, /already running|listening on/, state.home)
       assert.match(stderr, /app-server already running at /)
       const code = daemon.exitCode ?? (await once(daemon, 'exit'))[0]
       assert.equal(code, 0)
@@ -429,7 +493,7 @@ test('a daemon that finds its socket taken by another one when it binds leaves i
     assert.equal(existsSync(state.pidFile), true, 'the daemon writes its pid file')
     const taken = await socketServer(state.sock)
     server = taken.server
-    const stderr = waitForStderr(daemon, /already running|listening on/)
+    const stderr = waitForStderr(daemon, /already running|listening on/, state.home)
     await writeFile(gate, '')
     assert.match(await stderr, /app-server already running at /)
     const code = daemon.exitCode ?? (await once(daemon, 'exit'))[0]

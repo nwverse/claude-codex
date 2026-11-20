@@ -68,6 +68,10 @@ function handle(message) {
     case 'thread/settings/update':
       if (p.model) models.set(p.threadId, p.model)
       return reply({})
+    // Read state at revision r1; any other expected revision conflicts.
+    case 'thread/readState/update':
+      if (p.expectedRevision !== 'r1') return send({id:message.id,error:{code:-32600,message:'read state changed',data:{reason:'readStateConflict',readState:{firstUnread:null,revision:'r1'}}}})
+      return reply({readState:{firstUnread:p.operation.type === 'unread' ? {type:'threadStart'} : null,revision:'r2'}})
     case 'thread/compact/start':
       if (process.env.FAKE_LATE_TURN) lateTurn = p.threadId
       return reply({})

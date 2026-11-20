@@ -164,7 +164,15 @@ export class SessionStore {
     // A database elsewhere, as in the tests, leaves the adapter home alone.
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.conn = openDatabase(path)
-    this.migrate()
+    // A new file gets its whole schema in one transaction. Statement by
+    // statement it took over 50 commits, each a few fsyncs, which a busy disk
+    // turns into seconds before a new daemon listens. An existing store
+    // migrates as before, taking the write lock only for what it changes.
+    const existing = this.conn
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'")
+      .get()
+    if (existing) this.migrate()
+    else this.transaction(() => this.migrate())
   }
 
   // Every statement goes through here, so whatever reads, writes or opens a
@@ -539,11 +547,14 @@ export class SessionStore {
     if (probe.get(table, column)) return
     // Another adapter can add the column after the first probe. Recheck
     // under the writer lock; an already migrated store takes no write lock.
-    this.transaction(() => {
+    // A new store's schema already runs in a transaction.
+    const add = () => {
       if (!probe.get(table, column)) {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
       }
-    })
+    }
+    if (this.conn.isTransaction) add()
+    else this.transaction(add)
   }
 
   upsertThread(thread: ThreadRecord): void {
