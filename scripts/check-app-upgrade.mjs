@@ -63,9 +63,20 @@ const { values: args } = parseArgs({
   },
 })
 
+// The check ends by setting process.exitCode and letting Node exit once
+// stdout is written: exiting at once would drop what a pipe has not taken
+// yet. fail() stops it with a CheckStopped, which only sets the code.
+class CheckStopped extends Error {}
+process.on('uncaughtException', (error) => {
+  if (error instanceof CheckStopped) return
+  console.error(error)
+  process.exitCode = 1
+})
+
 function fail(message) {
   console.error(`check-app-upgrade: ${message}`)
-  process.exit(2)
+  process.exitCode = 2
+  throw new CheckStopped(message)
 }
 
 const baselinePath = resolve(args.baseline)
@@ -852,4 +863,4 @@ if (args['write-baseline']) {
   )
 }
 
-process.exit(problems.length > 0 ? 1 : 0)
+process.exitCode = problems.length > 0 ? 1 : 0

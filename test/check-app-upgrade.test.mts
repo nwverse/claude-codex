@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
+import { once } from 'node:events'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 
 // Tests run from dist/test; the script and the baseline sit two levels up.
@@ -179,6 +181,49 @@ test('check:app-upgrade reports a version that turns on a gate the adapter keeps
       raised.out,
       /problem: the adapter's version turns on feedbackSave \(needs 0\.164\.0-alpha\.11\), which KEPT_OFF_GATES keeps off/,
     )
+  } finally {
+    rmSync(app, { recursive: true, force: true })
+  }
+})
+
+test('check:app-upgrade writes its whole report into a pipe read late', {
+  timeout: 30_000,
+}, async () => {
+  // 3000 names the protocol does not have make a report of several hundred
+  // KiB, more than a pipe holds: the script must not exit before it is
+  // written.
+  const letters = (n: number) => {
+    let text = ''
+    for (let rest = n + 1; rest > 0; rest = Math.floor((rest - 1) / 26))
+      text = String.fromCharCode(97 + ((rest - 1) % 26)) + text
+    return text
+  }
+  const names = Array.from({ length: 3000 }, (_, i) => `"thread/unknown${letters(i)}"`)
+  const app = bundle('26.1199.4', {
+    '.vite/build/main.js': [
+      `o=${gateTable('"')};`,
+      'let ef="0.141.0",eg="codex-app-server-version-unsupported:";',
+      'x({minRequiredVersion:ef});send({clientInfo:{name:"Codex Desktop",version:c}});',
+      `y=[${names.join(',')}];`,
+    ].join(''),
+  })
+  try {
+    const env = { ...process.env }
+    delete env.CLAUDE_CODEX_COMPAT_VERSION
+    delete env.CODEX_SHIM_COMPAT_VERSION
+    const child = spawn(process.execPath, [script, '--app', app, '--bundle-only'], {
+      env,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    const closed = once(child, 'close')
+    // Read nothing until the pipe is full and the script is done writing.
+    await delay(1500)
+    const chunks: Buffer[] = []
+    child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk))
+    const [status] = await closed
+    const out = Buffer.concat(chunks).toString('utf8')
+    assert.equal(status, 1)
+    assert.equal(out.match(/^problem: the App names thread\/unknown[a-z]+,/gm)?.length, 3000)
   } finally {
     rmSync(app, { recursive: true, force: true })
   }

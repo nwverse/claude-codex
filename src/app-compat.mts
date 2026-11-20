@@ -680,7 +680,8 @@ export interface DispatchCases {
 // check:app-upgrade and the tests read them. A case only answers "method not
 // found" when its body is `throw methodNotFound(method)` or throws an RpcError
 // with METHOD_NOT_FOUND (Codex's own text for a feature it lacks); the labels
-// above it may be separated by comments and blank lines.
+// above it may be separated by comments and blank lines, and an
+// `// App rule: <id>` comment among them explains the labels below it.
 export function dispatchCases(source: string): DispatchCases {
   const cases = new Set<string>()
   const notFound = new Set<string>()
@@ -691,18 +692,25 @@ export function dispatchCases(source: string): DispatchCases {
     const thrown = /^\s*throw (methodNotFound\(method\)|new RpcError\()/.exec(line)
     if (!thrown) continue
     if (thrown[1] !== 'methodNotFound(method)' && !throwsMethodNotFound(lines, index)) continue
-    const labels: string[] = []
-    let rule: string | undefined
+    // The labels and App rules above the throw, bottom up.
+    const group: Array<{ label: string } | { rule: string }> = []
     for (let above = index - 1; above >= 0; above -= 1) {
       const text = lines[above] as string
-      const label = /^\s*case '([^']+)':\s*$/.exec(text)
-      if (label) labels.push(label[1] as string)
-      else if (/^\s*\/\//.test(text)) rule ??= /App rule: ([a-z0-9-]+)/.exec(text)?.[1]
-      else if (text.trim() !== '') break
+      const label = /^\s*case '([^']+)':\s*$/.exec(text)?.[1]
+      const rule = /^\s*\/\/.*App rule: ([a-z0-9-]+)/.exec(text)?.[1]
+      if (label) group.push({ label })
+      else if (rule) group.push({ rule })
+      else if (!/^\s*\/\//.test(text) && text.trim() !== '') break
     }
-    for (const method of labels) {
-      notFound.add(method)
-      if (rule) byDesign.set(method, rule)
+    // A rule covers the labels below it, so a comment above one case does
+    // not explain another.
+    let rule: string | undefined
+    for (const entry of group.reverse()) {
+      if ('rule' in entry) rule = entry.rule
+      else {
+        notFound.add(entry.label)
+        if (rule) byDesign.set(entry.label, rule)
+      }
     }
   }
   return { cases, notFound, byDesign }

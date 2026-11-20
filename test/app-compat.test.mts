@@ -117,13 +117,8 @@ test('dispatchCases finds the cases that answer "method not found"', () => {
     'c/plain',
   ])
   assert.deepEqual([...found.notFound].sort(), ['a/first', 'a/second', 'c/plain'])
-  assert.deepEqual(
-    [...found.byDesign],
-    [
-      ['a/second', 'some-rule'],
-      ['a/first', 'some-rule'],
-    ],
-  )
+  // The rule sits below a/first, so it explains only a/second.
+  assert.deepEqual([...found.byDesign], [['a/second', 'some-rule']])
 })
 
 test('every request the verified App can send has a case', () => {
