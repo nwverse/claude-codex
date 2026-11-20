@@ -277,6 +277,14 @@ versioning or publishing metadata.
   (`-32600`) while a turn runs or is still starting on the thread. They used
   to start a second Claude run that took over the thread, and the running
   turn's remaining output was lost. (#240, #241)
+- Deleting or archiving a chat interrupts a turn the user runs directly on
+  one of its subagent threads, as it does the chat's own turn. A deleted
+  thread's turn used to keep the adapter busy for good: the daemon never
+  idle-exited and the keep-awake guard stayed on. A review, compaction or
+  Claude follow-up no longer starts on a chat that `thread/delete` is
+  removing (nor a review or compaction on an archived chat), and the App
+  hears nothing more of a deleted thread, such as a `turn/completed` still
+  marked `inProgress`. (#328)
 - Startup recovery streams the completed history and rechecks a turn before
   repairing its activity markers. A report another adapter finished while
   recovery was scanning stays in the conversation.

@@ -699,9 +699,9 @@ export class CodexClaudeAppServer {
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
   // Threads a thread/delete is removing. It waits for their turns to end
-  // first; a turn/start in that gap, on one of them or on a subagent thread
-  // below one, is refused rather than starting a turn on a thread that is
-  // about to go.
+  // first; a turn, review, compaction, shell command or continuation in that
+  // gap, on one of them or on a subagent thread below one, is refused rather
+  // than starting a turn on a thread that is about to go.
   private deletingThreads = new Set<string>()
   private readonly startingTurnByThread = new Map<string, Promise<void>>()
   // Turns whose runtime run is scheduled or has not returned yet. A turn outside this
@@ -3478,13 +3478,11 @@ export class CodexClaudeAppServer {
         continue
       await this.stopBackgroundSubagent(entry)
     }
-    // Archiving or deleting a parent takes its child threads with it. A child
-    // can have opened a user shell of its own since the subagent task ended.
+    // Archiving or deleting a parent takes its child threads with it. The user
+    // can talk to a child thread directly, so it can run a turn, review,
+    // compaction or user shell of its own; each ends like the parent's turn.
     for (const id of this.store.subagentTreeIds(threadId)) {
-      const turnId = this.activeTurnByThread.get(id)
-      if (!turnId) continue
-      if (this.userShells.get(turnId)?.standalone) this.settleInterruptedTurn(peer, id, turnId)
-      else this.stopUserShells(turnId, 'command aborted by user')
+      if (this.activeTurnByThread.has(id)) await this.turnInterrupt(peer, { threadId: id })
     }
   }
 
@@ -3806,8 +3804,8 @@ export class CodexClaudeAppServer {
 
   private reviewStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    const thread = this.store.getThread(threadId)
-    if (!thread) throw unknownThread(threadId)
+    const thread = this.startableThread(threadId)
+    if (thread.archived) throw invalidRequest('cannot start a review in an archived thread')
     const runningTurnId = this.activeTurnByThread.get(threadId)
     const activeTurn = runningTurnId ? this.store.getTurn(runningTurnId) : null
     if (this.startingTurnByThread.has(threadId) || activeTurn?.status === 'inProgress') {
@@ -3889,8 +3887,8 @@ export class CodexClaudeAppServer {
 
   private threadCompactStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    const thread = this.store.getThread(threadId)
-    if (!thread) throw unknownThread(threadId)
+    const thread = this.startableThread(threadId)
+    if (thread.archived) throw invalidRequest('cannot compact an archived thread')
     const runningTurnId = this.activeTurnByThread.get(threadId)
     const activeTurn = runningTurnId ? this.store.getTurn(runningTurnId) : null
     if (this.startingTurnByThread.has(threadId) || activeTurn?.status === 'inProgress') {
@@ -4055,7 +4053,8 @@ export class CodexClaudeAppServer {
       if (!this.stopped) {
         if (active()) endCompactItem(true)
         completeAgentItem()
-        // An interrupt already ended the turn and told the client.
+        // An interrupt already ended the turn and told the client; a
+        // thread/delete took it with the thread.
         const completed = this.endTurn(turn, 'completed', null)
         if (completed) {
           this.clearActiveTurn(threadId, turnId)
@@ -4066,7 +4065,7 @@ export class CodexClaudeAppServer {
           })
           if (!sessionFailed)
             this.notify(peer, { method: 'thread/compacted', params: { threadId, turnId } })
-        }
+        } else this.clearActiveTurn(threadId, turnId)
       }
     }
   }
@@ -6705,8 +6704,15 @@ export class CodexClaudeAppServer {
       this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
     }
     this.subagentStateByTurn.delete(turn.id)
-    const currentTurn = this.store.getTurn(turn.id)
-    if (currentTurn && currentTurn.status !== 'inProgress') return
+    // Whatever ended the turn meanwhile also let go of the thread, unless the
+    // turn went with its deleted thread: then nothing else will.
+    const ended = (): boolean => {
+      if (this.stopped) return true
+      const current = this.store.getTurn(turn.id)
+      if (!current) this.clearActiveTurn(thread.id, turn.id)
+      return current?.status !== 'inProgress'
+    }
+    if (ended()) return
 
     let finalDiff = await gitDiff(thread.cwd)
     // A joined shell can outlast the model and make further file changes.
@@ -6714,11 +6720,11 @@ export class CodexClaudeAppServer {
     let shells = this.userShells.get(turn.id)
     while (shells) {
       await Promise.all(Array.from(shells.runs.values(), (run) => run.done))
-      if (this.stopped || this.store.getTurn(turn.id)?.status !== 'inProgress') return
+      if (ended()) return
       finalDiff = await gitDiff(thread.cwd)
       shells = this.userShells.get(turn.id)
     }
-    if (this.stopped || this.store.getTurn(turn.id)?.status !== 'inProgress') return
+    if (ended()) return
     if (finalDiff) {
       this.store.updateTurnDiff(turn.id, finalDiff)
       this.notify(peer, {
@@ -7896,6 +7902,7 @@ export class CodexClaudeAppServer {
     if (
       !thread ||
       thread.archived ||
+      this.isBeingDeleted(threadId) ||
       this.activeTurnByThread.has(threadId) ||
       this.runtime.hasPendingContinuation?.(threadId) !== true
     ) {
@@ -10883,15 +10890,15 @@ export class CodexClaudeAppServer {
     return withTurnNotices(explained, this.turnNotices.messages(turn.id))
   }
 
-  // Writes a turn's terminal state. Returns null when the turn already ended,
-  // and the terminal record built in memory when the store refused the write;
-  // that write is then retried in the background.
+  // Writes a turn's terminal state. Returns null when the turn already ended
+  // or went with its deleted thread, and the terminal record built in memory
+  // when the store refused the write; that write is then retried in the
+  // background.
   private endTurn(turn: TurnRecord, status: TurnStatus, error: unknown | null): TurnRecord | null {
     this.stopUserShells(turn.id, 'command stopped because its turn ended')
     try {
-      const current = this.store.getTurn(turn.id)
-      if (current && current.status !== 'inProgress') return null
-      return this.store.completeTurn(turn.id, status, error) ?? turn
+      if (this.store.getTurn(turn.id)?.status !== 'inProgress') return null
+      return this.store.completeTurn(turn.id, status, error)
     } catch (storeError) {
       debugLog('turn.persist_failed', {
         threadId: turn.threadId,
