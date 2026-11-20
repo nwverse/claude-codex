@@ -922,10 +922,6 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       context.model,
       context.claudeSessionCwd,
     )
-    if (!resume && context.claudeSessionId && CLAUDE_SESSION_UUID.test(context.claudeSessionId))
-      throw new Error(
-        `Cannot resume Claude session ${context.claudeSessionId}: its transcript is missing from the configured workspace`,
-      )
     if (resume) opts.resume = resume
     if (resume && context.forkSession) opts.forkSession = true
     // A rewound thread continues from one of its own checkpoints. Forking
@@ -1512,6 +1508,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private startCli(sdk: ClaudeSdk, session: LiveSession): void {
     const context = session.lastContext
     const options = this.buildOptions(sdk, context, session.abort, () => session)
+    // The thread's Claude session has no transcript left to resume (Claude
+    // Code deletes old ones), so a new session starts. Queued ahead of the
+    // CLI's messages: the thread drops the old id before it hears the new.
+    const missing = context.claudeSessionId
+    if (!options.resume && missing && CLAUDE_SESSION_UUID.test(missing))
+      void this.serialize(session, () => this.reportMissingSession(session, missing))
     session.transcriptEnv = (options.env as NodeJS.ProcessEnv | undefined) ?? process.env
     if (session.reusable) this.trackCronJobs(context, options, session.transcriptEnv)
     if (session.current) {
@@ -1526,6 +1528,29 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       commandOutputPollMs(),
     )
     this.readCliVersion(session, session.query)
+  }
+
+  // The thread forgets the lost session even if the new CLI never starts,
+  // so its next turn does not look for it again, and the user hears that
+  // Claude goes on without the earlier context.
+  private async reportMissingSession(session: LiveSession, claudeSessionId: string) {
+    debugLog('native.session.transcript_missing', { threadId: session.threadId, claudeSessionId })
+    const pending = session.current
+    if (!pending || pending.resolved || session.closed) return
+    try {
+      await pending.handlers.onEvent({ type: 'session', claudeSessionId: null })
+      await pending.handlers.onEvent({
+        type: 'notice',
+        level: 'warning',
+        message:
+          "Claude could not find this chat's earlier conversation: its transcript is gone, for example removed by Claude Code's cleanup of old sessions. This message starts a new Claude session without that context.",
+      })
+    } catch (error) {
+      debugLog('native.session.transcript_missing_report_failed', {
+        threadId: session.threadId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
   }
 
   // The initialize reply names the CLI's version from Claude Code 2.1.296

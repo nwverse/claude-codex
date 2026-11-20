@@ -833,6 +833,18 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- A Claude chat whose session transcript is gone, for example because Claude
+  Code deleted sessions older than its `cleanupPeriodDays` (30 days by
+  default), continues in a new Claude session, and a notice says the earlier
+  conversation could not be found. Since #324 such a chat, and every fork of
+  it, failed each message with `Cannot resume Claude session …: its
+  transcript is missing`. The chat drops the lost session id right away, so a
+  new session that fails to start does not leave it bound. (#327)
+- Renaming a chat's workspace folder to a name with the same Claude Code
+  project folder (`my_project` or `my project` to `my-project`) keeps its
+  conversation: the transcript is already where Claude Code looks. Since #324
+  every later turn failed with `Cannot relocate a Claude session between
+  workspaces with the same transcript directory`. (#327)
 - A deleted chat stays deleted and a rename sticks when a `turn/start`
   arrives at the same time, for example from a second window on the same
   chat. `turn/start` re-reads the thread after waiting on a running turn

@@ -111,7 +111,15 @@ Resume the existing thread with the new workspace path. The adapter uses the
 Claude session ID and its last recorded workspace to locate the transcript in
 the selected CLI's configuration directory. It publishes an independent copy
 for the new workspace and keeps the source file. The profile, executable and
-provider continue to follow the thread's existing binding.
+provider continue to follow the thread's existing binding. A rename that only
+changes characters Claude Code's project folder name replaces with `-`
+(`my_project` to `my-project`) needs no copy: the transcript is already where
+the CLI looks.
+
+When the transcript is gone, for example after Claude Code deleted sessions
+older than its `cleanupPeriodDays`, the chat continues in a new Claude session
+and a notice says the earlier conversation could not be found. This holds
+whether or not the workspace moved.
 
 If the previous workspace has multiple candidate transcripts, or a same-ID
 file at the destination has diverged, the turn reports an error and preserves

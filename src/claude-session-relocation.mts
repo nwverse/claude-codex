@@ -125,7 +125,9 @@ function identicalDestination(source: string, target: string, id: string): boole
 }
 
 // When the App changes this thread's working directory, use only the source
-// workspace recorded in SQLite and the config root of the selected CLI.
+// workspace recorded in SQLite and the config root of the selected CLI. False
+// when there is nothing to copy: the CLI already finds the transcript under
+// the new workspace's name, or the recorded workspace has none left.
 export function relocateClaudeTranscript(
   id: string,
   sourceCwd: string,
@@ -138,14 +140,15 @@ export function relocateClaudeTranscript(
   if (!CLAUDE_SESSION_UUID.test(id))
     throw new Error('Cannot relocate an unrecognized Claude session ID')
   const projects = join(root, 'projects')
+  // No transcripts at all, e.g. after the projects folder was cleared.
+  if (!lstatSync(projects, { throwIfNoEntry: false })) return false
   verifyDirectory(projects)
   const sources: string[] = []
   const previous = new Set([...projectSlugs(from), ...projectSlugs(sourceCwd)])
   const targetSlug = projectSlugs(to)[0] as string
-  if (previous.has(targetSlug))
-    throw new Error(
-      'Cannot relocate a Claude session between workspaces with the same transcript directory',
-    )
+  // A rename that keeps the folder name's slug (my_project -> my-project)
+  // leaves the transcript where the CLI looks for it.
+  if (previous.has(targetSlug)) return false
   for (const slug of previous) {
     const dir = join(projects, slug)
     if (!lstatSync(dir, { throwIfNoEntry: false })) continue
@@ -163,6 +166,9 @@ export function relocateClaudeTranscript(
       return true
     }
   }
+  // Claude Code deletes old transcripts (cleanupPeriodDays): a session with
+  // none left is missing, moved or not, and the turn starts a new one.
+  if (!sources.length) return false
   if (sources.length !== 1) {
     throw new Error(
       `Cannot relocate Claude session ${id}: expected one transcript in the recorded workspace, found ${sources.length}`,
