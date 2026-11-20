@@ -252,6 +252,30 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- Codex App 26.1111 names itself `Codex Desktop` in `initialize` instead of
+  `codex_desktop`. The adapter takes either name for the desktop App, so it
+  reports an App build missing from the verified list again (a
+  `configWarning` in Settings, and on stderr); 26.1111 connected without
+  that warning. (#347)
+- `npm run check:app-upgrade` reads Codex App 26.1111 bundles again: their
+  double-quoted strings, gates without a version (shown as "never"), the
+  minimum version in a constant of its own, and a `clientInfo` name taken from
+  another module. Against 26.1111 it reported no gate table, no minimum and no
+  desktop client name. It also notes a gate the adapter's version no longer
+  turns on (26.1111's `asyncCompaction` needs `0.163.0-alpha.11`), counts a
+  case that throws an `RpcError` with `METHOD_NOT_FOUND` as answering
+  "method not found", and lists one whose `// App rule:` comment says why as
+  "-32601 by design" instead of as a problem. (#347)
+- With `CLAUDE_CODEX_APP_MCP_SERVERS=1`, editing a server under Settings >
+  MCP servers works with Codex App 26.1111, which saves the changed fields one
+  by one with quoted keys (`mcp_servers."name"."env"."KEY"`). Every such save
+  used to fail with "invalid MCP server name". A server is now checked once
+  all edits of a save are made, so moving one from a command to a URL works,
+  and the debug log keeps the values of quoted `env`, header, `args` and
+  `url` keys out as it does for plain ones. (#347)
+- The note that tells Claude which Codex App tools it lacks also names
+  `delete_thread`, which App 26.1111's thread instructions mention. (#347)
+
 - A file the turn diff leaves out (too large, binary or past the size limit)
   shows as a binary change with the reason after it, which renderers show
   without content and `git apply` refuses. It used to be a one-line hunk that

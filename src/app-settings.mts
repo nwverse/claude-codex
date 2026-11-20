@@ -1,5 +1,6 @@
 import { asTable, codexMcpServer, type InheritedMcpServer, mergeTables } from './codex-config.mjs'
 import { invalidRequest, type RpcError } from './host-methods.mjs'
+import { dottedKeyParts } from './toml.mjs'
 import { codexHome } from './util.mjs'
 
 // What the Codex App's settings write with config/value/write and
@@ -118,36 +119,49 @@ function withPath(table: Table, path: readonly string[], value: unknown, upsert:
   return out
 }
 
-// Applies an edit of the mcp_servers table to `settings`, the adapter's saved
-// settings, or throws an RpcError the App shows without anything changing.
-// The App's MCP settings replace a server's whole entry on save and delete
-// it with null, and upsert its `enabled` field when switched.
-export function editMcpServers(settings: Table, edit: ConfigEdit): void {
-  const [, name, ...field] = edit.keyPath.split('.')
-  if (name !== undefined && DESKTOP_MCP_SERVERS.has(name)) return
+// `servers` with one edit of the mcp_servers table made: an entry replaced
+// or deleted, or (App 26.1111) one field of an entry, or one entry of its
+// env or headers.
+function editedServers(servers: Table, edit: ConfigEdit): Table {
+  const parts = dottedKeyParts(edit.keyPath)
+  if (parts?.[0] !== 'mcp_servers') throw invalidRequest(`invalid config key: ${edit.keyPath}`)
+  const [, name, ...field] = parts
+  if (name !== undefined && DESKTOP_MCP_SERVERS.has(name)) return servers
   const upsert = edit.mergeStrategy === 'upsert'
-  const prior = asTable(settings.mcp_servers) ?? {}
-  let servers: Table
   if (name === undefined) {
     const table = asTable(edit.value)
     if (edit.value != null && !table) throw invalidRequest('mcp_servers must be a table of servers')
-    servers = upsert ? { ...prior } : {}
+    let out: Table = upsert ? { ...servers } : {}
     for (const [key, entry] of Object.entries(table ?? {})) {
       if (DESKTOP_MCP_SERVERS.has(key)) continue
       // Checked before withPath, which would drop a __proto__ server unseen.
       if (!validServerName(key)) throw invalidRequest(`invalid MCP server name: ${key}`)
-      servers = withPath(servers, [key], entry, upsert)
+      out = withPath(out, [key], entry, upsert)
     }
-  } else {
-    if (!validServerName(name)) throw invalidRequest(`invalid MCP server name: ${name}`)
-    if (field.includes(PROTOTYPE_KEY))
-      throw invalidRequest(`invalid MCP server field: mcp_servers.${name}.${field.join('.')}`)
-    if (field.length > 0 && !asTable(prior[name]))
-      throw invalidRequest(`no MCP server named ${name} in the App's settings`)
-    if (field.length === 0 && edit.value != null && !asTable(edit.value))
-      throw invalidRequest(`mcp_servers.${name} must be a table`)
-    servers = withPath(prior, [name, ...field], edit.value, upsert)
+    return out
   }
+  if (!validServerName(name)) throw invalidRequest(`invalid MCP server name: ${name}`)
+  if (field.includes(PROTOTYPE_KEY))
+    throw invalidRequest(`invalid MCP server field: mcp_servers.${name}.${field.join('.')}`)
+  if (field.length > 0 && !asTable(servers[name]))
+    throw invalidRequest(`no MCP server named ${name} in the App's settings`)
+  if (field.length === 0 && edit.value != null && !asTable(edit.value))
+    throw invalidRequest(`mcp_servers.${name} must be a table`)
+  return withPath(servers, [name, ...field], edit.value, upsert)
+}
+
+// Applies the edits of the mcp_servers table one write makes to `settings`,
+// the adapter's saved settings, or throws an RpcError the App shows without
+// anything changing. The App's MCP settings save a new server's whole entry
+// and delete one with null, and upsert its `enabled` field when switched.
+// App 26.1111 saves an edited server field by field, with quoted keys, so the
+// entries are checked once all edits are made: a server moved from a command
+// to a URL has neither in between.
+// App rule: mcp-settings
+export function editMcpServers(settings: Table, edits: readonly ConfigEdit[]): void {
+  const prior = asTable(settings.mcp_servers) ?? {}
+  let servers = prior
+  for (const edit of edits) servers = editedServers(servers, edit)
   // A server the edit removes is a change too: with the servers off, what was
   // saved stays as it is.
   const changed = [...new Set([...Object.keys(prior), ...Object.keys(servers)])].filter(

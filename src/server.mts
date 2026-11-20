@@ -11,6 +11,7 @@ import {
   appMcpServers,
   appMcpServersEnabled,
   appMcpServerTable,
+  type ConfigEdit,
   editMcpServers,
   pruneLegacySettings,
   unsupportedSettingWrite,
@@ -9889,6 +9890,7 @@ export class CodexClaudeAppServer {
     const overrides = structuredClone(this.configOverrides)
     let model = this.configModel
     let effort = this.configReasoningEffort
+    const serverEdits: ConfigEdit[] = []
     for (const edit of configEdits(params)) {
       const { keyPath, value } = edit
       if (keyPath === 'model' && typeof value === 'string' && value.length > 0) {
@@ -9898,7 +9900,7 @@ export class CodexClaudeAppServer {
         effort = normalizeCodexReasoningEffort(value) ?? effort
         edits.model_reasoning_effort = effort
       } else if (keyPath === 'mcp_servers' || keyPath.startsWith('mcp_servers.')) {
-        editMcpServers(overrides, edit)
+        serverEdits.push(edit)
       } else {
         const unsupported = unsupportedSettingWrite(edit)
         if (unsupported instanceof RpcError) throw unsupported
@@ -9912,6 +9914,7 @@ export class CodexClaudeAppServer {
         }
       }
     }
+    if (serverEdits.length > 0) editMcpServers(overrides, serverEdits)
     if (!isDeepStrictEqual(overrides, this.configOverrides)) edits.overrides = overrides
     this.persistConfig(saved, edits)
     this.configOverrides = overrides
