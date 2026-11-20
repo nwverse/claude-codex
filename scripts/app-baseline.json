@@ -1,5 +1,5 @@
 {
-  "appVersion": "26.1111.21308",
+  "appVersion": "26.1111.71704",
   "gates": {
     "commandSessionsWorldState": null,
     "desktopMcpSocket": null,
@@ -87,7 +87,7 @@
   },
   "minimum": "0.141.0",
   "clientNames": ["Codex", "Codex Desktop", "codex_latex_preview"],
-  "codexVersion": "codex-cli 0.169.0-alpha.11.1",
+  "codexVersion": "codex-cli 0.169.1",
   "clientRequests": [
     "account/bedrock/checkGovCloudRequirements",
     "account/bedrock/discover",
@@ -572,6 +572,7 @@
     "model/stl",
     "model/vrml",
     "plugin/codex",
+    "project/settings",
     "server/discover",
     "thread/environmentReady",
     "thread/prewarm",

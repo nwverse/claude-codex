@@ -21,6 +21,7 @@ export const VERIFIED_APP_VERSIONS: readonly string[] = [
   '26.930.21537',
   '26.1013.40934',
   '26.1111.21308',
+  '26.1111.71704',
 ]
 
 // initialize.clientInfo.name of the desktop App: "Codex Desktop" from 26.1111,

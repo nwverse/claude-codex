@@ -1368,8 +1368,10 @@ test('Claude threads report the claude-code model provider', async () => {
 test('host methods answer truthfully: empty, disabled or unavailable', async () => {
   await withServer(async (server) => {
     // The App treats -32601 as "not supported here" and falls back quietly;
-    // Codex itself does not implement thread/prediction/request.
-    for (const method of ['x/y', 'thread/prediction/request']) {
+    // Codex itself does not implement thread/prediction/request, and has no
+    // project/settings, which App 26.1111.71704 names only as the path of a
+    // ChatGPT project's settings page on the web.
+    for (const method of ['x/y', 'thread/prediction/request', 'project/settings']) {
       await assert.rejects(server.request(method), (error: unknown) => {
         assert.ok(error instanceof RpcError)
         assert.equal(error.code, -32601)

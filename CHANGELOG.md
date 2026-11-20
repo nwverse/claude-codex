@@ -270,6 +270,12 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- Codex App 26.1111.71704 is a verified build too, and the upgrade baseline.
+  Its Codex, `0.169.1`, has the same app-server protocol as 26.1111.21308's,
+  its gates are unchanged, and the one new method-shaped name in its scripts,
+  `project/settings`, is the path of a ChatGPT project's settings page, not
+  an app-server request; like Codex, the adapter answers it with method not
+  found. (#354)
 - Codex App 26.1111 is a verified build, checked against the App rules from
   its bundle (`docs/reference/app-compat.md` notes what changed). The adapter
   still reports app-server `0.163.0-alpha.10.2`, which turns on five of
@@ -417,6 +423,13 @@ versioning or publishing metadata.
   A file whose directory does not exist yet (`.git/HEAD` before `git init`)
   is watched from the nearest existing folder, as Codex does, instead of
   failing with `ENOENT`. (#333)
+- `fs/watch` on a file keeps working when a folder on the way to it is deleted
+  and created again, such as `.git` in `rm -rf .git && git init`. As in Codex,
+  the watch picks the nearest existing folder again on every event and moves
+  to the new folder, also when it is already back by then; on Linux it used
+  to stop for good. A folder created while the watch moves down to it is no
+  longer missed, and on macOS a watch whose nearest existing folder is `/`
+  now sees its entry. (#348)
 - `fs/readDirectory` lists a symlink as the file or folder it points to, as
   `fs/getMetadata` and Codex do, and leaves out a dangling link. Linked files
   such as `CLAUDE.md -> AGENTS.md` and linked package folders used to show as
