@@ -553,7 +553,6 @@ function turnRecord(threadId: string, id: string): TurnRecord {
     completedAt: null,
     durationMs: null,
     items: [],
-    diff: '',
     error: null,
   }
 }

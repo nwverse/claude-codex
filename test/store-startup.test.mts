@@ -165,6 +165,62 @@ test('startup repairs each legacy condition on its own', async (t) => {
   }
 })
 
+test('turn diffs older builds stored are emptied, and none is written or forked again', async () => {
+  const { home, path } = await cleanStore()
+  const diffBytes = (raw: InstanceType<typeof DatabaseSync>) =>
+    raw
+      .prepare(
+        `SELECT id, octet_length(diff) AS bytes FROM turns
+         UNION ALL SELECT thread_id, octet_length(diff) FROM thread_inherited_turns ORDER BY 1`,
+      )
+      .all()
+      .map(({ id, bytes }) => `${id}:${bytes}`)
+  // How an older build writes a turn, which a rollback runs again.
+  const olderBuildWrite = (raw: InstanceType<typeof DatabaseSync>, id: string, diff: string) =>
+    raw.exec(`INSERT INTO turns (id, thread_id, status, started_at, items_json, diff)
+      VALUES ('${id}', 'clean', 'completed', 1, '[]', '${diff}')
+      ON CONFLICT(id) DO UPDATE SET diff = excluded.diff`)
+  const big = 'x'.repeat(64 * 1024)
+  try {
+    let raw = new DatabaseSync(path)
+    insertThread(raw, 'fork', `forked_from_id = 'clean'`)
+    olderBuildWrite(raw, 'old', big)
+    raw.exec(`INSERT INTO thread_inherited_turns (thread_id, position, id, status, items_json, diff)
+      VALUES ('fork', 0, 'old', 'completed', '[]', '${big}')`)
+    raw.close()
+
+    let store = new SessionStore(path)
+    raw = new DatabaseSync(path)
+    assert.deepEqual(diffBytes(raw), ['fork:0', 'old:0'])
+    // Diffs a rollback stored meanwhile: the next write of the turn drops its
+    // own, and a fork copies none.
+    olderBuildWrite(raw, 'old', 'rolled back')
+    const turn = store.getTurn('old')
+    assert.ok(turn)
+    store.copyInheritedHistory('fork', 'clean', 1)
+    assert.deepEqual(diffBytes(raw), ['fork:0', 'old:11'])
+    store.upsertTurn({ ...turn, id: 'new' })
+    store.upsertTurn(turn)
+    assert.deepEqual(diffBytes(raw), ['fork:0', 'new:0', 'old:0'])
+    store.close()
+
+    // The next open empties what a rollback stored, and a clean store
+    // reopens without a write.
+    olderBuildWrite(raw, 'old', 'rolled back')
+    raw.close()
+    new SessionStore(path).close()
+    raw = new DatabaseSync(path)
+    assert.deepEqual(diffBytes(raw), ['fork:0', 'new:0', 'old:0'])
+    raw.close()
+    const before = changeCounter(path)
+    store = new SessionStore(path)
+    store.close()
+    assert.equal(changeCounter(path), before, 'reopening a cleared store must not write')
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('another adapter can finish a column migration between the probe and the write', async (t) => {
   const { home, path } = await cleanStore()
   const other = new DatabaseSync(path)

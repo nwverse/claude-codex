@@ -15,6 +15,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { isDeepStrictEqual } from 'node:util'
@@ -1894,7 +1895,7 @@ test('getConversationSummary refuses a thread it does not know and dates one it 
   })
 })
 
-test('notifications a client opts out of are not sent, nor the diff after each tool run', async () => {
+test('notifications a client opts out of are not sent, nor a diff taken for them', async () => {
   // A git on PATH that logs each run, to count the diffs the server takes.
   const tools = await mkdtemp(join(tmpdir(), 'claude-codex-git-runs-'))
   const log = join(tools, 'runs.log')
@@ -1913,7 +1914,7 @@ test('notifications a client opts out of are not sent, nor the diff after each t
   const env = { PATH: `${tools}${delimiter}${process.env.PATH ?? ''}` }
   // Like Codex, an opt-out names exact methods; the App opts out of the diff.
   const run = async (optOutNotificationMethods: string[]) => {
-    let seen = { diffRuns: 0, diffs: [] as string[], accounts: 0, completed: 0 }
+    let seen = { diffRuns: 0, diffs: [] as string[], stored: -1, accounts: 0, completed: 0 }
     await withServer(async (server) => {
       await rm(log, { force: true })
       const repo = join(server.home, 'repo')
@@ -1935,12 +1936,19 @@ test('notifications a client opts out of are not sent, nor the diff after each t
       })
       const threadId = await server.startThread({ cwd: repo })
       const turnId = await server.runTurn(threadId, 'please use generic tool')
+      // The diff goes out, but the turn does not keep it.
+      const db = new DatabaseSync(join(server.home, 'claude-codex-adapter', 'state.sqlite'))
+      const row = db
+        .prepare('SELECT octet_length(diff) AS bytes FROM turns WHERE id = ?')
+        .get(turnId) as { bytes: number }
+      db.close()
       seen = {
         diffRuns: await diffRuns(),
         diffs: server
           .notified('turn/diff/updated', 0)
           .filter((params) => params.turnId === turnId)
           .map((params) => params.diff),
+        stored: row.bytes,
         accounts: server.notified('account/updated', 0).length,
         completed: server.notified('turn/completed', 0).length,
       }
@@ -1953,12 +1961,15 @@ test('notifications a client opts out of are not sent, nor the diff after each t
     assert.equal(all.diffRuns, 2)
     assert.equal(all.diffs.length, 2)
     assert.match(all.diffs[1] ?? '', /\+changed/)
+    assert.equal(all.stored, 0)
     assert.equal(all.accounts, 1)
 
-    // Opted out, only the turn's own diff is taken, and nothing named is sent.
+    // Opted out, nothing named is sent, and no diff is taken for it, after a
+    // tool or when the turn ends.
     const optedOut = await run(['turn/diff/updated', 'account/updated', 'no/such/method'])
-    assert.equal(optedOut.diffRuns, 1)
+    assert.equal(optedOut.diffRuns, 0)
     assert.deepEqual(optedOut.diffs, [])
+    assert.equal(optedOut.stored, 0)
     assert.equal(optedOut.accounts, 0)
     assert.equal(optedOut.completed, 1)
   } finally {

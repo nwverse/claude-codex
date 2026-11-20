@@ -217,7 +217,6 @@ export interface TurnRecord {
   completedAt: number | null
   durationMs: number | null
   items: ThreadItem[]
-  diff: string
   error: unknown | null
   // The first turn in the chain of work that led to this one, when that is
   // another turn: the rootTurnId of turn/start, or for a subagent's turn the

@@ -141,7 +141,6 @@ function completedTurn(id: string, items: ThreadItem[]): TurnRecord {
     completedAt: 2,
     durationMs: 1000,
     items,
-    diff: '',
     error: null,
   }
 }

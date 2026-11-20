@@ -693,7 +693,6 @@ test('turn interrupt completes requested in-progress turn after reconnect', asyn
         completedAt: null,
         durationMs: null,
         items: [],
-        diff: '',
         error: null,
       })
       const interrupted = []
@@ -2266,7 +2265,6 @@ test('server stop during final git diff leaves the closed store alone', async ()
     try {
       const turn = store.getTurn(turnId)
       assert.equal(turn?.status, 'interrupted')
-      assert.equal(turn?.diff, '')
     } finally {
       store.close()
     }
