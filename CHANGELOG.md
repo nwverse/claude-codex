@@ -1177,6 +1177,14 @@ versioning or publishing metadata.
 
 ### Provider and multi-agent boundaries
 
+- **Behavior change:** a Codex (`gpt-*`) chat on the `codex-proxy` route that
+  has no sandbox stored runs `codex exec` with `-s workspace-write`, the
+  sandbox the App shows for it. It used to run with
+  `--dangerously-bypass-approvals-and-sandbox`, with no sandbox and no
+  approvals. A chat ends up with no sandbox when `thread/resume`,
+  `thread/metadata/update` or `thread/fork` names a value the adapter does not
+  know, and older threads can have none. Only a Full Access
+  (`danger-full-access`) chat runs unsandboxed. (#349)
 - Follow-up turns of a Codex (`gpt-*`) chat on the `codex-proxy` route run
   in the thread's folder with its sandbox mode and extra writable roots
   (`CLAUDE_CODEX_ADD_DIRS`) again. `codex exec resume` was run without `-C`,
