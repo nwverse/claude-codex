@@ -860,9 +860,11 @@ versioning or publishing metadata.
   the newest message. When the transcript cannot be found, for example after
   Claude Code deleted sessions older than its `cleanupPeriodDays` (30 days by
   default), the chat continues in a new Claude session and a notice says the
-  earlier conversation could not be found. A Claude config folder that is
-  missing or cannot be read fails the turn instead, and the chat keeps its
-  session for when the folder is back. (#324, #327)
+  earlier conversation could not be found. So does a chat whose Claude config
+  folder was deleted; the new session creates it again. A config folder that
+  is out of reach (a link or parent folder that is gone, as on an unmounted
+  volume, or a folder that cannot be read) fails the turn instead, and the
+  chat keeps its session for when the folder is back. (#324, #327)
 - A fork whose first turn failed before Claude Code started still forks its
   parent's Claude session on its next turn. It used to resume the parent's
   session itself and write the fork's conversation into the parent's

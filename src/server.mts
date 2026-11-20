@@ -4876,7 +4876,8 @@ export class CodexClaudeAppServer {
     // A fork resumes the session it was forked from as a fork of it until a
     // turn of its own has written to a session. Counting turns instead would
     // resume the parent's session itself after a first turn that failed
-    // before Claude started.
+    // before Claude started. A fork whose own turns left no checkpoints (one
+    // from before checkpoints) forks its own session once more, then has one.
     const forkSession =
       thread.forkedFromId != null &&
       thread.claudeSessionId != null &&

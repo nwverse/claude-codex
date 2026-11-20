@@ -16,7 +16,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
 import { NativeClaudeRuntime, sdkResumeSessionId } from '../src/native-runtime.mjs'
 import { projectSlugs } from '../src/util.mjs'
@@ -142,26 +142,66 @@ test('relocation refuses a recorded workspace with more than one transcript', {
 
 test('a transcript that is only out of reach is not taken for gone', async () => {
   const f = await fixture('workspace', 'workspace')
-  const resume = () => sdkResumeSessionId(f.id, f.cwd, f.config, 'same-model', f.cwd)
+  const resume = (config = f.config) => sdkResumeSessionId(f.id, f.cwd, config, 'same-model', f.cwd)
   try {
     assert.equal(resume(), f.id)
-    // The config folder is away, as on a volume that is not mounted.
-    await rename(f.config, `${f.config}.away`)
-    assert.throws(resume, /transcript could not be read .*ENOENT/)
-    await rename(`${f.config}.away`, f.config)
-    if (process.platform !== 'win32' && process.getuid?.() !== 0) {
-      await chmod(f.newDir, 0o000)
-      assert.throws(resume, /transcript could not be read .*EACCES/)
-      await chmod(f.newDir, 0o700)
+    // A config folder on a volume that is not mounted: its parent is gone.
+    assert.throws(
+      () => resume(join(f.base, 'volume', 'profile')),
+      /transcript could not be read \(.*volume: ENOENT\)/,
+    )
+    if (process.platform !== 'win32') {
+      // A link to a folder that is not there now, for the config folder or
+      // for its projects.
+      await rename(f.config, join(f.base, 'real'))
+      await symlink(join(f.base, 'volume', 'profile'), f.config)
+      assert.throws(resume, /transcript could not be read .*ENOENT/)
+      await rm(f.config)
+      await rename(join(f.base, 'real'), f.config)
       await rename(join(f.config, 'projects'), join(f.base, 'projects'))
-      await symlink(join(f.base, 'elsewhere'), join(f.config, 'projects'))
+      await symlink(join(f.base, 'volume', 'projects'), join(f.config, 'projects'))
       assert.throws(resume, /transcript could not be read .*ENOENT/)
       await rm(join(f.config, 'projects'))
       await rename(join(f.base, 'projects'), join(f.config, 'projects'))
     }
+    if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+      await chmod(f.newDir, 0o000)
+      assert.throws(resume, /transcript could not be read .*EACCES/)
+      await chmod(f.newDir, 0o700)
+    }
     assert.equal(resume(), f.id)
   } finally {
     await chmod(f.newDir, 0o700).catch(() => {})
+    await rm(f.base, { recursive: true, force: true })
+  }
+})
+
+test('a deleted config folder, or an unreadable one the CLI does not use, leaves a gone transcript gone', async () => {
+  const f = await fixture('workspace', 'workspace')
+  const saved = [process.env.CLAUDE_CONFIG_DIR, process.env.CLAUDE_CONFIG_DIRS]
+  const routers = join(f.base, 'routers')
+  try {
+    // Without a profile, the CLI runs from CLAUDE_CONFIG_DIR; a router
+    // folder it does not run from cannot be read.
+    process.env.CLAUDE_CONFIG_DIR = f.config
+    process.env.CLAUDE_CONFIG_DIRS = routers
+    await mkdir(join(routers, 'locked'), { recursive: true })
+    if (process.platform !== 'win32') await chmod(join(routers, 'locked'), 0o000)
+    assert.equal(sdkResumeSessionId(randomUUID(), f.cwd, undefined, null), null)
+    assert.equal(sdkResumeSessionId(f.id, f.cwd, undefined, null), f.id)
+    // The CLI creates its config folder again.
+    await rm(f.config, { recursive: true })
+    assert.equal(sdkResumeSessionId(f.id, f.cwd, f.config, 'same-model', f.cwd), null)
+    assert.equal(sdkResumeSessionId(f.id, f.cwd, undefined, null), null)
+  } finally {
+    for (const [key, value] of [
+      ['CLAUDE_CONFIG_DIR', saved[0]],
+      ['CLAUDE_CONFIG_DIRS', saved[1]],
+    ] as const) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    await chmod(join(routers, 'locked'), 0o700).catch(() => {})
     await rm(f.base, { recursive: true, force: true })
   }
 })
@@ -251,7 +291,7 @@ async function withClaudeChat(
 ) {
   const base = await realpath(await mkdtemp(join(tmpdir(), 'cc-session-')))
   const cwd = join(base, 'workspace')
-  const config = join(base, 'claude')
+  const config = join(base, 'volume', 'claude')
   const sessionId = randomUUID()
   await mkdir(cwd)
   await mkdir(join(config, 'projects'), { recursive: true, mode: 0o700 })
@@ -297,6 +337,8 @@ test('a chat keeps its Claude session until a new session has started', async ()
     const failed = await app.turnCompleted(await app.startTurn(threadId, 'hello again'))
     assert.equal(failed.status, 'failed')
     assert.equal(app.store.getThread(threadId)?.claudeSessionId, sessionId)
+    // No new session started, so the turn does not say one did.
+    assert.equal(missingNotices(app).length, 0)
     const next = await app.turnCompleted(await app.startTurn(threadId, 'and again'))
     assert.equal(next.status, 'completed')
     assert.deepEqual(
@@ -304,22 +346,34 @@ test('a chat keeps its Claude session until a new session has started', async ()
       [undefined, undefined],
     )
     assert.equal(app.store.getThread(threadId)?.claudeSessionId, fresh)
-    // Each turn that went on without the earlier context said so.
-    assert.equal(missingNotices(app).length, 2)
+    assert.equal(missingNotices(app).length, 1)
+  })
+})
+
+test('a chat whose Claude config folder was deleted continues in a new session and says so', async () => {
+  const fresh = randomUUID()
+  await withClaudeChat(true, [fresh], async (app, { threadId, config, launches }) => {
+    await rm(config, { recursive: true })
+    const turn = await app.turnCompleted(await app.startTurn(threadId, 'hello again'))
+    assert.equal(turn.status, 'completed')
+    assert.equal(launches[0]?.resume, undefined)
+    assert.equal(app.store.getThread(threadId)?.claudeSessionId, fresh)
+    assert.equal(missingNotices(app).length, 1)
   })
 })
 
 test('a chat whose Claude config folder is out of reach fails the turn and keeps its session', async () => {
   const fresh = randomUUID()
   await withClaudeChat(true, [fresh], async (app, { threadId, sessionId, config, launches }) => {
-    // The folder is away, as on a volume that is not mounted.
-    await rename(config, `${config}.away`)
+    // The volume the folder is on is not mounted.
+    const volume = dirname(config)
+    await rename(volume, `${volume}.away`)
     const failed = await app.turnCompleted(await app.startTurn(threadId, 'hello'))
     assert.equal(failed.status, 'failed')
     assert.match(failed.error.message, /transcript could not be read/)
     assert.equal(launches.length, 0)
     assert.equal(app.store.getThread(threadId)?.claudeSessionId, sessionId)
-    await rename(`${config}.away`, config)
+    await rename(`${volume}.away`, volume)
     const resumed = await app.turnCompleted(await app.startTurn(threadId, 'again'))
     assert.equal(resumed.status, 'completed')
     assert.equal(launches[0]?.resume, sessionId)

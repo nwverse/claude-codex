@@ -39,27 +39,41 @@ export function transcriptStat(path: string, failures: string[]): Stats | null {
   }
 }
 
-// A Claude session starts over only when its transcript is certainly gone:
-// the CLI's config folder is readable, its projects folder is readable or
-// was never created, and no lookup failed. A folder that is away or cannot
-// be read (an unmounted volume, a privacy block) fails the turn instead, and
-// the chat keeps its session for when the folder is back.
-export function assertTranscriptGone(id: string, root: string, failures: string[]): void {
-  const problems = [...failures]
-  const projects = join(root, 'projects')
-  for (const dir of [root, projects]) {
-    if (problems.length) break
-    try {
-      if (dir === projects && !lstatSync(dir, { throwIfNoEntry: false })) break
-      if (!statSync(dir).isDirectory()) problems.push(`${dir}: not a folder`)
-      else accessSync(dir, constants.R_OK | constants.X_OK)
-    } catch (error) {
-      problems.push(failure(dir, error))
+// Whether a folder can say a transcript in it is gone: 'readable', 'absent'
+// (no entry at all in a parent folder that is there), or else why not.
+function folderState(dir: string): string {
+  let path = dir
+  try {
+    if (!lstatSync(dir, { throwIfNoEntry: false })) {
+      path = dirname(dir)
+      if (statSync(path).isDirectory()) return 'absent'
+    } else if (statSync(dir).isDirectory()) {
+      accessSync(dir, constants.R_OK | constants.X_OK)
+      return 'readable'
     }
+    return `${path}: not a folder`
+  } catch (error) {
+    return failure(path, error)
   }
-  if (problems.length)
+}
+
+// A Claude session starts over only when its transcript is certainly gone:
+// no lookup in the CLI's config folder failed, and that folder and its
+// projects folder are readable or not there at all (the CLI creates them).
+// A folder that is out of reach (a link or parent folder that is gone, as
+// on an unmounted volume, or one that cannot be read) fails the turn
+// instead, and the chat keeps its session for when the folder is back.
+export function assertTranscriptGone(id: string, root: string, failures: string[]): void {
+  let problem = failures[0]
+  for (const dir of [root, join(root, 'projects')]) {
+    if (problem) break
+    const state = folderState(dir)
+    if (state === 'absent') break
+    if (state !== 'readable') problem = state
+  }
+  if (problem)
     throw new Error(
-      `Cannot resume Claude session ${id}: its transcript could not be read (${problems[0]}). The chat keeps its session; send the message again once that folder is available.`,
+      `Cannot resume Claude session ${id}: its transcript could not be read (${problem}). The chat keeps its session; send the message again once that folder is available.`,
     )
 }
 

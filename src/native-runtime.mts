@@ -346,6 +346,9 @@ interface LiveSession {
   // Settles once the first prompt is sent, when the session has to switch
   // permission modes first; a steer must not overtake it.
   firstPrompt: Promise<void> | null
+  // The thread's session whose transcript is gone, until this new session
+  // has started in its place and the user has heard so.
+  lostSession: string | null
   closed: boolean
 }
 
@@ -1466,6 +1469,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         idleTimer: null,
         chain: Promise.resolve(),
         firstPrompt: null,
+        lostSession: null,
         closed: false,
       }
       // Without the launch gate the CLI starts right away, else once the
@@ -1514,11 +1518,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const context = session.lastContext
     const options = this.buildOptions(sdk, context, session.abort, () => session)
     // The thread's Claude session is certainly gone (sdkResumeSessionId), so
-    // a new session starts. The user hears so before Claude's first message;
-    // the new session's id replaces the old one once it starts.
+    // a new session starts; its id replaces the old one once it has started.
     const missing = context.claudeSessionId
     if (!options.resume && missing && CLAUDE_SESSION_UUID.test(missing))
-      void this.serialize(session, () => this.reportMissingSession(session, missing))
+      session.lostSession = missing
     session.transcriptEnv = (options.env as NodeJS.ProcessEnv | undefined) ?? process.env
     if (session.reusable) this.trackCronJobs(context, options, session.transcriptEnv)
     if (session.current) {
@@ -1535,10 +1538,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     this.readCliVersion(session, session.query)
   }
 
-  private async reportMissingSession(session: LiveSession, claudeSessionId: string) {
+  // Before anything Claude says in the new session, the turn says it goes on
+  // without the earlier context. A CLI that fails to start says nothing.
+  private async reportMissingSession(session: LiveSession) {
+    const claudeSessionId = session.lostSession
+    session.lostSession = null
     debugLog('native.session.transcript_missing', { threadId: session.threadId, claudeSessionId })
     const pending = session.current
-    if (!pending || pending.resolved || session.closed) return
+    if (!pending || pending.resolved) return
     try {
       await pending.handlers.onEvent({
         type: 'notice',
@@ -1948,6 +1955,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       session.cliRunning = true
       session.unsettled = false
     }
+    if (init && session.lostSession) await this.reportMissingSession(session)
     const sink = session.sink
     if (
       sink &&
@@ -4727,7 +4735,9 @@ export function sdkResumeSessionId(
     const files = slugs.map((slug) => join(root, 'projects', slug, `${value}.jsonl`))
     files.push(join(root, 'sessions', `${value}.jsonl`))
     for (const file of files) {
-      const stat = transcriptStat(file, failures)
+      // Only the CLI's own config folder can leave its transcript out of
+      // reach; one it does not run from is skipped as before.
+      const stat = transcriptStat(file, root === runRoot ? failures : [])
       // The newest copy wins; on a tie, the one already in the run root.
       if (stat && (!source || stat.mtimeMs > source.stat.mtimeMs)) source = { file, stat }
     }
