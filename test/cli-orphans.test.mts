@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
 import { parseProcessRows, reapOrphanedCliChildren } from '../src/cli-orphans.mjs'
+import { startedBy } from '../src/process-owner.mjs'
 
 // Keep debug.jsonl out of the developer's ~/.codex.
 process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
@@ -142,4 +143,26 @@ test('parseProcessRows reads ps lstart rows', () => {
       command: 'claude --input-format stream-json',
     },
   ])
+})
+
+test('startedBy tells the process that wrote its pid from a later one, in any time zone', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const child = spawn('sleep', ['30'], { stdio: 'ignore' })
+  const savedTz = process.env.TZ
+  process.env.TZ = 'Asia/Tokyo'
+  try {
+    await once(child, 'spawn')
+    const pid = child.pid as number
+    assert.equal(startedBy(pid, Date.now() + 1000), true)
+    assert.equal(startedBy(pid, Date.now() - 60_000), false)
+    child.kill('SIGKILL')
+    await once(child, 'exit')
+    // A start time ps cannot report never makes a process a later one.
+    assert.equal(startedBy(pid, 0), true)
+  } finally {
+    if (savedTz === undefined) delete process.env.TZ
+    else process.env.TZ = savedTz
+    child.kill('SIGKILL')
+  }
 })

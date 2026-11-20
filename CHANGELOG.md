@@ -452,6 +452,15 @@ versioning or publishing metadata.
   stack trace after it, or a silent `stdio://`. The unix daemon no longer
   refuses to start over a pid file that is empty, holds `0`, or names a
   process that is not listening on the socket.
+- A unix daemon that takes more than 10 seconds to start no longer gets a
+  second daemon beside it. A second `--listen unix://` used to take it for
+  stale after 10 seconds and start too; one of the two then removed the
+  other's socket, and the daemon left without one kept the state database and
+  its Claude runtime open and never exited. The process the pid file names now
+  counts as the daemon for as long as it runs, unless it started after the
+  file was written (a reused pid), and a daemon never removes a socket that
+  still accepts connections: the second one says `app-server already starting`
+  or `already running` and exits 0. (#329)
 - With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
   Code processes one at a time: a new session waits until the previous
   launch has sent its first SDK message, has ended, or has held the slot for

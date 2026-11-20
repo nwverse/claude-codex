@@ -263,6 +263,28 @@ test('a unix listener replaces a stale socket', async () => {
   }
 })
 
+test('a unix listener leaves a socket that another server still listens on', async () => {
+  const dir = await tempDir()
+  const sock = join(dir, 's.sock')
+  const server = net.createServer((socket) => socket.destroy())
+  try {
+    server.listen(sock)
+    await once(server, 'listening')
+    const inode = (await stat(sock)).ino
+    assert.match((await listenError(sock)) ?? '', /EADDRINUSE/)
+    assert.equal((await stat(sock)).ino, inode)
+    const probe = net.createConnection(sock)
+    try {
+      await once(probe, 'connect')
+    } finally {
+      probe.destroy()
+    }
+  } finally {
+    server.close()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('unix daemon exits 1 and leaves a regular file at its socket path alone', {
   timeout: 30_000,
 }, async () => {

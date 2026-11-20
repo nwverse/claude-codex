@@ -2,8 +2,9 @@ import assert from 'node:assert/strict'
 import { type ChildProcess, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
-import { createServer } from 'node:net'
+import { existsSync } from 'node:fs'
+import { lstat, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
+import { connect, createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
@@ -274,6 +275,107 @@ test('a daemon that dies while starting lets the waiting one take over', {
       await assertDaemonReplacesPidFile(state, second)
     })
   } finally {
+    await cleanup(state)
+  }
+})
+
+test('a daemon slow to start is left to finish, not joined by a second one', {
+  timeout: 30_000,
+}, async () => {
+  const state = await setup()
+  try {
+    await withStartingDaemon(state, async ({ other, second }) => {
+      // The second daemon gives up waiting after 10 s. A second daemon here
+      // would remove the first one's socket once both listen, and the one
+      // left without it would never be reached or exit.
+      const stderr = await waitForStderr(second, /already starting|listening on/, 20_000)
+      assert.match(stderr, new RegExp(`already starting at .*\\(pid ${other.pid}\\)`))
+      const code = second.exitCode ?? (await once(second, 'exit'))[0]
+      assert.equal(code, 0)
+      assert.equal(await readFile(state.pidFile, 'utf8'), `${other.pid}\n`)
+    })
+  } finally {
+    await cleanup(state)
+  }
+})
+
+// Another server listening at the path, and the inode of its socket.
+async function socketServer(sock: string): Promise<{ server: Server; inode: number }> {
+  const server = createServer((socket) => socket.destroy())
+  server.listen(sock)
+  await once(server, 'listening')
+  return { server, inode: (await lstat(sock)).ino }
+}
+
+// Whether a server still accepts a connection at the path.
+async function accepts(sock: string): Promise<boolean> {
+  const socket = connect(sock)
+  try {
+    await once(socket, 'connect')
+    return true
+  } catch {
+    return false
+  } finally {
+    socket.destroy()
+  }
+}
+
+test('a socket that still accepts connections is never removed for a stale pid file', {
+  timeout: 15_000,
+}, async () => {
+  const state = await setup()
+  const gone = spawn('true', { stdio: 'ignore' })
+  await once(gone, 'exit')
+  await writeFile(state.pidFile, `${gone.pid}\n`)
+  const { server, inode } = await socketServer(state.sock)
+  try {
+    const daemon = startDaemon(state)
+    try {
+      const stderr = await waitForStderr(daemon, /already running|listening on/)
+      assert.match(stderr, /app-server already running at /)
+      const code = daemon.exitCode ?? (await once(daemon, 'exit'))[0]
+      assert.equal(code, 0)
+    } finally {
+      await stopProcess(daemon)
+    }
+    assert.equal((await lstat(state.sock)).ino, inode)
+    assert.equal(await accepts(state.sock), true)
+    assert.equal(await readFile(state.pidFile, 'utf8'), `${gone.pid}\n`)
+  } finally {
+    server.close()
+    await cleanup(state)
+  }
+})
+
+test('a daemon that finds its socket taken by another one when it binds leaves it', {
+  timeout: 20_000,
+}, async () => {
+  const state = await setup()
+  const daemon = startDaemon(state)
+  let server: Server | undefined
+  try {
+    // Stopped between writing its pid file and binding, while another daemon
+    // that saw no pid file either binds the socket.
+    const deadline = Date.now() + 8000
+    while (!existsSync(state.pidFile) && daemon.exitCode === null && Date.now() < deadline)
+      await delay(5)
+    daemon.kill('SIGSTOP')
+    assert.equal(existsSync(state.pidFile), true, 'the daemon writes its pid file')
+    const taken = await socketServer(state.sock)
+    server = taken.server
+    const stderr = waitForStderr(daemon, /already running|listening on/)
+    daemon.kill('SIGCONT')
+    assert.match(await stderr, /app-server already running at /)
+    const code = daemon.exitCode ?? (await once(daemon, 'exit'))[0]
+    assert.equal(code, 0)
+    assert.equal((await lstat(state.sock)).ino, taken.inode)
+    assert.equal(await accepts(state.sock), true)
+    // The pid file it wrote goes with it.
+    assert.equal(existsSync(state.pidFile), false)
+  } finally {
+    daemon.kill('SIGCONT')
+    await stopProcess(daemon)
+    server?.close()
     await cleanup(state)
   }
 })
