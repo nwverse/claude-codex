@@ -23,7 +23,9 @@ import {
   delay,
   JsonLineReader,
   json,
+  manualBackgroundReports,
   nextNotification,
+  releaseBackgroundReport,
   spawnMockAdapter,
   startMockThread,
   stopProcess,
@@ -209,6 +211,70 @@ test('unix daemon keeps active turns alive across peer reconnect', async () => {
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('unix daemon idle exit waits for a queued message that starts after the client left', {
+  timeout: 30_000,
+}, async () => {
+  const daemon = await startIdleExitDaemon()
+  try {
+    const threadId = await daemon.startThread()
+    // A mock reply streams a character every few milliseconds: the first turn
+    // still runs when the message is queued, and the queued one runs well past
+    // the idle timeout.
+    await daemon.call('turn/start', { threadId, input: textInput(`first ${'x'.repeat(100)}`) })
+    await daemon.call('thread/queue/add', { threadId, input: textInput(`next ${'y'.repeat(200)}`) })
+    await daemon.disconnect()
+
+    assert.equal(await waitForExit(daemon.proc, 20_000), 0)
+    const store = new SessionStore(daemon.statePath)
+    try {
+      const turns = store.listTurns(threadId)
+      assert.deepEqual(
+        turns.map((turn) => turn.status),
+        ['completed', 'completed'],
+        JSON.stringify(turns.map((turn) => turn.error)),
+      )
+      assert.deepEqual(store.listQueue(threadId), [])
+    } finally {
+      store.close()
+    }
+  } finally {
+    await daemon.close()
+  }
+})
+
+test('unix daemon idle exit leaves alone a turn that starts while it counts down', {
+  timeout: 30_000,
+}, async () => {
+  const daemon = await startIdleExitDaemon(manualBackgroundReports)
+  try {
+    const threadId = await daemon.startThread()
+    await daemon.call('turn/start', {
+      threadId,
+      input: textInput('background subagent check answer=1000'),
+    })
+    await daemon.next((message) => message.method === 'turn/completed')
+    await daemon.disconnect()
+    // The agent reports with no client connected. Nothing runs then, so the
+    // idle timer starts; Claude's answer to the report outlasts it.
+    releaseBackgroundReport(daemon.proc, threadId)
+
+    assert.equal(await waitForExit(daemon.proc, 20_000), 0)
+    const store = new SessionStore(daemon.statePath)
+    try {
+      const turns = store.listTurns(threadId)
+      assert.deepEqual(
+        turns.map((turn) => turn.status),
+        ['completed', 'completed'],
+        JSON.stringify(turns.map((turn) => turn.error)),
+      )
+    } finally {
+      store.close()
+    }
+  } finally {
+    await daemon.close()
   }
 })
 
@@ -1623,6 +1689,87 @@ async function nextTurnCompleted(
       return { completed: message.params.turn, methods }
   }
   throw new Error(`turn/completed never arrived for ${turnId}`)
+}
+
+// A mock unix daemon that exits 200 ms after its last client left and nothing
+// runs, with one client connected to it.
+async function startIdleExitDaemon(env: Record<string, string> = {}) {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  // A socket in a folder of its own: another program on the machine that
+  // finds a daemon socket in the shared temp dir and connects would keep the
+  // daemon from going idle.
+  const sock = join(home, 'd.sock')
+  const debugLogPath = join(home, 'debug.jsonl')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_HOME: join(home, 'adapter'),
+      CLAUDE_CODEX_DEBUG_LOG: debugLogPath,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_IDLE_EXIT_MS: '200',
+      NODE_NO_WARNINGS: '1',
+      ...env,
+    },
+  })
+  let ws: WebSocket | null = null
+  const close = async () => {
+    terminateWebSocket(ws)
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+  try {
+    await waitForStderr(proc, /listening on/)
+    ws = new WebSocket('ws://localhost/', {
+      createConnection: (() => net.createConnection(sock)) as typeof net.createConnection,
+    })
+    const reader = new WebSocketJsonReader(ws)
+    await once(ws, 'open')
+    const client = ws
+    let nextId = 1
+    const call = async (method: string, params: Record<string, unknown>) => {
+      const id = nextId++
+      client.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+      const response = await reader.nextResponse(id)
+      assert.equal(response.error, undefined, `${method}: ${response.error?.message}`)
+      return response.result
+    }
+    return {
+      proc,
+      statePath: join(home, 'adapter', 'state.sqlite'),
+      call,
+      startThread: async (): Promise<string> =>
+        (
+          await call('thread/start', {
+            cwd: home,
+            experimentalRawEvents: false,
+            persistExtendedHistory: false,
+          })
+        ).thread.id,
+      next: async (match: (message: any) => boolean) => {
+        for (;;) {
+          const message = await reader.next()
+          if (match(message)) return message
+        }
+      },
+      // Closes the client, and returns once the daemon has let it go.
+      disconnect: async () => {
+        client.close()
+        await once(client, 'close')
+        for (let waited = 0; ; waited += 10) {
+          const log = await readFile(debugLogPath, 'utf8').catch(() => '')
+          if (log.includes('"event":"peer.close"')) return
+          assert.ok(waited < 10_000, 'the daemon never saw the client go')
+          await delay(10)
+        }
+      },
+      close,
+    }
+  } catch (error) {
+    await close()
+    throw error
+  }
 }
 
 function terminateWebSocket(ws: WebSocket | null): void {
