@@ -493,7 +493,8 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 ```bash
 # JSON Lines debug log (default <adapter home>/debug.jsonl, the adapter home
 # being $CODEX_HOME/claude-codex-adapter unless CLAUDE_CODEX_HOME is set).
-# Exactly "0" or "false" turns it off.
+# Exactly "0" or "false" turns it off. Another path should be in a folder
+# only you can write to (see below), not /tmp.
 # export CLAUDE_CODEX_DEBUG_LOG="/absolute/path/to/debug.jsonl"
 
 # Rotate once the log reaches this many bytes (default 52428800, 50 MiB;
@@ -516,6 +517,13 @@ the log it also tightens a log or rotated copy an earlier version left
 readable, if that is a regular file the adapter owns; a symbolic link and its
 target, a device such as `/dev/stderr` and another user's file keep their mode.
 Keep any copy you make private too.
+
+The adapter appends to the path `CLAUDE_CODEX_DEBUG_LOG` names through any
+symbolic link there, so a value such as `/dev/stderr` works. Point it at a file
+in a folder only you can write to, such as the adapter home, never at a shared
+or world-writable folder such as `/tmp`. There another user could create the
+file first and read what the adapter logs, or leave a link to one of your files
+that the adapter would then append to.
 
 ## WebSocket listener
 
@@ -636,7 +644,7 @@ the profile's `env` or env file.
 | `CLAUDE_CODEX_CODEX_AUTO_COMPACT` | `1` takes `model_auto_compact_token_limit` from the Codex config files (user `config.toml` and trusted project `.codex/config.toml`) as the auto-compact window of Claude threads; off otherwise, since users set it there for Codex models and it would replace their Claude Code window. See [Context compaction](#context-compaction). |
 | `CLAUDE_CODEX_APP_PLUGIN_MCP` | `1` runs the MCP server of the Codex App's bundled `code-review` plugin for the App's Pull Requests panel calls, from the plugin's folder with a short environment allowlist; a comma-separated list names other plugins instead (`codex-app-tools` and `browser-use` never run). Off otherwise; Claude threads never get these servers. The plugin uses the host's GitHub credentials, such as an existing `gh` login; the adapter passes it no token. See [Pull Requests panel](/guide/gui#pull-requests-panel). |
 | `CLAUDE_CODEX_APP_MCP_SERVERS` | `1` lets the App's Settings > MCP servers add, edit, switch off and delete servers, which the adapter keeps in its own config and starts in Claude threads' own turns, below `CLAUDE_CODEX_MCP_SERVERS`. Off otherwise (the default): the page lists no server and every save, switch or delete there fails with a message naming this switch and Claude Code's own MCP config; servers saved earlier stay saved, unused. See [MCP, tools & directories](#mcp-tools-directories). |
-| `CLAUDE_CODEX_ALLOWED_TOOLS` | Pre-approved tools, comma-separated, which run without an approval card. In a read-only sandbox or plan mode only the single `Tool` or `Tool(specifier)` rules for tools that read (Read, Grep, Glob, LS, WebSearch) stay pre-approved; anything else listed, such as `Bash(git log:*)`, WebFetch or an MCP tool, asks or is refused there as an unlisted tool is. A thread switched to read-only while background work or session cron jobs keep its Claude Code process running keeps the old list until that process ends. |
+| `CLAUDE_CODEX_ALLOWED_TOOLS` | Pre-approved tools, comma-separated, which run without an approval card. In a read-only sandbox or plan mode only the single `Tool` or `Tool(specifier)` rules for tools that read (Read, Grep, Glob, LS, WebSearch) stay pre-approved; anything else listed, such as `Bash(git log:*)`, WebFetch or an MCP tool, asks or is refused there as an unlisted tool is. In plan mode Claude Code itself runs Agent (Task) calls without asking the adapter, listed or not; that is the CLI's behaviour. A thread switched to read-only or plan mode keeps its previous list while background work or session cron jobs keep its Claude Code process running; the new list applies from the first turn after that work ends. |
 | `CLAUDE_CODEX_ADD_DIRS` | Extra directories exposed to Claude. |
 | `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` | Claude Code config folder (such as `~/.claude`) whose `CLAUDE.md`, rules and skills the adapter passes to Claude itself, together with the project's `CLAUDE.md` files, rules and skills. For a Claude CLI started with its setting sources turned off. `AGENTS.md` files reach Claude either way. Its MCP servers, subagents, permission rules and command hooks come along only with the switches below. |
 | `CLAUDE_CODEX_CLAUDE_MCP_SERVERS` | `1` starts the bridged Claude Code config's MCP servers (with approved project `.mcp.json` servers) in Claude threads and lists them in the App's MCP panel; off otherwise. Needs `CLAUDE_CODEX_CLAUDE_CONFIG_DIR`. See [Inherited configuration](https://github.com/nwverse/claude-codex#inherited-configuration). |
@@ -677,7 +685,7 @@ the profile's `env` or env file.
 | `CLAUDE_CODEX_REAP_ORPHANED_CLI` | `0` stops the adapter from ending Claude CLI processes a previous adapter left running (on by default; never on Windows). |
 | `CLAUDE_CODEX_MOCK` | Run the protocol without Claude credentials. |
 | `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS` | How long a state-database write waits for another connection's lock before it fails (default `5000`). |
-| `CLAUDE_CODEX_DEBUG_LOG` | Debug log path (default `debug.jsonl` in the adapter home); `0` or `false` turns it off. See [Debug log](#debug-log). |
+| `CLAUDE_CODEX_DEBUG_LOG` | Debug log path (default `debug.jsonl` in the adapter home); `0` or `false` turns it off. Keep another path in a folder only you can write to, not `/tmp`. See [Debug log](#debug-log). |
 | `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` / `_KEEP` | Size at which the debug log rotates (default 50 MiB; `0` never rotates) and how many rotated files stay (default `3`). |
 | `CLAUDE_CODEX_RUN_LOG` | Run registry, the JSON Lines file of thread, turn and subagent events (default `runs.jsonl` in the adapter home); `0` or `false` turns it off. See [Run registry](/reference/workflow-operations#run-registry). |
 | `CLAUDE_CODEX_HTTP_*`, `CLAUDE_CODEX_CLAUDE_P_*` | Tuning for the `agent-http`, `agentapi` and `claude-p` backends. See [agent-http and agentapi settings](/guide/backends#agent-http-and-agentapi-settings) and [claude-p](/guide/backends#claude-p). |

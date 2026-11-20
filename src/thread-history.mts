@@ -1,8 +1,8 @@
 // Codex's paged views of a thread's history: thread/turns/list,
-// thread/items/list, thread/timeline/list, the two searches and the turns a
-// fork keeps. A thread's turns come from the store whole, so cursors are
-// positions in them. A page asking for a cursor, turn or item the thread does
-// not have is an invalid request.
+// thread/items/list, thread/items/read, thread/timeline/list, the two
+// searches and the turns a fork keeps. A thread's turns come from the store
+// whole, so cursors are positions in them. A page asking for a cursor, turn
+// or item the thread does not have is an invalid request.
 
 import { invalidRequest } from './host-methods.mjs'
 import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
@@ -149,6 +149,30 @@ export function pageItems(
     nextCursor: index >= 0 && index < entries.length ? String(index) : null,
     backwardsCursor: data.length > 0 ? String(start) : null,
   }
+}
+
+// thread/items/read: the items of one turn that `itemIds` names, in the
+// turn's order; an id the turn does not have is left out. Codex limits a
+// read to 1 to 100 ids. The App reads an item whose output a page marked
+// outputDeferred, which no page here does, so the items come whole.
+export function readItems(
+  turns: TurnRecord[],
+  params: { turnId: string; itemIds: unknown },
+): ThreadItemEntry[] {
+  const ids = params.itemIds
+  if (
+    !Array.isArray(ids) ||
+    ids.length < 1 ||
+    ids.length > 100 ||
+    !ids.every((id) => typeof id === 'string')
+  )
+    throw invalidRequest('itemIds must contain 1 to 100 IDs')
+  const turn = turns.find((candidate) => candidate.id === params.turnId)
+  if (!turn) throw invalidRequest(`turn not found: ${params.turnId}`)
+  const wanted = new Set<unknown>(ids)
+  return historyItems(turn)
+    .filter((item) => wanted.has(item.id))
+    .map((item) => ({ turnId: turn.id, item, startedAtMs: null, completedAtMs: null }))
 }
 
 export type TimelineEntry =

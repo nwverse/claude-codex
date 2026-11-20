@@ -530,6 +530,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'Pick auto-review in a Claude chat on a model with auto mode and have Claude delete a build folder: the picker stays on auto-review, and a blocked call shows as declined with the review reason. On a model without auto mode the picker returns to the default with a config warning, and approval cards show as before.',
   },
+  {
+    id: 'thread-read-state',
+    app: "With the threadReadState gate on, syncs a thread's unread dot with the app-server only once thread/read or thread/list has returned a readState for that thread, and writes changes with thread/readState/update. An update answered with -32601 makes it keep the dot to itself for the rest of the connection.",
+    adapter:
+      "Returns no readState for a Claude chat, and answers thread/readState/update with -32601 (durable thread read state unavailable), as Codex does without its state database. A native Codex chat's read state belongs to its Codex child: thread/read and thread/readState/update go to the child, so an update the App sends for one never turns read state off for the connection.",
+    verify:
+      'In the bundle, the read-state sync still gives up before thread/readState/update while thread/read has no readState, and still turns itself off when the update fails with -32601. Let a chat finish a turn while another one is open: its unread dot shows, and opening it clears the dot; with CLAUDE_CODEX_NATIVE_CODEX=on, the same holds for a Codex chat.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the
