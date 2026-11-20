@@ -98,16 +98,25 @@ function watchEntry(path: string, onEntry: () => void): () => void {
   // Watches the nearest existing folder unless it is watched already, then
   // checks again: a folder further down may have appeared before the new
   // watch started. At most one move per level, so a folder that keeps being
-  // replaced cannot hold it here.
+  // replaced cannot hold it here. Throws only when no watch could start; a
+  // move that fails (the folder gone again, or out of watches) keeps the
+  // current watch.
   const anchor = (): void => {
     for (let level = path.split(sep).length; level > 0; level--) {
       const dir = nearestFolder(parent)
       if (dir.path === watched?.path && dir.id === watched.id) return
       // The entry's own name, or the first missing directory on the way to it.
       const name = relative(dir.path, path).split(sep)[0] ?? ''
-      const next = watch(dir.path, { persistent: false }, (_eventType, filename) => {
-        onEvent(dir.path === parent && isEntryEvent(filename, name))
-      })
+      let next: FSWatcher
+      try {
+        next = watch(dir.path, { persistent: false }, (_eventType, filename) => {
+          onEvent(dir.path === parent && isEntryEvent(filename, name))
+        })
+      } catch (error) {
+        if (!watcher) throw error
+        debugLog('fs_watch_error', { path: dir.path, error: String(error) })
+        return
+      }
       logErrors(next, dir.path)
       watcher?.close()
       watcher = next
@@ -116,23 +125,13 @@ function watchEntry(path: string, onEntry: () => void): () => void {
   }
   const onEvent = (aboutEntry: boolean): void => {
     const was = watched
-    try {
-      anchor()
-    } catch (error) {
-      debugLog('fs_watch_error', { path, error: String(error) })
-    }
+    anchor()
     // After a move the entry may exist (created before the watch got down to
     // it) or be gone with the folder the watch was on.
     if (aboutEntry || (watched !== was && (was?.path === parent || entryExists(path)))) onEntry()
   }
-  const close = (): void => watcher?.close()
-  try {
-    anchor()
-  } catch (error) {
-    close()
-    throw error
-  }
-  return close
+  anchor()
+  return () => watcher?.close()
 }
 
 // Whether an event in a watched folder may be about its entry `name`; one
@@ -159,7 +158,11 @@ function symlinkTarget(path: string): string | null {
 }
 
 // An existing folder. `id` tells it apart from one created later at the same
-// path: on Linux a watch stays with the folder it was started on.
+// path, since on Linux a watch stays with the folder it was started on. The
+// birth time is part of it because ext4 often gives a folder created right
+// after another was deleted the old inode number. Where Linux lacks statx,
+// Node reports the change time as birth time, and a change inside the folder
+// starts a new watch on it: extra work, but no loop.
 interface Folder {
   path: string
   id: string
@@ -169,7 +172,7 @@ interface Folder {
 function nearestFolder(path: string): Folder {
   for (let dir = path; ; dir = dirname(dir)) {
     const stats = directoryStats(dir)
-    if (stats) return { path: dir, id: `${stats.dev}:${stats.ino}` }
+    if (stats) return { path: dir, id: `${stats.dev}:${stats.ino}:${stats.birthtimeMs}` }
     if (dirname(dir) === dir) return { path: dir, id: '' }
   }
 }
@@ -187,10 +190,11 @@ function isDirectory(path: string): boolean {
   return directoryStats(path) !== undefined
 }
 
+// Runs on every event, so a missing folder is not an exception.
 function directoryStats(path: string): Stats | undefined {
   try {
-    const stats = statSync(path)
-    return stats.isDirectory() ? stats : undefined
+    const stats = statSync(path, { throwIfNoEntry: false })
+    return stats?.isDirectory() ? stats : undefined
   } catch {
     return undefined
   }
