@@ -15,7 +15,12 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join } from 'node:path'
-import { CLAUDE_SESSION_UUID, relocateClaudeTranscript } from './claude-session-relocation.mjs'
+import {
+  assertTranscriptGone,
+  CLAUDE_SESSION_UUID,
+  relocateClaudeTranscript,
+  transcriptStat,
+} from './claude-session-relocation.mjs'
 
 // Extended cache TTL for 1-hour prompt caching
 if (!process.env.ANTHROPIC_BETAS) {
@@ -341,6 +346,9 @@ interface LiveSession {
   // Settles once the first prompt is sent, when the session has to switch
   // permission modes first; a steer must not overtake it.
   firstPrompt: Promise<void> | null
+  // The thread's session whose transcript is gone, until this new session
+  // has started in its place and the user has heard so.
+  lostSession: string | null
   closed: boolean
 }
 
@@ -922,10 +930,6 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       context.model,
       context.claudeSessionCwd,
     )
-    if (!resume && context.claudeSessionId && CLAUDE_SESSION_UUID.test(context.claudeSessionId))
-      throw new Error(
-        `Cannot resume Claude session ${context.claudeSessionId}: its transcript is missing from the configured workspace`,
-      )
     if (resume) opts.resume = resume
     if (resume && context.forkSession) opts.forkSession = true
     // A rewound thread continues from one of its own checkpoints. Forking
@@ -1268,7 +1272,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (decision.decision === 'cancel') {
         return { behavior: 'deny', message: 'cancelled by user', interrupt: true }
       }
-      return { behavior: 'deny', message: 'declined by user' }
+      return { behavior: 'deny', message: decision.message ?? 'declined by user' }
     }
   }
 
@@ -1465,6 +1469,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         idleTimer: null,
         chain: Promise.resolve(),
         firstPrompt: null,
+        lostSession: null,
         closed: false,
       }
       // Without the launch gate the CLI starts right away, else once the
@@ -1512,6 +1517,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private startCli(sdk: ClaudeSdk, session: LiveSession): void {
     const context = session.lastContext
     const options = this.buildOptions(sdk, context, session.abort, () => session)
+    // The thread's Claude session is certainly gone (sdkResumeSessionId), so
+    // a new session starts; its id replaces the old one once it has started.
+    const missing = context.claudeSessionId
+    if (!options.resume && missing && CLAUDE_SESSION_UUID.test(missing))
+      session.lostSession = missing
     session.transcriptEnv = (options.env as NodeJS.ProcessEnv | undefined) ?? process.env
     if (session.reusable) this.trackCronJobs(context, options, session.transcriptEnv)
     if (session.current) {
@@ -1526,6 +1536,29 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       commandOutputPollMs(),
     )
     this.readCliVersion(session, session.query)
+  }
+
+  // Before anything Claude says in the new session, the turn says it goes on
+  // without the earlier context. A CLI that fails to start says nothing.
+  private async reportMissingSession(session: LiveSession) {
+    const claudeSessionId = session.lostSession
+    session.lostSession = null
+    debugLog('native.session.transcript_missing', { threadId: session.threadId, claudeSessionId })
+    const pending = session.current
+    if (!pending || pending.resolved) return
+    try {
+      await pending.handlers.onEvent({
+        type: 'notice',
+        level: 'warning',
+        message:
+          'The earlier Claude conversation of this chat could not be found, so this message starts a new Claude session without that context.',
+      })
+    } catch (error) {
+      debugLog('native.session.transcript_missing_report_failed', {
+        threadId: session.threadId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
   }
 
   // The initialize reply names the CLI's version from Claude Code 2.1.296
@@ -1922,6 +1955,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       session.cliRunning = true
       session.unsettled = false
     }
+    if (init && session.lostSession) await this.reportMissingSession(session)
     const sink = session.sink
     if (
       sink &&
@@ -4018,7 +4052,10 @@ function derivePermissionMode(
   if (envOverride) return envOverride
   if (planMode) return 'plan'
   if (sandboxMode === 'danger-full-access' || approvalPolicy === 'never') return 'default'
-  if (approvalPolicy === 'on-failure') return 'acceptEdits'
+  // acceptEdits runs edits in the workspace without canUseTool, so only a
+  // sandbox that lets the workspace be written takes it; anywhere else an
+  // edit asks.
+  if (approvalPolicy === 'on-failure' && sandboxMode === 'workspace-write') return 'acceptEdits'
   return 'default'
 }
 
@@ -4670,14 +4707,16 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null
 }
 
-// The session to resume, or null when no config dir has its transcript. The
-// CLI resumes it from the config dir it runs from: a model process profile's
-// (`configRoot`), else the adapter's (CLAUDE_CONFIG_DIR or ~/.claude), or, for
-// a custom CLI such as a model router, the router config dir named after
-// `model`. When the newest copy of the transcript is elsewhere (the session
-// ran on another model or router), it is copied into that one config dir,
-// unless the copy there is as new or longer. A profile's transcripts are only
-// resumed from its own config dir and never copied in from another one.
+// The session to resume, or null when no config dir has its transcript; a
+// Claude session whose transcript may only be out of reach throws instead
+// (see assertTranscriptGone). The CLI resumes it from the config dir it runs
+// from: a model process profile's (`configRoot`), else the adapter's
+// (CLAUDE_CONFIG_DIR or ~/.claude), or, for a custom CLI such as a model
+// router, the router config dir named after `model`. When the newest copy of
+// the transcript is elsewhere (the session ran on another model or router),
+// it is copied into that one config dir, unless the copy there is as new or
+// longer. A profile's transcripts are only resumed from its own config dir
+// and never copied in from another one.
 export function sdkResumeSessionId(
   value: string | null,
   cwd?: string,
@@ -4694,16 +4733,22 @@ export function sdkResumeSessionId(
     return value
   const roots = configRoot ? [configRoot] : [runRoot, ...knownConfigRoots()]
   let source: TranscriptCopy | null = null
+  const failures: string[] = []
   for (const root of new Set(roots)) {
     const files = slugs.map((slug) => join(root, 'projects', slug, `${value}.jsonl`))
     files.push(join(root, 'sessions', `${value}.jsonl`))
     for (const file of files) {
-      const stat = regularFileStat(file)
+      // Only the CLI's own config folder can leave its transcript out of
+      // reach; one it does not run from is skipped as before.
+      const stat = transcriptStat(file, root === runRoot ? failures : [])
       // The newest copy wins; on a tie, the one already in the run root.
       if (stat && (!source || stat.mtimeMs > source.stat.mtimeMs)) source = { file, stat }
     }
   }
-  if (!source) return null
+  if (!source) {
+    if (CLAUDE_SESSION_UUID.test(value)) assertTranscriptGone(value, runRoot, failures)
+    return null
+  }
   for (const slug of slugs) {
     mirrorTranscript(value, source, join(runRoot, 'projects', slug, `${value}.jsonl`))
   }
