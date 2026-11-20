@@ -139,3 +139,48 @@ test('archiving a chat mid-turn interrupts its turn', async () => {
     assert.equal(app.store.getThread(threadId)?.archived, true)
   })
 })
+
+test('archiving a chat interrupts a turn the user runs on its subagent thread', async () => {
+  const interrupts: string[] = []
+  const releases = new Map<string, () => void>()
+  const runtime = scriptedRuntime(
+    async (context, handlers) => {
+      await handlers.onEvent({ type: 'text_delta', delta: 'Working. ' })
+      await new Promise<void>((resolve) => releases.set(context.turnId, resolve))
+      await handlers.onEvent({ type: 'completed', success: true, result: 'Working. Done.' })
+    },
+    {
+      interrupt: async (threadId) => {
+        interrupts.push(threadId)
+      },
+    },
+  )
+  await withInProcessApp(runtime, async (app) => {
+    const parent = await app.startThread()
+    const { thread: child } = await app.request('thread/fork', {
+      threadId: parent,
+      threadSource: 'subagent',
+    })
+    const turnId = await app.startTurn(child.id, 'a question for the agent itself')
+    await app.waitFor(() => releases.get(turnId))
+
+    await app.request('thread/archive', { threadId: parent })
+    assert.deepEqual(interrupts, [child.id])
+    assert.equal((await app.turnCompleted(turnId)).status, 'interrupted')
+    assert.equal(app.store.getThread(child.id)?.archived, true)
+    assert.equal(app.server.hasActiveTurns(), false)
+    // The run returning later does not complete the turn after all.
+    releases.get(turnId)?.()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(app.store.getTurn(turnId)?.status, 'interrupted')
+
+    // Nor does a review or compaction start in the archived thread.
+    for (const [method, params] of [
+      ['review/start', { target: { type: 'uncommittedChanges' } }],
+      ['thread/compact/start', {}],
+    ] as const) {
+      const reply = await app.call(method, { threadId: child.id, ...params })
+      assert.match(reply.error?.message ?? 'accepted', /archived thread/, method)
+    }
+  })
+})

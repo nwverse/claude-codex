@@ -270,6 +270,16 @@ versioning or publishing metadata.
   `isFile`, `isDirectory` and the times still describe its target, and a
   dangling link returns the link's own metadata instead of failing with
   `ENOENT`; a missing path or a symlink loop still fails. (#271)
+- `fs/watch` on a symlinked file reports changes to the file it points to
+  again, under the link's path, and follows the link when it is re-pointed.
+  Since #267 it only noticed the link itself being replaced.
+  A file whose directory does not exist yet (`.git/HEAD` before `git init`)
+  is watched from the nearest existing folder, as Codex does, instead of
+  failing with `ENOENT`. (#333)
+- `fs/readDirectory` lists a symlink as the file or folder it points to, as
+  `fs/getMetadata` and Codex do, and leaves out a dangling link. Linked files
+  such as `CLAUDE.md -> AGENTS.md` and linked package folders used to show as
+  neither. (#333)
 - `fs/copy` keeps symlink targets as written, so a relative link in a
   recursive copy stays relative instead of pointing back into the source
   tree, and writing through the copy no longer changes the source. (#270)
@@ -277,6 +287,14 @@ versioning or publishing metadata.
   (`-32600`) while a turn runs or is still starting on the thread. They used
   to start a second Claude run that took over the thread, and the running
   turn's remaining output was lost. (#240, #241)
+- Deleting or archiving a chat interrupts a turn the user runs directly on
+  one of its subagent threads, as it does the chat's own turn. A deleted
+  thread's turn used to keep the adapter busy for good: the daemon never
+  idle-exited and the keep-awake guard stayed on. A review, compaction or
+  Claude follow-up no longer starts on a chat that `thread/delete` is
+  removing (nor a review or compaction on an archived chat), and the App
+  hears nothing more of a deleted thread, such as a `turn/completed` still
+  marked `inProgress`. (#328)
 - Startup recovery streams the completed history and rechecks a turn before
   repairing its activity markers. A report another adapter finished while
   recovery was scanning stays in the conversation.
@@ -1260,6 +1278,10 @@ versioning or publishing metadata.
   entries the same task id and priority as REST exports. A pull request
   queued before gets a new `github-pull-request-N-*` id on its next ingest.
   (#272)
+- An option value that starts with `--`, such as `--prompt "--dry-run
+  first"` or an `--error` holding a diff, is refused with a hint to write
+  `--name=value`, which keeps it as given. It used to be saved as `true`, as
+  was a value option given last without a value. (#333)
 
 ### Rust-first protocol groundwork
 
