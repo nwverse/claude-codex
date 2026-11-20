@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { MockRuntime } from '../src/mock-runtime.mjs'
@@ -65,6 +67,41 @@ test('a process without a pty that reaches timeoutMs is stopped with its group a
   })
 })
 
+// A process can exit while a child it left in the background holds its pipes
+// open. As command/exec answers, its exit comes after a bounded drain of its
+// output, with its handle free again: process/kill and timeoutMs, which would
+// signal only the process that has gone, could not end the wait.
+test('a process without a pty reports its exit while a child it left holds its pipes', {
+  timeout: 20_000,
+}, async () => {
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    const pidFile = join(app.home, 'background.pid')
+    let background = 0
+    try {
+      await app.request('process/spawn', {
+        processHandle: 'p',
+        command: ['sh', '-c', 'sleep 30 & echo $! > "$0"; echo out; echo err >&2; exit 3', pidFile],
+        cwd: app.home,
+      })
+      background = Number(await app.waitFor(() => readFileOr(pidFile) || undefined))
+
+      const exit = await app.waitFor(() => exitOf(app, 'p'), 10_000)
+      assert.deepEqual(exit, {
+        processHandle: 'p',
+        exitCode: 3,
+        stdout: 'out\n',
+        stdoutCapReached: false,
+        stderr: 'err\n',
+        stderrCapReached: false,
+      })
+      assert.ok(isAlive(background), 'the child it left was stopped')
+      await app.request('process/spawn', { processHandle: 'p', command: ['true'], cwd: app.home })
+    } finally {
+      if (background && isAlive(background)) process.kill(background, 'SIGKILL')
+    }
+  })
+})
+
 // The pty bridge stops its shell's session itself (SIGTERM, then SIGKILL)
 // when told to; a SIGTERM to the bridge left a shell ignoring SIGHUP running.
 test('a terminal that reaches timeoutMs has its shell stopped', { timeout: 20_000 }, async () => {
@@ -98,6 +135,14 @@ function printedPids(app: InProcessApp, processHandle: string): number[] | undef
     .join('')
   const found = /^(\d+)(?: (\d+))?\r?\n/.exec(printed)
   return found ? found.slice(1).filter(Boolean).map(Number) : undefined
+}
+
+function readFileOr(path: string): string {
+  try {
+    return readFileSync(path, 'utf8')
+  } catch {
+    return ''
+  }
 }
 
 function exitOf(app: InProcessApp, processHandle: string): unknown {
