@@ -1240,6 +1240,16 @@ versioning or publishing metadata.
   SendMessage to an older agent reopens its child thread as one to an agent
   from before a restart does, and that lookup now finds the agent by name,
   also in a chat with more than 200 agents. (#350)
+- **Behavior change:** a Codex (`gpt-*`) chat on the `codex-proxy` route that
+  has no sandbox stored runs `codex exec` with `-s workspace-write`, the
+  sandbox the App shows for it. It used to run with
+  `--dangerously-bypass-approvals-and-sandbox`, with no sandbox and no
+  approvals. A chat ends up with no sandbox when `thread/resume`,
+  `thread/metadata/update` or `thread/fork` names a value the adapter does not
+  know, and older threads can have none. Its commands now get Codex's
+  workspace-write rules, network included (restricted unless the user's Codex
+  config allows it). Only a Full Access (`danger-full-access`) chat runs
+  unsandboxed. (#349)
 - Follow-up turns of a Codex (`gpt-*`) chat on the `codex-proxy` route run
   in the thread's folder with its sandbox mode and extra writable roots
   (`CLAUDE_CODEX_ADD_DIRS`) again. `codex exec resume` was run without `-C`,
