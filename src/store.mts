@@ -1710,13 +1710,16 @@ export class SessionStore {
   // adapter finds it. The user's turns open with their message (or a tool's
   // output); a review's message comes with its enteredReviewMode item, and a
   // standalone shell command, compaction, goal continuation or Claude's own
-  // follow-up opens with none.
+  // follow-up opens with none. Items SQLite cannot parse (JSON.parse takes
+  // nesting deeper than its limit of 1000) count as the user's, so such a
+  // turn can release a hold but never keep one.
   interruptedSinceUserTurn(threadId: string): boolean {
     const row = this.db
       .prepare(
-        `SELECT status FROM turns WHERE thread_id = ? AND (status = 'interrupted'
-           OR (json_extract(items_json, '$[0].type') IN ('userMessage', 'functionCallOutput')
-             AND json_extract(items_json, '$[1].type') IS NOT 'enteredReviewMode'))
+        `SELECT status FROM turns WHERE thread_id = ? AND CASE
+           WHEN status = 'interrupted' OR NOT json_valid(items_json) THEN 1
+           ELSE json_extract(items_json, '$[0].type') IN ('userMessage', 'functionCallOutput')
+             AND json_extract(items_json, '$[1].type') IS NOT 'enteredReviewMode' END
          ORDER BY started_at DESC, rowid DESC LIMIT 1`,
       )
       .get(threadId) as { status?: unknown } | undefined

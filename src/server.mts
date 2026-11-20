@@ -3119,9 +3119,21 @@ export class CodexClaudeAppServer {
   // turn of their own (thread/queue/start runs one). A shell command, review,
   // compaction, goal continuation or Claude's own follow-up in between leaves
   // the hold as it was. Until this process starts a turn on the thread, the
-  // stored turns say, so a hold outlives a restart.
+  // stored turns say, so a hold outlives a restart. Should they fail to say,
+  // the newest turn does, as before: this also runs where a throw would stop
+  // the daemon (a follow-up after a turn ends).
   private queueHeld(threadId: string): boolean {
-    return this.queueHolds.get(threadId) ?? this.store.interruptedSinceUserTurn(threadId)
+    const held = this.queueHolds.get(threadId)
+    if (held !== undefined) return held
+    try {
+      return this.store.interruptedSinceUserTurn(threadId)
+    } catch (error) {
+      debugLog('queue.hold_unreadable', {
+        threadId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return this.store.lastTurnStatus(threadId) === 'interrupted'
+    }
   }
 
   // Pins the hold in memory before turn/start stores a turn: the stored
