@@ -21,11 +21,13 @@ import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { query, type SpawnOptions } from '@anthropic-ai/claude-agent-sdk'
 import { claudeAgents, frontmatterData } from '../src/claude-agents.mjs'
+import { listClaudeHooks } from '../src/claude-capabilities.mjs'
 import {
   claudeGlobalConfigPath,
   claudeMcpServers,
   claudePermissionRules,
   claudeTrustsProject,
+  readJsonFile,
   repositorySupplied,
 } from '../src/claude-config.mjs'
 import { claudeHookSpecs } from '../src/claude-hooks.mjs'
@@ -40,6 +42,7 @@ import {
   gitVouchesForCheckout,
   type InheritedMcpServer,
   mainRepositoryRoot,
+  readTomlFile,
   verbatim,
 } from '../src/codex-config.mjs'
 import { notifyPayload } from '../src/codex-notify.mjs'
@@ -250,6 +253,62 @@ x = 1
   assert.throws(() => parseToml('a = 1\na = 2'), /TOML line 2: duplicate key a/)
   assert.throws(() => parseToml('a = "open'), /unterminated string/)
   assert.throws(() => parseToml('[table'), /unterminated table header/)
+})
+
+test('settings and config files that do not parse are reported quoting none of their text', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-unparsable-'))
+  const home = join(root, 'home')
+  const project = join(root, 'project')
+  const log = join(root, 'debug.jsonl')
+  const userSettings = join(home, '.claude', 'settings.json')
+  const localSettings = join(project, '.claude', 'settings.local.json')
+  const codexConfig = join(home, '.codex', 'config.toml')
+  // A fake credential pasted without its quotes, as a hand edit can leave it.
+  const token = 'ghp_DUMMY0123456789abcdef'
+  try {
+    await write(userSettings, `{\n  "env": {\n    "GITHUB_TOKEN": ${token}\n  }\n}\n`)
+    await write(localSettings, `{"env": {"GITHUB_TOKEN": '${token}'}}\n`)
+    await write(codexConfig, `[mcp_servers.github.env]\nGITHUB_PERSONAL_ACCESS_TOKEN = ${token}\n`)
+    const errors = await withEnv(
+      { HOME: home, CLAUDE_CODEX_CLAUDE_CONFIG_DIR: undefined, CLAUDE_CODEX_DEBUG_LOG: log },
+      async () => {
+        assert.equal(readJsonFile(userSettings), null)
+        assert.equal(readJsonFile(localSettings), null)
+        assert.equal(readTomlFile(codexConfig), null)
+        return listClaudeHooks({ cwds: [project] })[0]?.errors
+      },
+    )
+    // hooks/list tells the App which settings files it skipped, and why.
+    assert.deepEqual(errors, [
+      { path: userSettings, message: "Unexpected token 'g'" },
+      { path: localSettings, message: "Unexpected token '''" },
+    ])
+    const logged = (await readFile(log, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    assert.deepEqual(
+      logged.map(({ event, path, error }) => ({ event, path, error })),
+      [
+        { event: 'claude_config_unreadable', path: userSettings, error: "Unexpected token 'g'" },
+        { event: 'claude_config_unreadable', path: localSettings, error: "Unexpected token '''" },
+        {
+          event: 'codex_config_unreadable',
+          path: codexConfig,
+          error: 'TOML line 2: invalid value',
+        },
+      ],
+    )
+    // Not even the start of the token, which JSON.parse may clip.
+    assert.doesNotMatch(JSON.stringify([errors, logged]), /ghp_|DUMMY/)
+    const tomlError = (source: string, message: string) =>
+      assert.throws(() => parseToml(source), { message: `TOML line 1: ${message}` })
+    tomlError(`a = "${token}" ${token}`, 'expected the end of the line')
+    tomlError(`a = "${token}\\q"`, 'invalid escape')
+    tomlError(`a = "${token}\\UFFFFFFFF"`, 'invalid unicode escape')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('Codex config MCP servers become SDK server configs', async () => {

@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -171,6 +172,10 @@ export function debugLog(event: string, data: Record<string, unknown> = {}): voi
     let file = debugLogFiles.get(path)
     if (!file) {
       ensureParent(path)
+      // The log holds commands, tool input and stderr excerpts. It is created
+      // owner-only below; a log and its rotated copies left by an older version
+      // or another program are tightened here, once per process.
+      for (let i = 0; i <= debugLogKeep(); i += 1) ownerOnly(i === 0 ? path : `${path}.${i}`)
       file = { size: 0, checkedAt: Number.NEGATIVE_INFINITY }
       debugLogFiles.set(path, file)
     }
@@ -181,12 +186,12 @@ export function debugLog(event: string, data: Record<string, unknown> = {}): voi
       file.checkedAt = now
     }
     try {
-      appendFileSync(path, line)
+      appendFileSync(path, line, { mode: 0o600 })
     } catch (error) {
       // The log's folder was removed while we ran: recreate it once and retry.
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       ensureParent(path)
-      appendFileSync(path, line)
+      appendFileSync(path, line, { mode: 0o600 })
     }
     file.size += Buffer.byteLength(line)
   } catch {}
@@ -207,6 +212,19 @@ function debugLogMaxBytes(): number {
   return numericEnv('CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', 50 * 1024 * 1024)
 }
 
+function debugLogKeep(): number {
+  return Math.max(1, numericEnv('CLAUDE_CODEX_DEBUG_LOG_KEEP', 3))
+}
+
+// Clears a regular file's group and other permissions. A missing file, or a
+// device such as /dev/stderr named as the log, is left alone.
+function ownerOnly(path: string): void {
+  try {
+    const stat = statSync(path)
+    if (stat.isFile() && (stat.mode & 0o077) !== 0) chmodSync(path, stat.mode & 0o700)
+  } catch {}
+}
+
 // Rotates `path` when it has reached `maxBytes`; returns the active log's size
 // afterwards (0 when it was rotated away or does not exist yet).
 function rotateLog(path: string, maxBytes: number): number {
@@ -217,7 +235,7 @@ function rotateLog(path: string, maxBytes: number): number {
     return 0 // file does not exist yet — nothing to rotate
   }
   if (size < maxBytes) return size
-  const keep = Math.max(1, numericEnv('CLAUDE_CODEX_DEBUG_LOG_KEEP', 3))
+  const keep = debugLogKeep()
   // Drop the oldest slot if it would push us past `keep`.
   const oldest = `${path}.${keep}`
   try {

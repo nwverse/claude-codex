@@ -14,6 +14,8 @@ export function parseToml(source: string): Table {
   let pos = 0
   let current = root
 
+  // Errors reach the debug log, so they name the line and quote no value,
+  // which may be a credential pasted without its quotes.
   const fail = (message: string): never => {
     const line = text.slice(0, pos).split('\n').length
     throw new Error(`TOML line ${line}: ${message}`)
@@ -41,7 +43,7 @@ export function parseToml(source: string): Table {
     if (pos >= text.length) return
     if (text[pos] === '\n') pos++
     else if (text[pos] === '\r' && text[pos + 1] === '\n') pos += 2
-    else fail(`unexpected ${JSON.stringify(text[pos])}`)
+    else fail('expected the end of the line')
   }
 
   const key = (): string => {
@@ -78,11 +80,13 @@ export function parseToml(source: string): Table {
     }
     if (ch && Object.hasOwn(simple, ch)) return simple[ch] ?? ''
     const width = ch === 'x' ? 2 : ch === 'u' ? 4 : ch === 'U' ? 8 : 0
-    if (width === 0) fail(`invalid escape \\${ch ?? ''}`)
+    if (width === 0) fail('invalid escape')
     const hex = text.slice(pos, pos + width)
-    if (!/^[0-9A-Fa-f]+$/.test(hex) || hex.length !== width) fail('invalid unicode escape')
+    const code = Number.parseInt(hex, 16)
+    if (!/^[0-9A-Fa-f]+$/.test(hex) || hex.length !== width || code > 0x10ffff)
+      fail('invalid unicode escape')
     pos += width
-    return String.fromCodePoint(Number.parseInt(hex, 16))
+    return String.fromCodePoint(code)
   }
   const basicString = (): string => {
     pos++
@@ -154,7 +158,7 @@ export function parseToml(source: string): Table {
     if (/^[+-]?\d+$/.test(digits)) return Number(digits)
     if (/^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(digits)) return Number(digits)
     if (/^(\d{4}-\d{2}-\d{2}|\d{2}:\d{2})/.test(token)) return token
-    return fail(`invalid value ${JSON.stringify(token || text[pos] || '')}`)
+    return fail('invalid value')
   }
 
   const value = (): unknown => {

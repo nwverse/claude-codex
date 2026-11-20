@@ -9,6 +9,7 @@ import {
   type InheritedMcpServer,
   mainRepositoryRoot,
 } from './codex-config.mjs'
+import { jsonSyntaxReason } from './json-syntax.mjs'
 import { gitRoot, readText, realPath } from './project-instructions.mjs'
 import { debugLog } from './util.mjs'
 
@@ -48,10 +49,7 @@ export function readJsonFile(path: string): Table | null {
   try {
     value = asTable(JSON.parse(readText(path) ?? ''))
   } catch (error) {
-    debugLog('claude_config_unreadable', {
-      path,
-      error: error instanceof Error ? error.message : String(error),
-    })
+    debugLog('claude_config_unreadable', { path, error: jsonSyntaxReason(error) })
   }
   parsed.set(path, { stamp, value })
   return value

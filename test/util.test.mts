@@ -246,3 +246,30 @@ test('debugLog notices another writer growing the log and still rotates it', asy
     },
   )
 })
+
+test('debugLog keeps the log and its rotated copies readable by the owner alone', async () => {
+  // The log holds commands and tool input, whatever the umask would allow.
+  const umask = process.umask(0o022)
+  const mode = (file: string) => (statSync(file).mode & 0o777).toString(8)
+  try {
+    await withDebugLogEnv(
+      { CLAUDE_CODEX_DEBUG_LOG: '<dir>/debug.jsonl', CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES: '400' },
+      (dir) => {
+        const path = join(dir, 'debug.jsonl')
+        for (let i = 0; i < 20; i += 1) debugLog(`event.${i}`, { i })
+        assert.deepEqual([path, `${path}.1`].map(mode), ['600', '600'])
+      },
+    )
+    // A log and rotated copies an older version left readable are tightened.
+    await withDebugLogEnv({ CLAUDE_CODEX_DEBUG_LOG: '<dir>/debug.jsonl' }, async (dir) => {
+      const path = join(dir, 'debug.jsonl')
+      const files = [path, `${path}.1`, `${path}.3`]
+      for (const file of files) await writeFile(file, '{"event":"old"}\n', { mode: 0o644 })
+      debugLog('new')
+      assert.deepEqual(files.map(mode), ['600', '600', '600'])
+      assert.deepEqual(logEvents(path), ['old', 'new'])
+    })
+  } finally {
+    process.umask(umask)
+  }
+})

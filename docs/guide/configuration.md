@@ -496,7 +496,9 @@ cut at 1200 characters. The App's prompts and steers, streamed text and output
 deltas, diffs, file writes, terminal input and injected items are logged as
 sizes, counts and ids instead of their text. Writing is best-effort: a log that
 cannot be written never fails a turn. Everything else, such as commands, paths
-and bridge URLs, is written as is, so keep the file private.
+and bridge URLs, is written as is, so the adapter keeps the log and its rotated
+copies readable by their owner alone (0600), tightening ones an earlier version
+left readable. Keep any copy you make private too.
 
 ## WebSocket listener
 
