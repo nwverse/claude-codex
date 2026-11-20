@@ -222,6 +222,28 @@ test('a GPT chat runs in the ChatGPT child', async () => {
   }
 })
 
+test("a native chat's deferred items and memory summary come from its child", async () => {
+  const app = startAdapter()
+  try {
+    await initialize(app)
+    const started = await app.request('thread/start', { model: 'gpt-6.1-sol', cwd: app.home })
+    const threadId = started.result.thread.id as string
+    await runTurn(app, threadId, 'decline')
+    for (const [method, params] of [
+      ['thread/items/read', { threadId, turnId: 'turn-old', itemIds: ['c1'] }],
+      ['thread/memory/read', { threadId }],
+    ] as const) {
+      const answer = await app.request(method, params)
+      assert.equal(answer.error, undefined, `${method}: ${JSON.stringify(answer.error)}`)
+      const heard = app.childLog().filter((entry) => entry.method === method)
+      assert.equal(heard.length, 1, method)
+      assert.match(heard[0].params.threadId, /^openai-thread-/)
+    }
+  } finally {
+    await app.stop()
+  }
+})
+
 test('a chat keeps its harness once it has a conversation; a new one can still move', async () => {
   const app = startAdapter()
   try {

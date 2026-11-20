@@ -43,6 +43,10 @@ versioning or publishing metadata.
   the rest of its process group with it, as a stopped one does, so helpers it
   started, such as MCP servers that ignore stdin EOF, no longer run on after
   every crash. (#334)
+- With native mode on, `thread/items/read` and `thread/memory/read` for a
+  native Codex chat go to its Codex child, like the chat's other history
+  requests, so the App can load a command output Codex left out of a history
+  page. (#343)
 
 ### `ws://` listener authentication
 
@@ -252,6 +256,19 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- The eleven requests Codex App 26.1111 added no longer fail with "method
+  not found". `thread/items/read` returns the stored items it names,
+  `thread/memory/read` reports no memory summary, `modelProvider/list` and
+  `accountSession/list` list no Codex model providers or ChatGPT sign-ins,
+  and `thread/sample/cancel` succeeds. Google Cloud setup, model provider
+  writes, workspace switches, feedback bundles (`feedback/save`) and
+  `thread/sample` fail with `-32600` and say why. `thread/readState/update`
+  still answers `-32601`, as Codex does without its state database, so the
+  App keeps unread dots to itself (App rule `thread-read-state`). (#343)
+- `thread/section/move` now sends `thread/section/changed` to every
+  connected client, as Codex does, so a second App window reloads its
+  sidebar sections after a chat moves into, within or out of a section,
+  the pinned one included. (#343)
 - A file the turn diff leaves out (too large, binary or past the size limit)
   shows as a binary change with the reason after it, which renderers show
   without content and `git apply` refuses. It used to be a one-line hunk that

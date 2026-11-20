@@ -85,6 +85,7 @@ import {
   invalidParams,
   invalidRequest,
   invalidRequestIfThrows,
+  METHOD_NOT_FOUND,
   methodNotFound,
   RpcError,
   SERVER_ERROR,
@@ -244,6 +245,7 @@ import {
   pageLimit,
   pageTimeline,
   pageTurns,
+  readItems,
   sortDirectionOr,
   threadSnippet,
 } from './thread-history.mjs'
@@ -1152,6 +1154,8 @@ export class CodexClaudeAppServer {
         return this.historyForPeer(peer, this.threadTurnItemsList(asRecord(params)))
       case 'thread/items/list':
         return this.historyForPeer(peer, this.threadItemsList(asRecord(params)))
+      case 'thread/items/read':
+        return this.historyForPeer(peer, this.threadItemsRead(asRecord(params)))
       case 'thread/timeline/list':
         return this.historyForPeer(peer, this.threadTimelineList(asRecord(params)))
       case 'thread/search':
@@ -1231,9 +1235,13 @@ export class CodexClaudeAppServer {
         throw new Error(
           "memory/reset is not supported: Claude Code keeps its memories in its own per-project folders, shared with Claude Code outside the App. Review or delete them with Claude Code's /memory command.",
         )
-      // Claude Code never consolidates chats into Codex memories.
+      // Claude Code never consolidates chats into Codex memories, so no
+      // thread has a memory summary either.
       case 'memory/status':
         return memoryStatus(asRecord(params))
+      case 'thread/memory/read':
+        this.knownThreadId(asRecord(params))
+        return { summary: null }
       case 'thread/unarchive':
         return this.historyForPeer(peer, this.threadUnarchive(asRecord(params)))
       case 'thread/compact/start':
@@ -1524,12 +1532,25 @@ export class CodexClaudeAppServer {
         return this.fuzzySessionUpdate(peer, asRecord(params))
       case 'fuzzyFileSearch/sessionStop':
         return this.fuzzySessionStop(peer, asRecord(params))
-      // Requests of the protocol that no App build sends. Codex itself answers
-      // thread/prediction/request with method not found, and
-      // thread/readState/update too when it keeps no read state.
-      case 'thread/items/read':
-      case 'thread/prediction/request':
+      // Codex samples one model response on a hidden fork of a thread for the
+      // App's composer predictions, which the App asks only of a thread whose
+      // modelProvider is openai. Claude Code answers only within a turn, with
+      // its tools.
+      // App rule: prediction-provider
+      case 'thread/sample':
+        this.knownThreadId(asRecord(params))
+        throw invalidRequest('thread/sample is not supported: Claude Code answers only in a turn')
+      // No sample ever runs to be cancelled.
+      case 'thread/sample/cancel':
+        return {}
+      // Codex keeps each thread's unread position in its state database and
+      // answers this with method not found when it has none, as the adapter
+      // does: the App then keeps the unread dot to itself.
+      // App rule: thread-read-state
       case 'thread/readState/update':
+        throw new RpcError('durable thread read state unavailable', undefined, METHOD_NOT_FOUND)
+      // Codex itself answers this with method not found; no App build sends it.
+      case 'thread/prediction/request':
         throw methodNotFound(method)
       default: {
         const result = hostMethod(method, asRecord(params))
@@ -2216,6 +2237,11 @@ export class CodexClaudeAppServer {
       isPinned: moved.isPinned === true,
       beforeThreadId,
     })
+    // As Codex does after a move, so every window reloads its sections.
+    this.notifyAll({
+      method: 'thread/section/changed',
+      params: { threadId, sectionId: moved.sectionId ?? null },
+    })
     return {}
   }
 
@@ -2393,6 +2419,15 @@ export class CodexClaudeAppServer {
       limit: pageLimit(params.limit),
       sortDirection: sortDirectionOr(params.sortDirection, 'asc'),
     })
+  }
+
+  private threadItemsRead(params: Record<string, unknown>): unknown {
+    return {
+      data: readItems(this.store.historyTurns(this.knownThreadId(params)), {
+        turnId: stringOr(params.turnId, ''),
+        itemIds: params.itemIds,
+      }),
+    }
   }
 
   private threadTimelineList(params: Record<string, unknown>): unknown {
