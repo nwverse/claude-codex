@@ -82,8 +82,10 @@ export function parseToml(source: string): Table {
     const width = ch === 'x' ? 2 : ch === 'u' ? 4 : ch === 'U' ? 8 : 0
     if (width === 0) fail('invalid escape')
     const hex = text.slice(pos, pos + width)
+    // A Unicode scalar value: no code point past U+10FFFF and no surrogate.
     const code = Number.parseInt(hex, 16)
-    if (!/^[0-9A-Fa-f]+$/.test(hex) || hex.length !== width || code > 0x10ffff)
+    const unicode = code <= 0x10ffff && (code < 0xd800 || code > 0xdfff)
+    if (!/^[0-9A-Fa-f]+$/.test(hex) || hex.length !== width || !unicode)
       fail('invalid unicode escape')
     pos += width
     return String.fromCodePoint(code)

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, statSync } from 'node:fs'
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import test from 'node:test'
 import {
   claudeCodeAtLeast,
@@ -269,7 +270,53 @@ test('debugLog keeps the log and its rotated copies readable by the owner alone'
       assert.deepEqual(files.map(mode), ['600', '600', '600'])
       assert.deepEqual(logEvents(path), ['old', 'new'])
     })
+    // A link at the log's path or at a rotated slot keeps its target's mode,
+    // and no more than 100 old logs are looked at.
+    await withDebugLogEnv(
+      { CLAUDE_CODEX_DEBUG_LOG: '<dir>/logs/debug.jsonl', CLAUDE_CODEX_DEBUG_LOG_KEEP: '1000' },
+      async (dir) => {
+        const path = join(dir, 'logs', 'debug.jsonl')
+        const target = join(dir, 'target.jsonl')
+        const unrelated = join(dir, 'unrelated.txt')
+        await mkdir(join(dir, 'logs'))
+        const files = [target, unrelated, `${path}.100`, `${path}.101`]
+        for (const file of files) await writeFile(file, '', { mode: 0o644 })
+        await symlink(target, path)
+        await symlink(unrelated, `${path}.2`)
+        debugLog('linked')
+        assert.deepEqual(files.map(mode), ['644', '644', '600', '644'])
+        assert.deepEqual(logEvents(target), ['linked'])
+      },
+    )
   } finally {
     process.umask(umask)
+  }
+})
+
+test('debugLog leaves the file stderr writes to alone when stderr is the log', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccx-debuglog-stderr-'))
+  const util = new URL('../src/util.mjs', import.meta.url).href
+  const script = `const { debugLog } = await import(${JSON.stringify(util)}); debugLog('stderr')`
+  try {
+    for (const log of ['/dev/stderr', '/dev/fd/2']) {
+      const file = join(dir, `${basename(log)}.txt`)
+      await writeFile(file, '')
+      await chmod(file, 0o640)
+      const stderr = openSync(file, 'r+')
+      try {
+        const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+          stdio: ['ignore', 'ignore', stderr],
+          env: { ...process.env, CLAUDE_CODEX_DEBUG_LOG: log, NODE_NO_WARNINGS: '1' },
+          timeout: 30_000,
+        })
+        assert.equal(child.status, 0, log)
+      } finally {
+        closeSync(stderr)
+      }
+      assert.equal((statSync(file).mode & 0o777).toString(8), '640', log)
+      assert.deepEqual(logEvents(file), ['stderr'], log)
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true })
   }
 })

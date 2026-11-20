@@ -306,6 +306,13 @@ test('settings and config files that do not parse are reported quoting none of t
     tomlError(`a = "${token}" ${token}`, 'expected the end of the line')
     tomlError(`a = "${token}\\q"`, 'invalid escape')
     tomlError(`a = "${token}\\UFFFFFFFF"`, 'invalid unicode escape')
+    // Escapes name Unicode scalar values only: no lone surrogate.
+    tomlError(`a = "${token}\\uD800"`, 'invalid unicode escape')
+    tomlError(`a = "${token}\\U0000DFFF"`, 'invalid unicode escape')
+    assert.equal(
+      parseToml('a = "\\uD7FF\\uE000\\U0010FFFF"').a,
+      String.fromCodePoint(0xd7ff, 0xe000, 0x10ffff),
+    )
   } finally {
     await rm(root, { recursive: true, force: true })
   }

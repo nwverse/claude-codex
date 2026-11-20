@@ -165,13 +165,16 @@ versioning or publishing metadata.
   the App and the debug log used to carry the JSON parser's excerpt of it,
   which could include a credential; JSON wrapped in quotes was echoed whole
   as a file that was not found.
-- A Claude Code settings file (`~/.claude/settings.json`, a project's
-  `.claude/settings.json` or `.claude/settings.local.json`) or a Codex
-  `config.toml` that does not parse is reported quoting none of its text. The
-  App's hooks list and the debug log used to carry the JSON parser's excerpt
-  of the file, and the TOML reader quoted the whole bad value, so a credential
-  pasted without its quotes reached both. A TOML error names the line and
-  what is wrong. (#332)
+- A Claude Code settings or config file (`~/.claude/settings.json`, a
+  project's `.claude/settings.json` or `.claude/settings.local.json`,
+  `~/.claude.json`, a project's `.mcp.json`) or a Codex `config.toml` that
+  does not parse is reported quoting none of its text. The App's hooks list
+  showed the JSON parser's excerpt of a settings file, the debug log carried
+  it for each of these JSON files, and for a `config.toml` the debug log
+  quoted the whole bad value, so a credential pasted without its quotes ended
+  up there. A TOML error names the line and what is wrong. A `\u` or `\U`
+  escape for a surrogate or a code point past U+10FFFF is now such an error,
+  as TOML requires. (#332)
 - `claude-codex-mode logs agent-http|agentapi` and `tail agent-http|agentapi`
   show the pooled bridge log written to most recently. They used to show the
   oldest one, so the log a failed bridge start pointed you to was usually
@@ -934,12 +937,14 @@ versioning or publishing metadata.
   `process/writeStdin`, `command/exec/write`, `fs/writeFile`,
   `thread/inject_items` and every streamed delta, so diffs, written files,
   terminal input and steer text no longer reach `debug.jsonl`. (#210)
-- `debug.jsonl` and its rotated copies are readable by their owner alone
-  (0600), like `runs.jsonl`. The log was created with the umask's mode,
-  usually 0644, so only its folder kept other local accounts from the
-  commands, tool input and stderr in it. A log or rotated copy an earlier
-  version left readable is tightened the next time the adapter writes to the
-  log. (#332)
+- `debug.jsonl` and its rotated copies are created readable by their owner
+  alone (0600), like `runs.jsonl`. The log got the umask's mode, usually
+  0644, so only its folder kept other local accounts from the commands, tool
+  input and stderr in it. When the adapter starts writing to the log, it also
+  tightens a log or rotated copy an earlier version left readable, if that is
+  a regular file the adapter owns: a symbolic link and its target, a device
+  such as `/dev/stderr` and another user's file keep their mode.
+  `CLAUDE_CODEX_DEBUG_LOG_KEEP` is capped at 100. (#332)
 - Settings a Claude thread cannot honor are refused with `INVALID_REQUEST`
   instead of being saved and ignored, so the App shows "Couldn't update this
   setting": `model_verbosity`, a service tier other than the default, network
