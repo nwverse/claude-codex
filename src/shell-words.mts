@@ -589,16 +589,21 @@ function braceEnd(line: string, open: number, nesting = 0): number | null {
 // Where an arithmetic command (( ... )) ends: at `close`, the first ))
 // after it, where zsh ends it. 0 when its first group closes before that
 // (((a) | (b)) is two subshells) or nothing closes it; null when bash would
-// end it elsewhere (an unbalanced ( inside, also within ${...}), or it holds
-// what could hide or run a command: ; or a newline, a comment, a
-// substitution or quotes. The scan stops at `close`, so each start costs at
-// most that far.
+// end it elsewhere (an unbalanced ( inside), zsh would read it otherwise
+// (zsh skips the parens in a ${...}, bash counts them: so a ${...} holding
+// one is unknown), or it holds what could hide or run a command: ; or a
+// newline, a comment, a substitution or quotes. The scan stops at `close`,
+// so each start costs at most that far.
 function arithmeticCommandEnd(line: string, open: number, close: number): number | null {
   let depth = 0
   const end = close < 0 ? line.length : close
   for (let scan = open; scan < end; scan += 1) {
     const char = line[scan] ?? ''
-    if (char === '(') depth += 1
+    if (char === '$' && line[scan + 1] === '{') {
+      const brace = braceEnd(line, scan + 1)
+      if (brace === null || /[()]/.test(line.slice(scan, brace))) return null
+      scan = brace - 1
+    } else if (char === '(') depth += 1
     else if (char === ')') {
       depth -= 1
       if (depth === 1) return 0

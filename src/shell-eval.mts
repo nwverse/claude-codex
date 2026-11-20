@@ -22,10 +22,8 @@ function globSubst(text: string): boolean {
 
 export function runsLater(line: string, commands: readonly (readonly Word[])[]): boolean {
   if (RUNS_LATER.test(line) || globSubst(line)) return true
-  return commands.some(
-    (words) =>
-      words.some((word) => RUNS_LATER.test(word.text) || globSubst(word.text)) ||
-      hidesTarget(words),
+  return commands.some((words) =>
+    words.some((word) => RUNS_LATER.test(word.text) || globSubst(word.text)),
   )
 }
 
@@ -36,8 +34,10 @@ function isLiteralName(text: string): boolean {
 
 // Whether a builtin that sets variables or options names its target with
 // text built when the line runs (n=PS; printf -v "${n}4" ...): what it sets
-// cannot be told, so neither can what that runs later.
-function hidesTarget(words: readonly Word[]): boolean {
+// cannot be told, so neither can what that runs later. `words` start at a
+// command (shell-commands.mts checks every place one may start, behind
+// builtin, command, time and the like too).
+export function hidesTarget(words: readonly Word[]): boolean {
   let at = 0
   while (
     at < words.length &&
@@ -152,6 +152,13 @@ function nextOf(line: string, test: (char: string) => boolean): Int32Array {
 // POSITIONAL for the positional parameters; null when it evaluates nothing.
 // A name after ${# is not one: its length is.
 function evaluatedNames(line: string, commands: readonly (readonly Word[])[]): Set<string> | null {
+  // Most lines (and most words a shell's -c reads) hold nothing that could
+  // evaluate: skip the tables.
+  if (
+    !/[([{$]|-(?:eq|ne|lt|le|gt|ge|v)\b|\b(?:let|test|integer)\b/.test(line) &&
+    !NAMING.test(line)
+  )
+    return null
   const length = line.length
   const marks = new Int32Array(length + 1)
   let found = false

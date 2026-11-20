@@ -1,4 +1,4 @@
-import { evaluatesHiddenText, runsLater } from './shell-eval.mjs'
+import { evaluatesHiddenText, hidesTarget, runsLater } from './shell-eval.mjs'
 import { parseLine, RESERVED, type Word } from './shell-words.mjs'
 import { UNKNOWN } from './wildcards.mjs'
 
@@ -236,6 +236,7 @@ function analyze(words: readonly Word[], depth: number, scope: Scope, out: Candi
       continue
     }
     if (word.assignment === 'maybe') starts.add(index + 1)
+    if (hidesTarget(words.slice(index))) return false
     if (!out.add(words.slice(index))) return false
     const args = words.slice(index + 1).map((next) => next.text)
     const call: Call = { name: programName(word.text), words, index, args, depth, scope, out }

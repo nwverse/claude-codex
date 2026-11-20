@@ -5,6 +5,26 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { askRuleCovers, askRulesGuard, bashRuleCovers } from '../src/ask-rules.mjs'
 
+// How a check's time grows from input of size n / 10 to size n: about 10x
+// for linear code, 100x for quadratic. A ratio holds on a loaded machine or
+// a slow CI runner, where a fixed number of milliseconds does not. Each
+// size takes the best of three runs, so one stall of the machine does not
+// count, and 5 ms keeps a tiny small run from making the ratio jumpy.
+// `answer` checks the result as well.
+function growth(
+  make: (size: number) => string,
+  size: number,
+  answer: (line: string) => void,
+): number {
+  const time = (line: string): number => {
+    const start = performance.now()
+    answer(line)
+    return performance.now() - start
+  }
+  const best = (line: string): number => Math.min(time(line), time(line), time(line))
+  return best(make(size)) / (best(make(Math.floor(size / 10))) + 5)
+}
+
 test('a Bash ask rule covers every command of a command line and what wrappers run', () => {
   const covered = (specifier: string, line: string) => bashRuleCovers(specifier, line)
   for (const line of [
@@ -222,19 +242,27 @@ test('a Bash ask rule stays out of calls it does not cover', () => {
 })
 
 test('Bash ask rules are matched in time linear in the command', () => {
-  const start = performance.now()
-  assert.equal(bashRuleCovers('* a * b * c * d *', `echo ${'a b c '.repeat(400)}`), false)
+  const ratio = growth(
+    (size) => `echo ${'a b c '.repeat(size)}`,
+    400,
+    (line) => assert.equal(bashRuleCovers('* a * b * c * d *', line), false),
+  )
+  assert.ok(ratio < 30, `grew ${ratio}x`)
   assert.equal(bashRuleCovers('rm:*', `sudo ${'-z a '.repeat(100)}ls`), false)
   // A command line with too many readings to take apart asks.
   assert.equal(bashRuleCovers('rm:*', `sudo ${'-z a '.repeat(3000)}ls`), true)
   // One long command is still read, and so is a long host.
   assert.equal(bashRuleCovers('git push:*', `echo '${'{"a":1}'.repeat(25000)}' | jq .`), false)
-  const host = `https://${'a.'.repeat(5000)}com/`
-  assert.equal(
-    askRuleCovers('WebFetch(domain:*.*.*.example.com)', 'WebFetch', { url: host }, '/'),
-    false,
+  const hosts = growth(
+    (size) => `https://${'a.'.repeat(size)}com/`,
+    5000,
+    (url) =>
+      assert.equal(
+        askRuleCovers('WebFetch(domain:*.*.*.example.com)', 'WebFetch', { url }, '/'),
+        false,
+      ),
   )
-  assert.ok(performance.now() - start < 5000)
+  assert.ok(hosts < 30, `grew ${hosts}x`)
 })
 
 test('pathological input makes the ask guard ask rather than throw', async () => {
@@ -489,10 +517,14 @@ test('GNU parallel inputs end its command, and many reserved words read in linea
   for (const line of ["parallel sh -c ::: 'rm -rf build'", "parallel bash -c ::: 'rm -rf build'"])
     assert.equal(bashRuleCovers('git push:*', line), true, line)
   assert.equal(bashRuleCovers('rm:*', 'parallel echo ::: a b'), false)
-  const start = performance.now()
-  assert.equal(bashRuleCovers('rm:*', `${'if '.repeat(60000)}true`), false)
-  assert.equal(bashRuleCovers('rm:*', `${'! '.repeat(60000)}true`), false)
-  assert.ok(performance.now() - start < 5000)
+  for (const word of ['if ', '! ']) {
+    const ratio = growth(
+      (size) => `${word.repeat(size)}true`,
+      60000,
+      (line) => assert.equal(bashRuleCovers('rm:*', line), false),
+    )
+    assert.ok(ratio < 30, `${word}grew ${ratio}x`)
+  }
 })
 
 test('an arithmetic command ends where bash and zsh both end it, and $1 in it is hidden text', () => {
@@ -515,20 +547,21 @@ test('an arithmetic command ends where bash and zsh both end it, and $1 in it is
 })
 
 test('long chains of names and runs of (( read in linear time', () => {
-  let chain = ''
-  for (let index = 0; index < 15000; index += 1) chain += `a${index}=a${index + 1}; `
-  for (const [rule, line, asks] of [
-    ['rm:*', `${chain}read a15000; (( a0 ))`, true],
-    ['git push:*', `${'(( '.repeat(66000)}; rm -rf build`, true],
-    ['rm:*', `echo ${'(('.repeat(60000)}`, false],
-    ['rm:*', '(( 1 )); '.repeat(20000), false],
+  const chain = (size: number): string => {
+    let line = ''
+    for (let index = 0; index < size; index += 1) line += `a${index}=a${index + 1}; `
+    return `${line}read a${size}; (( a0 ))`
+  }
+  for (const [rule, make, size, asks] of [
+    ['rm:*', chain, 15000, true],
+    ['git push:*', (n: number) => `${'(( '.repeat(n)}; rm -rf build`, 66000, true],
+    ['rm:*', (n: number) => `echo ${'(('.repeat(n)}`, 60000, false],
+    ['rm:*', (n: number) => '(( 1 )); '.repeat(n), 20000, false],
   ] as const) {
-    const start = performance.now()
-    assert.equal(bashRuleCovers(rule, line), asks, line.slice(0, 40))
-    assert.ok(
-      performance.now() - start < 1000,
-      `${line.slice(0, 40)}: ${performance.now() - start} ms`,
+    const ratio = growth(make, size, (line) =>
+      assert.equal(bashRuleCovers(rule, line), asks, line.slice(0, 40)),
     )
+    assert.ok(ratio < 30, `${make(2).slice(0, 20)} grew ${ratio}x`)
   }
 })
 
@@ -577,6 +610,32 @@ test('array index loops are not read as evaluating hidden text', () => {
     "x='a['; x+='$(rm -rf build)]'; echo ${!x}",
   ])
     assert.equal(bashRuleCovers('git push:*', line), true, line)
+})
+
+test('zsh skips the parens in ${...} inside ((, and builtin or command hide no setter', () => {
+  // zsh reads these as subshells around a command, bash as arithmetic.
+  for (const line of [
+    '(( ${x:-(} ) || rm -rf build || ( ${y:-)} ))',
+    '(( ${x:-(} ) | rm -rf build | ( ${y:-)} ))',
+    '(( ${x:-(} ) && rm -rf build && ( ${y:-)} ))',
+  ])
+    assert.equal(bashRuleCovers('rm:*', line), true, line)
+  // A setter behind builtin, command or time names its target too.
+  for (const line of [
+    'n=PS; builtin printf -v "${n}4" \'$(rm -rf build)\'; set -x; :',
+    'n=PS; command printf -v "${n}4" \'$(rm -rf build)\'; set -x; :',
+    'n=PS; builtin declare "${n}4=\\$(rm -rf build)"; set -x; :',
+    'n=PS; time printf -v "${n}4" \'$(rm -rf build)\'; set -x; :',
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+  for (const line of [
+    'while (( i < ${#arr[@]} )); do echo "${arr[i]}"; (( i++ )); done',
+    'if (( $# > 0 )); then echo args; fi',
+    '(( n = ${#name} + 1 ))',
+    'command -v printf',
+    'builtin printf -v out "%s" hi',
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), false, line)
 })
 
 test('only a command name matches in any case, and only where the system ignores case', () => {
