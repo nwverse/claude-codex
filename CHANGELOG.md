@@ -17,6 +17,22 @@ versioning or publishing metadata.
 - A native Codex chat keeps its active sidebar state when another adapter opens
   the same state directory. A later startup clears the activity marker if the
   adapter that ran the native turn has exited.
+- With native mode on, `thread/resume` ignores a picker model on another
+  backend or Codex provider and opens the chat on its own model, as it does
+  without native mode. Opening a Claude chat, or a native chat of the other
+  provider, while the composer was on another harness's model used to fail
+  with "cannot change runtime backend … start a new thread". (#337)
+- Adapters sharing a state directory take turns on a native Codex chat, as
+  they do on Claude chats: while one adapter's turn runs, another refuses
+  `turn/start`, shell commands, reviews, compaction, rollback, revert, steer,
+  interrupt, archive and delete with "has an active turn in another adapter
+  process". Two `codex app-server` children used to run or rewrite the same
+  rollout at once. A turn left by an adapter that exited does not block the
+  next one. (#337)
+- With native mode on, an existing `codex exec` chat, and a fork the adapter
+  makes itself, refuse a Codex+AsterGate model ("start a new thread"); a
+  resume ignores one. Such a chat used to accept the model and then fail every
+  turn, because `codex exec` ran the prefixed id on its default provider. (#337)
 
 ### `ws://` listener authentication
 
@@ -833,6 +849,11 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- Settings saves from adapters whose `config.json` is a link to one shared
+  file all stay. Each save is now locked next to the file the link points to,
+  as the shared Claude model and command catalogs are; adapters with different
+  state directories used to overwrite each other's simultaneous saves while
+  reporting each one as saved. (#337)
 - A deleted chat stays deleted and a rename sticks when a `turn/start`
   arrives at the same time, for example from a second window on the same
   chat. `turn/start` re-reads the thread after waiting on a running turn

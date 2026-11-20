@@ -24,6 +24,23 @@ export function jsonFileTarget(path: string): string {
   return target
 }
 
+// Runs a read/modify/replace of the JSON file at `path` holding a lock next
+// to the file it resolves to, so writers in every home linked to that file
+// take turns. `body` gets the resolved target.
+export function withJsonFileLock<T>(path: string, body: (target: string) => T): T {
+  const target = jsonFileTarget(path)
+  ensureParent(target)
+  // Loading SQLite lazily keeps CLI probes independent of the lock.
+  const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite')
+  const lock = new DatabaseSync(`${target}.lock.sqlite`, { timeout: 5000 })
+  try {
+    lock.exec('BEGIN IMMEDIATE')
+    return body(target)
+  } finally {
+    lock.close()
+  }
+}
+
 export function replaceJsonFile(target: string, value: unknown): void {
   // Renaming can replace a read-only file in a writable directory. Honor
   // the file permissions that a direct config write would enforce.

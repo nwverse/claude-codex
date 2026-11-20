@@ -38,6 +38,14 @@ export function invalidRequest(message: string, data?: unknown): RpcError {
   return new RpcError(message, data, INVALID_REQUEST)
 }
 
+// A request that would start or change a turn while another adapter process
+// sharing the state directory runs one on the thread.
+export function foreignTurnError(threadId: string): RpcError {
+  return invalidRequest(
+    `thread ${threadId} has an active turn in another adapter process; retry after it completes`,
+  )
+}
+
 export function invalidParams(message: string, data?: unknown): RpcError {
   return new RpcError(message, data, INVALID_PARAMS)
 }

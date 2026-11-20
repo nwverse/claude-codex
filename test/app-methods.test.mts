@@ -487,6 +487,34 @@ test('an atomic settings save preserves a symlink to the config file', {
   })
 })
 
+test('adapter homes whose config.json links to one file keep every simultaneous save', {
+  skip: process.platform === 'win32',
+}, async () => {
+  await withServer(async (a) => {
+    await a.request('config/value/write', { keyPath: 'model', value: 'opus' })
+    const file = join(a.home, 'claude-codex-adapter', 'config.json')
+    const b = new AppServer(await mkdtemp(join(tmpdir(), 'claude-codex-app-methods-')))
+    try {
+      // Its home exists once it answers.
+      await b.request('config/read')
+      const link = join(b.home, 'claude-codex-adapter', 'config.json')
+      await symlink(file, link)
+      const keys = Array.from({ length: 40 }, (_, i) => `desktop.flag-${i}`)
+      await Promise.all(
+        keys.map((keyPath, i) =>
+          (i % 2 ? a : b).request('config/value/write', { keyPath, value: i }),
+        ),
+      )
+      const saved = JSON.parse(await readFile(file, 'utf8'))
+      assert.equal(saved.model, 'opus')
+      for (const [i, key] of keys.entries()) assert.equal(saved.overrides[key], i, key)
+      assert.equal((await lstat(link)).isSymbolicLink(), true)
+    } finally {
+      await b.close()
+    }
+  })
+})
+
 test('thread history pages turns, items and the timeline', async () => {
   await withServer(async (server) => {
     const threadId = await server.startThread()

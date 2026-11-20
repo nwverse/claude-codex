@@ -1295,6 +1295,54 @@ export class SessionStore {
       .run(preview, threadId)
   }
 
+  // A native thread's owner marker is also its claim, as claimTurn's row is
+  // for an adapter-managed turn: one adapter's codex child at a time runs or
+  // rewrites the rollout. A live owner in another adapter keeps it; a dead
+  // one's is taken over.
+  claimNativeTurn(threadId: string): boolean {
+    const before = this.foreignNativeOwner(threadId)
+    // ps can take seconds, so read liveness before taking the write lock. An
+    // owner that claimed meanwhile is a live one.
+    const alive = before !== null && otherProcessRunning(before)
+    return this.transaction(() => {
+      const owner = this.foreignNativeOwner(threadId)
+      if (owner && (alive || owner.pid !== before?.pid || owner.started !== before.started))
+        return false
+      const self = currentProcessOwner()
+      this.db
+        .prepare(`UPDATE threads SET native_active_owner_pid = ?, native_active_owner_started = ?
+        WHERE id = ?`)
+        .run(self.pid, self.started, threadId)
+      return true
+    })
+  }
+
+  // Gives up this adapter's claim when no turn took it over.
+  releaseNativeTurn(threadId: string): void {
+    const self = currentProcessOwner()
+    this.db
+      .prepare(`UPDATE threads SET native_active_owner_pid = NULL, native_active_owner_started = NULL
+      WHERE id = ? AND native_active_owner_pid = ? AND native_active_owner_started IS ?`)
+      .run(threadId, self.pid, self.started)
+  }
+
+  // Another live adapter runs the native thread's turn.
+  hasForeignNativeTurn(threadId: string): boolean {
+    const owner = this.foreignNativeOwner(threadId)
+    return owner !== null && otherProcessRunning(owner)
+  }
+
+  private foreignNativeOwner(threadId: string): { pid: number; started: string | null } | null {
+    const row = this.db
+      .prepare(`SELECT native_active_owner_pid AS pid, native_active_owner_started AS started
+      FROM threads WHERE id = ?`)
+      .get(threadId) as { pid: number | null; started: string | null } | undefined
+    if (row?.pid == null) return null
+    const self = currentProcessOwner()
+    if (row.pid === self.pid && row.started === self.started) return null
+    return { pid: Number(row.pid), started: row.started }
+  }
+
   startNativeTurnActivity(threadId: string): void {
     const owner = currentProcessOwner()
     // An earlier status event may already carry waitingOnApproval or other flags.

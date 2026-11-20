@@ -5,7 +5,7 @@ import {
   codexProviderForModel,
   isAgModel,
 } from './harness-models.mjs'
-import { invalidRequest, RpcError, SERVER_ERROR } from './host-methods.mjs'
+import { foreignTurnError, invalidRequest, RpcError, SERVER_ERROR } from './host-methods.mjs'
 import { permissionProfileIdFromParams, permissionProfilePolicy } from './server-helpers.mjs'
 import type { SessionStore } from './store.mjs'
 import type { RpcPeer, ThreadRecord } from './types.mjs'
@@ -80,6 +80,24 @@ const FORWARDED = new Set([
 // The adapter answers these from its own record; the child hears them too so
 // its rollout stays in step.
 const MIRRORED = new Set(['thread/name/set', 'thread/archive', 'thread/unarchive', 'thread/delete'])
+
+// Requests that run or rewrite the rollout. Adapters sharing the state
+// directory take turns: each holds the thread's native claim while its child
+// does one, and keeps it while a turn it started runs.
+const CLAIMING = new Set([
+  'turn/start',
+  'thread/shellCommand',
+  'review/start',
+  'thread/compact/start',
+  'thread/rollback',
+  'thread/revert',
+  'thread/archive',
+  'thread/delete',
+])
+// Requests whose turn the child announces only after answering.
+const ANNOUNCED_TURN = new Set(['thread/shellCommand', 'review/start', 'thread/compact/start'])
+// Requests about the running turn, which only its owner's child has.
+const TURN_CONTROL = new Set(['turn/interrupt', 'turn/steer'])
 
 export function isNativeConversationMethod(method: string): boolean {
   return FORWARDED.has(method) || MIRRORED.has(method)
@@ -169,16 +187,28 @@ export class CodexNativeBridge {
     const model = requestedModel(params)
     if (model && ['thread/resume', 'thread/settings/update', 'turn/start'].includes(method)) {
       const current = this.host.store.getThread(threadId)
-      if (current?.nativeCodexProvider) {
-        // Validate before forwarding. Commit the change only if the child accepts it.
-        this.host.applyModel(current, params, false)
-      } else if (
-        current &&
-        !current.codexSessionId &&
-        !current.ephemeral &&
-        (current.runtimeBackend === 'codex' || isCodexOpenAiModel(model))
-      ) {
-        this.host.applyModel(current, params, true)
+      try {
+        if (current?.nativeCodexProvider) {
+          // Validate before forwarding. Commit the change only if the child accepts it.
+          this.host.applyModel(current, params, false)
+        } else if (
+          current &&
+          !current.codexSessionId &&
+          !current.ephemeral &&
+          (current.runtimeBackend === 'codex' || isCodexOpenAiModel(model))
+        ) {
+          this.host.applyModel(current, params, true)
+        }
+      } catch (error) {
+        // A resume ignores a model the chat cannot move to, as the adapter's
+        // own thread/resume does, and opens the chat on its own model.
+        if (method !== 'thread/resume' || !current) throw error
+        debugLog('codexBridge.resumeModelIgnored', {
+          threadId,
+          model,
+          message: error instanceof Error ? error.message : String(error),
+        })
+        keepThreadModel(params, current.nativeCodexProvider ? current.model : null)
       }
     }
     const thread = this.owned(threadId)
@@ -194,11 +224,21 @@ export class CodexNativeBridge {
           'a fork uses its parent’s Codex provider; start a new chat to switch providers',
         )
     }
+    // Another adapter's child would run a second turn on the rollout, or
+    // rewrite it under the running one.
+    const claims = CLAIMING.has(method)
+    if (
+      claims
+        ? !this.host.store.claimNativeTurn(threadId)
+        : TURN_CONTROL.has(method) && this.host.store.hasForeignNativeTurn(threadId)
+    )
+      throw foreignTurnError(threadId)
     this.host.subscribe(thread.id, peer)
     this.requestsInFlight += 1
     this.clearIdleTimer()
     if (startsTurn) this.startingTurns.set(threadId, new Set())
     if (MIRRORED.has(method)) this.changesInFlight.add(threadId)
+    let announcedTurn = false
     try {
       if (!thread.codexSessionId) await this.createChildThread(thread)
       if (MIRRORED.has(method)) {
@@ -235,6 +275,10 @@ export class CodexNativeBridge {
         return local
       }
       const result = await this.forward(thread, method, params)
+      // A detached review runs on a thread of its own.
+      announcedTurn =
+        ANNOUNCED_TURN.has(method) &&
+        (stringField(asRecord(result).reviewThreadId) ?? threadId) === threadId
       if (method === 'thread/settings/update') return NOT_ROUTED
       if (model && (method === 'turn/start' || method === 'thread/resume')) {
         const current = this.host.store.getThread(threadId)
@@ -242,6 +286,9 @@ export class CodexNativeBridge {
       }
       return result
     } finally {
+      // A turn started on the thread keeps the claim until it ends.
+      if (claims && !announcedTurn && !this.activeTurns.has(threadId))
+        this.host.store.releaseNativeTurn(threadId)
       if (MIRRORED.has(method)) this.changesInFlight.delete(threadId)
       if (startsTurn) this.startingTurns.delete(threadId)
       this.requestsInFlight -= 1
@@ -690,6 +737,16 @@ function requestedModel(params: Record<string, unknown>): string | null {
   if (typeof params.model === 'string' && params.model) return params.model
   const nested = asRecord(asRecord(params.collaborationMode).settings).model
   return typeof nested === 'string' && nested ? nested : null
+}
+
+// Takes the requested model out of a resume. A native chat's child gets its
+// own model, which Codex requires in a collaboration mode's settings.
+function keepThreadModel(params: Record<string, unknown>, nativeModel: string | null): void {
+  delete params.model
+  const settings = asRecord(asRecord(params.collaborationMode).settings)
+  if (!('model' in settings)) return
+  if (nativeModel) settings.model = nativeModel
+  else delete settings.model
 }
 
 function isThreadIdField(key: string | null): boolean {

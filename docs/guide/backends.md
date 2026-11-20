@@ -42,10 +42,17 @@ history. The adapter starts one child process per provider on demand and stops
 idle children after `CLAUDE_CODEX_NATIVE_IDLE_MS`.
 
 The first turn of a new chat selects its harness. Later turns and forks can
-switch models within the same harness. Each native chat stores its original
-provider, including across restarts and changes to the provider setting.
-Existing `codex exec` conversations continue on their original route. Turning
-native mode off keeps native sidebar entries. Re-enable it to reopen them.
+switch models within the same harness; `thread/resume` ignores a model from
+another harness. Each native chat stores its original provider, including
+across restarts and changes to the provider setting. Existing `codex exec`
+conversations continue on their original route, which runs only the default
+Codex provider, so they refuse Codex+AsterGate models. Turning native mode off
+keeps native sidebar entries. Re-enable it to reopen them.
+
+Adapters that share a state directory take turns on a native chat. While one
+runs a turn, the others refuse to start, steer, interrupt, compact, review,
+roll back, revert, archive or delete it until the turn ends or its adapter
+exits.
 
 Fresh title helpers run on Claude. A description fork of a native chat uses
 its parent’s provider and rollout, so that provider processes the description.

@@ -616,3 +616,171 @@ test('adapter shutdown waits for a native child that ignores SIGTERM', async () 
   }
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
 })
+
+test('a resume ignores a model on another backend or provider, as without native mode', async () => {
+  const picks = [
+    { model: 'gpt-6.1-sol' },
+    { collaborationMode: { mode: 'default', settings: { model: 'gpt-6.1-sol' } } },
+  ]
+  for (const native of ['on', 'off']) {
+    const app = startAdapter({ env: { CLAUDE_CODEX_NATIVE_CODEX: native } })
+    try {
+      const threadId = await startChat(app, 'sonnet')
+      await app.request('turn/start', { threadId, input: [{ type: 'text', text: 'hello' }] })
+      await app.reader.until((message) => message.method === 'turn/completed')
+      for (const pick of picks) {
+        const resumed = await app.request('thread/resume', { threadId, ...pick })
+        assert.equal(resumed.error, undefined, `${native}: ${JSON.stringify(resumed.error)}`)
+        assert.equal(resumed.result.model, 'sonnet')
+      }
+      assert.deepEqual(app.childLog(), [])
+    } finally {
+      await app.stop()
+    }
+  }
+  const app = startAdapter()
+  try {
+    const threadId = await startChat(app)
+    await runTurn(app, threadId, 'accept')
+    for (const pick of picks) {
+      const resumed = await app.request('thread/resume', { threadId, ...pick })
+      assert.equal(resumed.error, undefined, JSON.stringify(resumed.error))
+      assert.equal(resumed.result.model, 'codex-ag:claude-opus-5-5')
+    }
+    // The child hears the chat's own model, in the mode's settings too.
+    assert.deepEqual(
+      app
+        .childLog()
+        .filter((entry) => entry.method === 'thread/resume')
+        .map((entry) => [entry.params.model, entry.params.collaborationMode?.settings.model]),
+      [
+        ['claude-opus-5-5', undefined],
+        ['claude-opus-5-5', 'claude-opus-5-5'],
+      ],
+    )
+    const { seen } = await runTurn(app, threadId, 'accept')
+    const delta = seen.find((message) => message.method === 'item/agentMessage/delta')
+    assert.equal(delta.params.delta, 'astergate_claude:claude-opus-5-5:accept')
+  } finally {
+    await app.stop()
+  }
+})
+
+test('a second adapter refuses to run or rewrite a native chat while another one’s turn is live', async () => {
+  const first = startAdapter()
+  const apps = [first]
+  try {
+    const threadId = await startChat(first)
+    await runTurn(first, threadId, 'accept')
+    const hold = async (app: typeof first) => {
+      const started = await app.request('turn/start', {
+        threadId,
+        input: [{ type: 'text', text: 'held' }],
+      })
+      assert.equal(started.error, undefined, JSON.stringify(started.error))
+      const approval = await app.reader.until((message) =>
+        message.method?.endsWith('requestApproval'),
+      )
+      return { turnId: started.result.turn.id as string, approval }
+    }
+    const held = await hold(first)
+    const second = startAdapter({ home: first.home })
+    apps.push(second)
+    await initialize(second)
+    const refused = [
+      ['turn/start', { threadId, input: [{ type: 'text', text: 'second' }] }],
+      ['thread/shellCommand', { threadId, command: 'ls' }],
+      ['review/start', { threadId, target: { type: 'uncommittedChanges' } }],
+      ['thread/compact/start', { threadId }],
+      ['thread/rollback', { threadId, numTurns: 1 }],
+      ['turn/steer', { threadId, expectedTurnId: held.turnId, input: [] }],
+      ['turn/interrupt', { threadId, turnId: held.turnId }],
+      ['thread/archive', { threadId }],
+      ['thread/delete', { threadId }],
+    ] as const
+    for (const [method, params] of refused) {
+      const answer = await second.request(method, params)
+      assert.equal(answer.error?.code, -32600, method)
+      assert.match(answer.error.message, /active turn in another adapter process/, method)
+    }
+    // No second child started, and the running turn goes on.
+    assert.deepEqual(
+      second
+        .childLog()
+        .filter(
+          (entry) => entry.event === 'spawn' || refused.some(([method]) => method === entry.method),
+        ),
+      [],
+    )
+    first.proc.stdin.write(
+      `${JSON.stringify({ id: held.approval.id, result: { decision: 'accept' } })}\n`,
+    )
+    await first.reader.until((message) => message.method === 'turn/completed')
+
+    // Once it ends, either adapter runs the next turn, one at a time.
+    await hold(second)
+    const blocked = await first.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'first' }],
+    })
+    assert.match(blocked.error?.message ?? '', /active turn in another adapter process/)
+    // An adapter that exited leaves its turn to the next one.
+    const exited = once(second.proc, 'exit')
+    second.proc.kill('SIGKILL')
+    await exited
+    await runTurn(first, threadId, 'decline')
+  } finally {
+    await Promise.all(apps.map((app) => app.stop()))
+  }
+})
+
+test('with native mode on, a chat on the exec route and a fork made here refuse Codex+AsterGate models', async () => {
+  const first = startAdapter()
+  const threadId = await startChat(first, 'gpt-6.1-sol')
+  try {
+    await runTurn(first, threadId, 'accept')
+  } finally {
+    await first.stop()
+  }
+  // A conversation from `codex exec`, as in a database from before native mode.
+  const db = new DatabaseSync(join(first.home, 'adapter', 'state.sqlite'))
+  try {
+    db.prepare('UPDATE threads SET native_codex_provider = NULL WHERE id = ?').run(threadId)
+  } finally {
+    db.close()
+  }
+  const ag = 'codex-ag:claude-opus-5-5'
+  for (const native of ['on', 'off']) {
+    const app = startAdapter({ home: first.home, env: { CLAUDE_CODEX_NATIVE_CODEX: native } })
+    try {
+      await initialize(app)
+      for (const method of ['thread/settings/update', 'thread/metadata/update']) {
+        const answer = await app.request(method, { threadId, model: ag })
+        // Without native mode the id is not a model, and the chat keeps its own.
+        if (native === 'off') assert.doesNotMatch(answer.error?.message ?? '', /AsterGate/)
+        else {
+          assert.equal(answer.error?.code, -32600, method)
+          assert.match(answer.error.message, /from Codex to Codex\+AsterGate/, method)
+        }
+      }
+      if (native === 'on') {
+        const turn = await app.request('turn/start', {
+          threadId,
+          model: ag,
+          input: [{ type: 'text', text: 'hello' }],
+        })
+        assert.equal(turn.error?.code, -32600)
+        const claude = await app.request('thread/start', { model: 'sonnet', cwd: app.home })
+        for (const parent of [threadId, claude.result.thread.id]) {
+          const fork = await app.request('thread/fork', { threadId: parent, model: ag })
+          assert.match(fork.error?.message ?? '', /cannot run on Codex\+AsterGate/)
+        }
+      }
+      const resumed = await app.request('thread/resume', { threadId, model: ag })
+      assert.equal(resumed.result.model, 'gpt-6.1-sol')
+      assert.deepEqual(app.childLog(), [])
+    } finally {
+      await app.stop()
+    }
+  }
+})

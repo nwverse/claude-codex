@@ -79,6 +79,7 @@ import {
 import {
   accountUsage,
   asInvalidRequest,
+  foreignTurnError,
   hostMethod,
   INVALID_REQUEST,
   invalidParams,
@@ -90,7 +91,7 @@ import {
 } from './host-methods.mjs'
 import { IdleSleepGuard, type IdleSleepGuardOptions } from './idle-sleep.mjs'
 import { inheritedAgents, inheritedHooks, inheritedPermissionRules } from './inherited-config.mjs'
-import { jsonFileTarget, replaceJsonFile } from './json-file.mjs'
+import { jsonFileTarget, replaceJsonFile, withJsonFileLock } from './json-file.mjs'
 import { LEADER_APP_THREAD_TOOLS, LeaderThreads } from './leader-tools.mjs'
 import {
   callMcpTool,
@@ -1315,9 +1316,9 @@ export class CodexClaudeAppServer {
       case 'plugin/share/delete':
         return {}
       case 'plugin/uninstall':
-        return this.store.transaction(() => this.pluginUninstall(asRecord(params)))
+        return this.configTransaction(() => this.pluginUninstall(asRecord(params)))
       case 'plugin/install':
-        return this.store.transaction(() => this.pluginInstall(asRecord(params)))
+        return this.configTransaction(() => this.pluginInstall(asRecord(params)))
       case 'skills/config/write':
         // App rule: settings-write-errors
         if (asRecord(params).enabled === false) {
@@ -1466,7 +1467,7 @@ export class CodexClaudeAppServer {
         return this.serverDiagnostics()
       case 'config/value/write':
       case 'config/batchWrite':
-        return this.store.transaction(() => this.configWriteResponse(asRecord(params)))
+        return this.configTransaction(() => this.configWriteResponse(asRecord(params)))
       case 'getConversationSummary':
         return this.getConversationSummary(asRecord(params))
       case 'gitDiffToRemote':
@@ -1734,13 +1735,16 @@ export class CodexClaudeAppServer {
       // still rebind same-backend models (e.g. sonnet → opus).
       const newBackend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
       if (newBackend === thread.runtimeBackend) {
-        // A Claude conversation also stays on its model process profile; the
-        // picker's choice is ignored rather than failing the resume. One no
-        // profile can run keeps its model and pin, so it stays refused.
+        // A Claude conversation also stays on its model process profile, and
+        // a `codex exec` one on its provider; the picker's choice is ignored
+        // rather than failing the resume. One no profile can run keeps its
+        // model and pin, so it stays refused.
         try {
           if (unbound) throw unbound
           if (newBackend === 'claude' && this.threadHasConversation(thread))
             assertModelProfileTransition(thread.model, model)
+          if (this.execRouteRefuses(thread, model))
+            throw new Error(`${harnessLabelOf(model)} does not run on this chat's route`)
           thread.modelProfileFingerprint = profileFingerprintForModel(model, newBackend)
           thread.model = model
         } catch (error) {
@@ -1839,6 +1843,12 @@ export class CodexClaudeAppServer {
     const runtimeBackend: ThreadRecord['runtimeBackend'] = isCodexOpenAiModel(forkModel)
       ? 'codex'
       : 'claude'
+    // A Codex fork made here runs on `codex exec`; the native harness forks
+    // its own chats.
+    if (this.codexBridge && isAgModel(forkModel))
+      throw invalidRequest(
+        `a fork of this chat cannot run on ${harnessLabelOf(forkModel)}; start a new chat to use it`,
+      )
     // The fork carries the parent's conversation, which a Claude parent keeps
     // in its model process profile. A Codex parent's lives in Codex, so its
     // fork may take any profile, as it takes any Claude model without them.
@@ -4489,7 +4499,7 @@ export class CodexClaudeAppServer {
         continue
       }
       if (ownedHere) throw invalidRequest(`thread ${threadId} already has an active turn`)
-      throw this.foreignTurnError(threadId)
+      throw foreignTurnError(threadId)
     }
     recordRunEvent('turn.started', {
       threadId,
@@ -8842,11 +8852,12 @@ export class CodexClaudeAppServer {
         if (codexModel && this.codexRoutingDisabled()) throw codexRoutingDisabledError(model)
         runtimeBackend = codexModel ? 'codex' : 'claude'
       } else if (
-        runtimeBackend === 'codex' &&
-        (thread.nativeCodexProvider || (this.codexBridge && !thread.codexSessionId)) &&
-        (isAgModel(model) !== isAgModel(thread.model) ||
-          (thread.nativeCodexProvider && !isCodexOpenAiModel(model))) &&
-        this.threadHasConversation(thread)
+        (runtimeBackend === 'codex' &&
+          (thread.nativeCodexProvider || (this.codexBridge && !thread.codexSessionId)) &&
+          (isAgModel(model) !== isAgModel(thread.model) ||
+            (thread.nativeCodexProvider && !isCodexOpenAiModel(model))) &&
+          this.threadHasConversation(thread)) ||
+        this.execRouteRefuses(thread, model)
       ) {
         // A Codex conversation lives with its model provider: Codex will not
         // go on with a ChatGPT chat on AsterGate, or the other way round.
@@ -8865,6 +8876,19 @@ export class CodexClaudeAppServer {
     thread.runtimeBackend = runtimeBackend
     thread.model = model
     thread.modelProfileFingerprint = profileFingerprint
+  }
+
+  // A Codex conversation the native harness does not run (one from `codex
+  // exec`, or a fork made here) goes on through `codex exec`, which has only
+  // its default provider: a Codex+AsterGate model there needs a new chat.
+  private execRouteRefuses(thread: ThreadRecord, model: string): boolean {
+    return (
+      this.codexBridge !== null &&
+      isAgModel(model) &&
+      thread.runtimeBackend === 'codex' &&
+      !thread.nativeCodexProvider &&
+      this.threadHasConversation(thread)
+    )
   }
 
   // A Claude thread's conversation lives in its model process profile: it
@@ -10911,17 +10935,11 @@ export class CodexClaudeAppServer {
     if (claim.claimed) return
     if (this.activeTurnByThread.get(turn.threadId) === claim.activeTurn.id)
       throw invalidRequest(`thread ${turn.threadId} already has an active turn`)
-    throw this.foreignTurnError(turn.threadId)
-  }
-
-  private foreignTurnError(threadId: string): RpcError {
-    return invalidRequest(
-      `thread ${threadId} has an active turn in another adapter process; retry after it completes`,
-    )
+    throw foreignTurnError(turn.threadId)
   }
 
   private requireLocalOrIdle(threadId: string): void {
-    if (this.store.hasForeignActiveTurn(threadId)) throw this.foreignTurnError(threadId)
+    if (this.store.hasForeignActiveTurn(threadId)) throw foreignTurnError(threadId)
   }
 
   private flushPendingTurnEnds(threadId: string): void {
@@ -11068,7 +11086,7 @@ export class CodexClaudeAppServer {
     if (purpose === 'startup' && pruned) {
       // A clean startup only reads. Recheck inside the writer lock before
       // migrating, in case another process saved since the initial read.
-      this.store.transaction(() => {
+      this.configTransaction(() => {
         const current = this.loadPersistedConfig()
         if (asTable(current?.overrides))
           this.persistConfig(current, { overrides: this.configOverrides })
@@ -11091,6 +11109,13 @@ export class CodexClaudeAppServer {
     throw new Error(
       `Cannot start a thread because ${this.configPath} must contain a valid JSON object.`,
     )
+  }
+
+  // A config.json read/modify/rename. Adapters sharing the home take the
+  // database's writer lock, as older versions do; a config.json linked into
+  // other homes is also locked next to the file it links to.
+  private configTransaction<T>(body: () => T): T {
+    return this.store.transaction(() => withJsonFileLock(this.configPath, body))
   }
 
   private persistConfig(

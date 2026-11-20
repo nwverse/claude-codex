@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { jsonFileTarget, replaceJsonFile } from './json-file.mjs'
+import { replaceJsonFile, withJsonFileLock } from './json-file.mjs'
 import { adapterHome, debugLog } from './util.mjs'
 
 // CLI reports are shared by all adapters using the home. Keep the JSON format
@@ -29,19 +29,10 @@ export class SharedClaudeCatalog<T> {
     const path = join(adapterHome(), this.filename)
     try {
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
-      const target = jsonFileTarget(path)
-      // Loading SQLite lazily keeps CLI probes independent of the catalog.
-      const { DatabaseSync } = process.getBuiltinModule(
-        'node:sqlite',
-      ) as typeof import('node:sqlite')
-      const lock = new DatabaseSync(target + '.lock.sqlite', { timeout: 5000 })
-      try {
-        lock.exec('BEGIN IMMEDIATE')
+      withJsonFileLock(path, (target) => {
         const draft = structuredClone(this.load(path))
         edit(draft, () => replaceJsonFile(target, draft))
-      } finally {
-        lock.close()
-      }
+      })
     } catch (error) {
       debugLog('claudeCatalog.saveFailed', { filename: this.filename, message: String(error) })
     }
