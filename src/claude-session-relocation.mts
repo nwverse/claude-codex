@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import {
+  accessSync,
   chmodSync,
   closeSync,
   constants,
@@ -13,12 +14,68 @@ import {
   realpathSync,
   rmSync,
   type Stats,
+  statSync,
 } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { newId, projectSlugs } from './util.mjs'
 
 export const CLAUDE_SESSION_UUID = /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i
+
+function failure(path: string, error: unknown): string {
+  return `${path}: ${(error as NodeJS.ErrnoException).code ?? String(error)}`
+}
+
+// A transcript lookup: the file, or null when nothing is there. A lookup that
+// cannot tell (EACCES, EPERM, EIO) is added to `failures`.
+export function transcriptStat(path: string, failures: string[]): Stats | null {
+  try {
+    const stat = statSync(path)
+    return stat.isFile() ? stat : null
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') failures.push(failure(path, error))
+    return null
+  }
+}
+
+// Whether a folder can say a transcript in it is gone: 'readable', 'absent'
+// (no entry at all in a parent folder that is there), or else why not.
+function folderState(dir: string): string {
+  let path = dir
+  try {
+    if (!lstatSync(dir, { throwIfNoEntry: false })) {
+      path = dirname(dir)
+      if (statSync(path).isDirectory()) return 'absent'
+    } else if (statSync(dir).isDirectory()) {
+      accessSync(dir, constants.R_OK | constants.X_OK)
+      return 'readable'
+    }
+    return `${path}: not a folder`
+  } catch (error) {
+    return failure(path, error)
+  }
+}
+
+// A Claude session starts over only when its transcript is certainly gone:
+// no lookup in the CLI's config folder failed, and that folder and its
+// projects folder are readable or not there at all (the CLI creates them).
+// A folder that is out of reach (a link or parent folder that is gone, as
+// on an unmounted volume, or one that cannot be read) fails the turn
+// instead, and the chat keeps its session for when the folder is back.
+export function assertTranscriptGone(id: string, root: string, failures: string[]): void {
+  let problem = failures[0]
+  for (const dir of [root, join(root, 'projects')]) {
+    if (problem) break
+    const state = folderState(dir)
+    if (state === 'absent') break
+    if (state !== 'readable') problem = state
+  }
+  if (problem)
+    throw new Error(
+      `Cannot resume Claude session ${id}: its transcript could not be read (${problem}). The chat keeps its session; send the message again once that folder is available.`,
+    )
+}
 
 // Also resolve a renamed directory's surviving parent, e.g. /tmp -> /private/tmp.
 function physicalPath(path: string): string {
@@ -125,7 +182,9 @@ function identicalDestination(source: string, target: string, id: string): boole
 }
 
 // When the App changes this thread's working directory, use only the source
-// workspace recorded in SQLite and the config root of the selected CLI.
+// workspace recorded in SQLite and the config root of the selected CLI. False
+// when there is nothing to copy: the CLI already finds the transcript under
+// the new workspace's name, or the recorded workspace has none left.
 export function relocateClaudeTranscript(
   id: string,
   sourceCwd: string,
@@ -138,14 +197,15 @@ export function relocateClaudeTranscript(
   if (!CLAUDE_SESSION_UUID.test(id))
     throw new Error('Cannot relocate an unrecognized Claude session ID')
   const projects = join(root, 'projects')
+  // No transcripts at all, e.g. after the projects folder was cleared.
+  if (!lstatSync(projects, { throwIfNoEntry: false })) return false
   verifyDirectory(projects)
   const sources: string[] = []
   const previous = new Set([...projectSlugs(from), ...projectSlugs(sourceCwd)])
   const targetSlug = projectSlugs(to)[0] as string
-  if (previous.has(targetSlug))
-    throw new Error(
-      'Cannot relocate a Claude session between workspaces with the same transcript directory',
-    )
+  // A rename that keeps the folder name's slug (my_project -> my-project)
+  // leaves the transcript where the CLI looks for it.
+  if (previous.has(targetSlug)) return false
   for (const slug of previous) {
     const dir = join(projects, slug)
     if (!lstatSync(dir, { throwIfNoEntry: false })) continue
@@ -163,6 +223,9 @@ export function relocateClaudeTranscript(
       return true
     }
   }
+  // Claude Code deletes old transcripts (cleanupPeriodDays): a session with
+  // none left is missing, moved or not, and the turn starts a new one.
+  if (!sources.length) return false
   if (sources.length !== 1) {
     throw new Error(
       `Cannot relocate Claude session ${id}: expected one transcript in the recorded workspace, found ${sources.length}`,

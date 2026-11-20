@@ -126,7 +126,7 @@ import {
   sessionApproval,
   sessionSuggestionsEnabled,
 } from './permission-suggestions.mjs'
-import { signalProcessGroup, stopProcessGroup } from './process-group.mjs'
+import { stopProcessGroup } from './process-group.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -549,22 +549,29 @@ const PTY_BRIDGE_STOP_GRACE_MS = 2_000
 
 // Stops a command/exec or process/spawn process. The pty bridge behind a
 // terminal ends its shell's session itself, told to or once its stdin closes;
-// SIGKILL follows if it has not exited by then.
-function stopClientProcess(child: ChildProcess): void {
+// SIGKILL follows if it has not exited by then. Settles once it has exited or
+// been sent SIGKILL.
+function stopClientProcess(child: ChildProcess): Promise<void> {
   // Exited, though a background child may still hold its pipes open and so
   // its handle: its pid may belong to another process by now.
-  if (child.exitCode !== null || child.signalCode !== null) return
-  if (!(child as any).__isPtyBridge) {
-    stopProcessGroup(child)
-    return
-  }
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+  if (!(child as any).__isPtyBridge) return stopProcessGroup(child)
   if (child.stdin?.writable) {
     // A bridge that has just exited fails the write.
     child.stdin.on('error', () => {})
     child.stdin.end(`${JSON.stringify({ action: 'kill' })}\n`)
   }
-  const kill = setTimeout(() => child.kill('SIGKILL'), PTY_BRIDGE_STOP_GRACE_MS)
-  kill.unref()
+  return new Promise((resolve) => {
+    const kill = setTimeout(() => {
+      child.kill('SIGKILL')
+      resolve()
+    }, PTY_BRIDGE_STOP_GRACE_MS)
+    kill.unref()
+    child.once('exit', () => {
+      clearTimeout(kill)
+      resolve()
+    })
+  })
 }
 
 // Drops a process's own entry only: a client that disconnected freed its id,
@@ -740,6 +747,8 @@ export class CodexClaudeAppServer {
   // Claude started a turn of its own while the thread's turn was settling.
   private pendingAutonomousTurns = new Set<string>()
   private lastTurnParamsByThread = new Map<string, Record<string, unknown>>()
+  // Whether each thread's server-side queue holds (see queueHeld).
+  private queueHolds = new Map<string, boolean>()
   private fuzzySessions = new Map<string, { roots: string[] }>()
   // Approvals the user gave "for this session", by thread: a command, a
   // non-edit tool call, or an MCP tool (see approvalSessionKey).
@@ -750,6 +759,10 @@ export class CodexClaudeAppServer {
   // The connection that started each command/exec and process/spawn process:
   // as in Codex, they end with it. thread/shellCommand's belong to the thread.
   private processOwners = new WeakMap<ChildProcess, string>()
+  // Stops under way, one per process, until each settles: a repeated
+  // process/kill joins the first, and stop() also waits for the ones a
+  // disconnect started after taking the process out of the maps.
+  private processStops = new Map<ChildProcess, Promise<void>>()
   // A watch belongs to the connection that made it: ids are unique per connection.
   private fsWatchers = new WeakMap<RpcPeer, Map<string, PathWatch>>()
   // Goal state lives in the store. These track the hidden continuation turns
@@ -922,7 +935,7 @@ export class CodexClaudeAppServer {
       for (const [id, child] of processes)
         if (this.processOwners.get(child) === peer.id) {
           processes.delete(id)
-          stopClientProcess(child)
+          void this.stopProcess(child)
         }
   }
 
@@ -930,16 +943,15 @@ export class CodexClaudeAppServer {
     if (this.stopped) return
     this.stopped = true
     const nativeStopped = this.codexBridge?.stop()
-    // command/exec runs in its own process group, out of reach of a signal to
-    // the adapter's group (launchd job stop, Ctrl-C), and a terminal has no
-    // timeout: end what is still running.
-    for (const child of this.commandProcesses.values()) signalProcessGroup(child, 'SIGTERM')
-    for (const child of this.processHandles.values()) stopClientProcess(child)
-    this.stopCommandsListener()
-    this.sleepMonitor.stop?.()
-    this.idleSleep.stop()
-    this.leaderThreads.stop()
+    // command/exec and process/spawn run in process groups of their own, out
+    // of reach of a signal to the adapter's group (launchd job stop, Ctrl-C),
+    // and a terminal has no timeout: end what is still running.
+    const processesStopped = this.stopClientProcesses()
     try {
+      this.stopCommandsListener()
+      this.sleepMonitor.stop?.()
+      this.idleSleep.stop()
+      this.leaderThreads.stop()
       for (const turnId of this.userShells.keys()) this.stopUserShells(turnId, 'server stopped')
       // Child turns are created directly from Task/Workflow events and are not
       // registered in activeTurnByThread. Finalize them before aborting the
@@ -960,6 +972,8 @@ export class CodexClaudeAppServer {
         await this.runtime.stop()
       } finally {
         try {
+          // Both, even when the native children's stop fails; then its error.
+          await Promise.allSettled([nativeStopped, processesStopped])
           await nativeStopped
         } finally {
           this.store.close()
@@ -968,10 +982,35 @@ export class CodexClaudeAppServer {
     }
   }
 
+  // Each command/exec and process/spawn process, stopped once: taken out of
+  // the maps first, so the clients that disconnect as the adapter goes do not
+  // signal them again. Settles when every one, and every one whose stop was
+  // already under way (a client that disconnected just before), has exited or
+  // been sent SIGKILL, which process.exit() would otherwise drop with its timer.
+  private stopClientProcesses(): Promise<unknown> {
+    const children = [...this.commandProcesses.values(), ...this.processHandles.values()]
+    this.commandProcesses.clear()
+    this.processHandles.clear()
+    for (const child of children) void this.stopProcess(child)
+    return Promise.all(this.processStops.values())
+  }
+
+  // stopClientProcess, kept in processStops until it settles.
+  private stopProcess(child: ChildProcess): Promise<void> {
+    let stopped = this.processStops.get(child)
+    if (!stopped) {
+      stopped = stopClientProcess(child).finally(() => this.processStops.delete(child))
+      this.processStops.set(child, stopped)
+    }
+    return stopped
+  }
+
   // Background agents keep running (and Claude may still answer them) after
   // every turn has settled; the daemon must not idle-exit underneath them.
+  // Nor under a turn still being claimed, such as a queued message the
+  // adapter dispatched while no client was connected.
   hasActiveTurns(): boolean {
-    if (this.activeTurnByThread.size > 0) return true
+    if (this.activeTurnByThread.size > 0 || this.startingTurnByThread.size > 0) return true
     if (this.codexBridge?.busy()) return true
     for (const entry of this.backgroundSubagents.values()) if (entry.running) return true
     return this.runtime.hasBackgroundWork?.() === true
@@ -2524,6 +2563,8 @@ export class CodexClaudeAppServer {
     this.goalToolHandlers.delete(threadId)
     this.leaderThreads.forget(threadId)
     this.elicitationCounts.delete(threadId)
+    // An unarchived thread's queue holds as its newest turn says.
+    this.queueHolds.delete(threadId)
   }
 
   private threadUnsubscribe(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -3017,8 +3058,19 @@ export class CodexClaudeAppServer {
     return this.dispatchQueued(peer, threadId, submission)
   }
 
+  // The queue holds once a turn ends interrupted, until the user starts a
+  // turn of their own (thread/queue/start runs one). A shell command, review,
+  // compaction, goal continuation or Claude's own follow-up in between leaves
+  // the hold as it was. Until this process starts a turn on the thread, the
+  // newest stored turn says.
   private queueHeld(threadId: string): boolean {
-    return this.store.lastTurnStatus(threadId) === 'interrupted'
+    return this.queueHolds.get(threadId) ?? this.store.lastTurnStatus(threadId) === 'interrupted'
+  }
+
+  // Before a turn is stored: from then on the hold no longer follows the
+  // newest turn, which may not be the user's.
+  private keepQueueHold(threadId: string): void {
+    if (!this.queueHolds.has(threadId)) this.queueHolds.set(threadId, this.queueHeld(threadId))
   }
 
   // Runs one queued submission as a regular user turn. The submission leaves
@@ -3067,7 +3119,8 @@ export class CodexClaudeAppServer {
   // The thread just went idle: run the next queued message, else keep an
   // active goal going. `settled` is the status of the turn that just ended,
   // when there is one; nothing follows an interrupt, and a goal does not
-  // retry a failure on its own. Returns whether a turn was started.
+  // retry a failure on its own. Returns whether a turn was started or is
+  // being started.
   private startFollowUp(threadId: string, settled?: TurnStatus): boolean {
     if (this.stopped || settled === 'interrupted' || this.activeTurnByThread.has(threadId))
       return false
@@ -3084,7 +3137,10 @@ export class CodexClaudeAppServer {
             params: { threadId, turnId: null, willRetry: false, error: turnErrorOf(error) },
           })
         })
-        return this.activeTurnByThread.has(threadId)
+        // Its turn is claimed across an await, so it is not active yet. The
+        // start keeps the adapter busy meanwhile, and checks idle itself if
+        // it ends up starting nothing (see turnStart).
+        return true
       }
     }
     if (settled === 'failed' || !this.canContinueGoal(threadId)) return false
@@ -4306,6 +4362,9 @@ export class CodexClaudeAppServer {
         this.startingTurnByThread.delete(threadId)
       }
       releaseStarting()
+      // A start counts as busy (see hasActiveTurns). One that left nothing
+      // running may leave the adapter idle.
+      if (this.activeTurnByThread.size === 0) this.checkIdle()
     }
   }
 
@@ -4472,6 +4531,7 @@ export class CodexClaudeAppServer {
       thread.preview = prompt.slice(0, 200)
       thread.updatedAt = nowSeconds()
     }
+    this.keepQueueHold(threadId)
     // Claim before publishing a preview, a policy change, or a model run. A
     // local side turn that crossed an await can still accept this input.
     for (;;) {
@@ -4505,7 +4565,7 @@ export class CodexClaudeAppServer {
         continue
       }
       if (ownedHere) throw invalidRequest(`thread ${threadId} already has an active turn`)
-      throw this.foreignTurnError(threadId)
+      throw this.claimRefusedError(threadId, claim.ownedBySelf)
     }
     recordRunEvent('turn.started', {
       threadId,
@@ -4517,7 +4577,11 @@ export class CodexClaudeAppServer {
     })
     this.activeTurnByThread.set(threadId, turnId)
     if (hiddenPrompt) this.goalTurns.add(turnId)
-    else if (params.outputSchema == null) this.goalIdleStreaks.delete(threadId)
+    else if (params.outputSchema == null) {
+      this.goalIdleStreaks.delete(threadId)
+      // The user's own turn releases a held queue.
+      this.queueHolds.set(threadId, false)
+    }
     this.syncGoalClock(threadId, this.store.getGoal(threadId))
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     const publicTurn = this.toLifecycleTurn(turn)
@@ -4890,10 +4954,15 @@ export class CodexClaudeAppServer {
       resolvedModel,
       resolvedEffort,
     })
+    // A fork resumes the session it was forked from as a fork of it until a
+    // turn of its own has written to a session. Counting turns instead would
+    // resume the parent's session itself after a first turn that failed
+    // before Claude started. A fork whose own turns left no checkpoints (one
+    // from before checkpoints) forks its own session once more, then has one.
     const forkSession =
       thread.forkedFromId != null &&
       thread.claudeSessionId != null &&
-      this.store.listTurns(thread.id).length <= 1
+      !this.store.turnsWroteSession(thread.id, thread.claudeSessionId)
     // Set after a rewind or fork: this turn resumes the session only up to a
     // checkpoint. It stays pending until Claude starts the forked session.
     const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
@@ -9454,7 +9523,7 @@ export class CodexClaudeAppServer {
     if (timeoutMs != null && timeoutMs > 0) {
       timeout = setTimeout(() => {
         timedOut = true
-        stopProcessGroup(child)
+        void stopProcessGroup(child)
       }, timeoutMs)
     }
 
@@ -9478,8 +9547,6 @@ export class CodexClaudeAppServer {
       child.once('exit', (code, signal) => {
         if (timeout) clearTimeout(timeout)
         forgetProcess(this.commandProcesses, processId, child)
-        // A child forked as the group was signalled can have missed it.
-        if (timedOut) signalProcessGroup(child, 'SIGKILL')
         const finish = () => {
           clearTimeout(drain)
           if (settled) return
@@ -9523,7 +9590,7 @@ export class CodexClaudeAppServer {
     const processId = stringOr(params.processId, '')
     const child = this.commandProcesses.get(processId)
     if (!child) throw invalidRequest(`unknown command process: ${processId}`)
-    stopProcessGroup(child)
+    void stopProcessGroup(child)
     return {}
   }
 
@@ -9578,6 +9645,9 @@ export class CodexClaudeAppServer {
         cwd,
         env: commandEnv(params.env),
         stdio: 'pipe',
+        // Its own process group, as for command/exec, so a kill, timeout or
+        // stop ends what it started too.
+        detached: process.platform !== 'win32',
       })
     }
     this.processHandles.set(processHandle, child)
@@ -9654,7 +9724,9 @@ export class CodexClaudeAppServer {
     const defaultTimeout = isInteractive ? 0 : 60_000
     const timeoutMs =
       params.timeoutMs == null ? defaultTimeout : numberOr(params.timeoutMs, defaultTimeout)
-    const timeout = timeoutMs > 0 ? setTimeout(() => child.kill('SIGTERM'), timeoutMs) : null
+    // Stopped as process/kill stops it: the group with SIGKILL to follow, or
+    // the pty bridge's own stop of its shell's session.
+    const timeout = timeoutMs > 0 ? setTimeout(() => void this.stopProcess(child), timeoutMs) : null
 
     child.once('error', (error) => {
       debugLog('process.spawn.error', {
@@ -9741,7 +9813,7 @@ export class CodexClaudeAppServer {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
     if (!child) throw invalidRequest(`unknown process handle: ${processHandle}`)
-    stopClientProcess(child)
+    void this.stopProcess(child)
     return {}
   }
 
@@ -10759,6 +10831,7 @@ export class CodexClaudeAppServer {
         error: error instanceof Error ? error.message : String(error),
       })
     }
+    if (settled?.status === 'interrupted') this.queueHolds.set(threadId, true)
     // Let the settled turn's notifications go out first. Claude's own
     // follow-up comes before the queue and goal continuation.
     if (this.pendingAutonomousTurns.delete(threadId)) {
@@ -10958,11 +11031,24 @@ export class CodexClaudeAppServer {
   // A standalone shell, review, compaction or continuation is also a turn.
   private claimSideTurn(turn: TurnRecord): void {
     this.flushPendingTurnEnds(turn.threadId)
+    this.keepQueueHold(turn.threadId)
     const claim = this.store.claimTurn(turn)
     if (claim.claimed) return
     if (this.activeTurnByThread.get(turn.threadId) === claim.activeTurn.id)
       throw invalidRequest(`thread ${turn.threadId} already has an active turn`)
-    throw this.foreignTurnError(turn.threadId)
+    throw this.claimRefusedError(turn.threadId, claim.ownedBySelf)
+  }
+
+  // A live turn of this process that is not the thread's active turn is a
+  // subagent's own: its agent runs inside the parent chat's turn or in the
+  // background, where only the parent can reach it.
+  private claimRefusedError(threadId: string, ownedBySelf: boolean): RpcError {
+    if (!ownedBySelf) return this.foreignTurnError(threadId)
+    if (this.store.getThread(threadId)?.threadSource === 'subagent')
+      return invalidRequest(
+        'this agent is still working; message it from its parent chat or wait for it to report',
+      )
+    return invalidRequest(`thread ${threadId} already has an active turn`)
   }
 
   private foreignTurnError(threadId: string): RpcError {

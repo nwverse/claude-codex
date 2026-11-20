@@ -6,6 +6,7 @@ import { reapOrphanedCliChildren } from './cli-orphans.mjs'
 import { daemonProbe, listening, startupConfigProbe } from './cli-probes.mjs'
 import { inheritedHooksWarning } from './inherited-config.mjs'
 import { replaceJsonFile } from './json-file.mjs'
+import { processStartTime } from './process-owner.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
 import { SessionStore } from './store.mjs'
@@ -134,10 +135,8 @@ async function main(): Promise<void> {
   const configOverrides = configArgs(args)
   setAppPluginConfigOverrides(configOverrides)
   const isUnixDaemon = listen.startsWith('unix://')
-  let pidFile: string | null = null
-  if (isUnixDaemon) {
-    pidFile = await ensureSingleUnixDaemon(listen)
-  }
+  const daemon = isUnixDaemon ? await ensureSingleUnixDaemon(listen) : null
+  const pidFile = daemon?.pidFile ?? null
 
   const store = new SessionStore()
   // The Codex App normally launches the app-server over stdio, so a crashed or
@@ -238,6 +237,11 @@ async function main(): Promise<void> {
     )
       return
     idleTimer = setTimeout(() => {
+      idleTimer = null
+      // Work can start with no peer connected while the timer runs (a queued
+      // message, a goal continuation, Claude's own follow-up). It is left
+      // alone, and its end checks idle again.
+      if (activePeers > 0 || server.hasActiveTurns()) return
       debugLog('adapter.idleExit', { idleExitMs, pid: process.pid })
       process.stderr.write(
         `[claude-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`,
@@ -270,9 +274,24 @@ async function main(): Promise<void> {
     startStdioTransport(onMessage, onClose)
     return
   }
-  transport = await startWebSocketTransport(normalized, onMessage, onClose, onConnect, {
-    ...(preparedWsAuth ? { auth: preparedWsAuth } : {}),
-  })
+  try {
+    transport = await startWebSocketTransport(normalized, onMessage, onClose, onConnect, {
+      ...(preparedWsAuth ? { auth: preparedWsAuth } : {}),
+    })
+  } catch (error) {
+    // Another daemon bound the socket while this one started, as when both
+    // started at the same moment and neither saw the other's pid file.
+    if (!daemon || (error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error
+    process.stderr.write(
+      `[claude-codex-adapter] app-server already running at ${daemon.socketPath}\n`,
+    )
+    await shutdown('socketInUse')
+  }
+}
+
+interface UnixDaemon {
+  socketPath: string
+  pidFile: string
 }
 
 // A bad option ends the process with its message alone, like the usage text:
@@ -281,11 +300,15 @@ function checkOptions<T>(check: () => T): T {
   try {
     return check()
   } catch (error) {
-    process.stderr.write(
-      `[claude-codex-adapter] ${error instanceof Error ? error.message : String(error)}\n`,
-    )
-    process.exit(1)
+    return optionError(error)
   }
+}
+
+function optionError(error: unknown): never {
+  process.stderr.write(
+    `[claude-codex-adapter] ${error instanceof Error ? error.message : String(error)}\n`,
+  )
+  process.exit(1)
 }
 
 // The --listen value, stdio:// when the flag is absent. `--listen` with no
@@ -318,28 +341,41 @@ function configArgs(args: string[]): string[] {
   return values
 }
 
-// How long after writing its pid file a starting daemon may take to listen.
-// A younger pid file whose process is alive counts as a daemon on its way up.
+// How long a second daemon waits for one that is still starting to listen,
+// or to exit so that it can take its place, before it leaves it to finish.
+// A pid whose process start time ps cannot read gets only this long from
+// the pid file's date, as it may belong to no daemon at all.
 const DAEMON_STARTUP_GRACE_MS = 10_000
+// How long the daemon a pid file names may go without listening before it is
+// taken for hung (or a zombie no one reaps) and replaced. Counted from the
+// file's date, which a touch, a restore or a sync can make later than the
+// daemon's start. A slow daemon replaced this way is safe: whichever binds
+// the socket second finds it taken and exits.
+const DAEMON_STARTUP_LIMIT_MS = 60_000
 
-async function ensureSingleUnixDaemon(listen: string): Promise<string> {
+async function ensureSingleUnixDaemon(listen: string): Promise<UnixDaemon> {
   const socketPath = listen === 'unix://' ? defaultSocketPath() : listen.slice('unix://'.length)
   const pidFile = `${socketPath}.pid`
   const shared = checkOptions(() => prepareUnixSocketParent(socketPath))
   const pid = checkOptions(() => readDaemonPid(pidFile, shared))
-  if (pid !== null && (await daemonIsRunning(pid, socketPath, pidFile))) {
+  const state = pid === null ? null : await daemonState(pid, socketPath, pidFile)
+  if (state) {
     process.stderr.write(
-      `[claude-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`,
+      `[claude-codex-adapter] app-server already ${state} at ${socketPath} (pid ${pid})\n`,
     )
     process.exit(0)
   }
-  // The pid file may be stale. Only a socket can be reclaimed at the listen path.
-  checkOptions(() => removeStaleSocket(socketPath, shared))
+  // The pid file may be stale. Only a socket that refuses a connection can be
+  // reclaimed at the listen path.
+  if (!(await removeStaleSocket(socketPath, shared).catch(optionError))) {
+    process.stderr.write(`[claude-codex-adapter] app-server already running at ${socketPath}\n`)
+    process.exit(0)
+  }
   // In a sticky temporary directory publish the decimal pid by rename, without
   // following an entry which appeared while the daemon was starting.
   if (shared) replaceJsonFile(pidFile, process.pid)
   else writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o600 })
-  return pidFile
+  return { socketPath, pidFile }
 }
 
 // The pid in the file, or null when it is missing or could not name another
@@ -363,24 +399,39 @@ function readDaemonPid(pidFile: string, shared: boolean): number | null {
   return Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid ? pid : null
 }
 
-// A live pid alone may be a recycled one, so the socket has to accept a
-// connection too. A daemon that wrote its pid file moments ago may still be
-// starting; give it until the grace window ends to begin listening.
-async function daemonIsRunning(pid: number, socketPath: string, pidFile: string): Promise<boolean> {
+// Whether the daemon the pid file names is running, still starting, or gone
+// (null). A live pid is that daemon only if its process had started by the
+// time the file was written; one that started later got the pid of a daemon
+// that is gone, as after a reboot. The daemon itself is not taken for gone
+// before the startup limit just because it does not listen yet: the store,
+// startup recovery and ps can take well over 10 s on a loaded machine.
+async function daemonState(
+  pid: number,
+  socketPath: string,
+  pidFile: string,
+): Promise<'running' | 'starting' | null> {
   let writtenAt: number
   try {
     writtenAt = statSync(pidFile).mtimeMs
   } catch {
-    return false
+    return null
   }
+  if (!processIsAlive(pid)) return null
+  const started = processStartTime(pid)
+  if (started !== null && started > writtenAt) return null
   // A pid file dated in the future (clock stepped back, network file system)
-  // gets one grace window from now, not until its date comes round.
-  const deadline = Math.min(writtenAt, Date.now()) + DAEMON_STARTUP_GRACE_MS
+  // counts from now, not from its date.
+  const now = Date.now()
+  const staleAt =
+    Math.min(writtenAt, now) +
+    (started === null ? DAEMON_STARTUP_GRACE_MS : DAEMON_STARTUP_LIMIT_MS)
+  const waitUntil = now + DAEMON_STARTUP_GRACE_MS
   for (;;) {
-    if (!processIsAlive(pid)) return false
-    if (await listening(socketPath)) return true
-    if (Date.now() >= deadline) return false
+    if (await listening(socketPath)) return 'running'
+    if (Date.now() >= staleAt) return null
+    if (Date.now() >= waitUntil) return 'starting'
     await sleep(200)
+    if (!processIsAlive(pid)) return null
   }
 }
 

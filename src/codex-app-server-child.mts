@@ -225,6 +225,10 @@ export class CodexAppServerChild {
   private onExit(proc: ChildProcessWithoutNullStreams, generation: number, reason: string): void {
     if (this.proc !== proc) return
     this.proc = null
+    // What it started in its group goes with it, as on stop(): an MCP helper
+    // may have closed its stdio and outlived it. Sent right as Node reports
+    // the exit, before the group's id can have been reused.
+    signalProcessGroup(proc, 'SIGKILL')
     debugLog('codexChild.exit', { provider: this.provider, generation, reason })
     this.failPending(`codex app-server (${this.provider}) ${reason}`)
     this.listener.exited(this.provider, generation, reason)

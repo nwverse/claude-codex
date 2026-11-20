@@ -17,6 +17,10 @@ versioning or publishing metadata.
 - A native Codex chat keeps its active sidebar state when another adapter opens
   the same state directory. A later startup clears the activity marker if the
   adapter that ran the native turn has exited.
+- A native `codex app-server` child that exits on its own (a crash) now takes
+  the rest of its process group with it, as a stopped one does, so helpers it
+  started, such as MCP servers that ignore stdin EOF, no longer run on after
+  every crash. (#334)
 
 ### `ws://` listener authentication
 
@@ -262,6 +266,20 @@ versioning or publishing metadata.
   reconnect, holding their handles, and a terminal without a pty even outlived
   the adapter. A stopping adapter now ends the terminals still open, and
   `process/kill` follows up with SIGKILL when a process ignores SIGTERM.
+- A stopping adapter (launchd stop, idle exit, the stdio pipe closing) sends
+  each running `command/exec` and `process/spawn` process group SIGTERM once
+  and SIGKILLs what is left after at most 1 s, before it exits. A command
+  that ignored SIGTERM used to outlive the adapter, and one that handled it
+  got a second SIGTERM as the clients disconnected. (#334)
+- A `process/spawn` without a pty runs in its own process group, as
+  `command/exec` does: `process/kill`, `timeoutMs` (60 s by default for a
+  non-interactive process) and a stopping adapter now end what it started,
+  not only its own process, with SIGKILL for what ignores SIGTERM, so its
+  `process/exited` comes and its handle is free again. A terminal that
+  reaches `timeoutMs` is stopped as `process/kill` stops it, shell session
+  included, instead of losing only its pty bridge. For `command/exec` too,
+  the SIGKILL now comes as soon as the command exits if that is before the
+  1 s grace ends, and never later. (#334)
 - A terminal with a TTY (`process/spawn` with `tty`) reports `process/exited`
   as soon as its command exits, after the rest of its output, with the real
   exit code (128+N for a signal, 127 when the command cannot start). It used
@@ -302,6 +320,10 @@ versioning or publishing metadata.
   A window attached to another adapter can read the chat while a turn runs and
   retry a message after it completes. A surviving adapter can start the next
   turn after the previous owner exits. (#283)
+- A message, shell command or review sent to the thread of a subagent that is
+  still working is refused with "this agent is still working; message it from
+  its parent chat or wait for it to report", instead of naming an active turn
+  in another adapter process that does not exist. (#335)
 - A `turn/start` sent while another is still starting on the same thread, or
   a goal continuation that waited on it, joins that turn instead of opening a
   second run whose answer was dropped, and a late cleanup from an older turn
@@ -405,6 +427,14 @@ versioning or publishing metadata.
   with continuation turns, token and time budgets and goal tools for Claude;
   steer errors in Codex's wording; `thread/queue/*`; and a `turn/start` that
   races a running turn joins it instead of orphaning it.
+- A queued message that starts after the App disconnected is no longer killed
+  by the unix daemon's idle exit 15 s into its turn, with the message already
+  gone from the queue; nor is any other turn that starts while the daemon
+  counts down, such as Claude answering a background agent's report. The
+  daemon exits once nothing runs. (#335)
+- After an interrupt, the queue stays held until `thread/queue/start` or the
+  user's next message. A `!` shell command, review or compaction in between
+  used to send the next queued message on its own. (#335)
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.
@@ -470,6 +500,18 @@ versioning or publishing metadata.
   stack trace after it, or a silent `stdio://`. The unix daemon no longer
   refuses to start over a pid file that is empty, holds `0`, or names a
   process that is not listening on the socket.
+- A unix daemon that takes more than 10 seconds to start no longer gets a
+  second daemon beside it. A second `--listen unix://` used to take it for
+  stale after 10 seconds and start too; one of the two then removed the
+  other's socket, and the daemon left without one kept the state database and
+  its Claude runtime open and never exited. The process the pid file names now
+  gets up to 60 seconds from the file's date to start listening, unless it
+  started after the file was written (a reused pid); when `ps` cannot report
+  its start time, the 10 seconds still apply. Meanwhile a second daemon says
+  `app-server already starting` (or `already running`) and exits 0. A daemon
+  removes a socket at its path only when the socket refuses a connection, so
+  of two daemons that do start, the one that binds second leaves the socket
+  to the first and exits. (#329)
 - With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
   Code processes one at a time: a new session waits until the previous
   launch has sent its first SDK message, has ended, or has held the slot for
@@ -870,6 +912,24 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- A Claude chat keeps its conversation when its workspace folder is moved or
+  renamed. The adapter looks for the transcript under the workspace it last
+  recorded, in the chat's own Claude config folder, and resumes an
+  independent copy for the new path, or the transcript itself when the new
+  name maps to the same Claude Code project folder (`my_project` to
+  `my-project`). It used to start a new session silently and send Claude only
+  the newest message. When the transcript cannot be found, for example after
+  Claude Code deleted sessions older than its `cleanupPeriodDays` (30 days by
+  default), the chat continues in a new Claude session and a notice says the
+  earlier conversation could not be found. So does a chat whose Claude config
+  folder was deleted; the new session creates it again. A config folder that
+  is out of reach (a link or parent folder that is gone, as on an unmounted
+  volume, or a folder that cannot be read) fails the turn instead, and the
+  chat keeps its session for when the folder is back. (#324, #327)
+- A fork whose first turn failed before Claude Code started still forks its
+  parent's Claude session on its next turn. It used to resume the parent's
+  session itself and write the fork's conversation into the parent's
+  transcript. (#327)
 - A deleted chat stays deleted and a rename sticks when a `turn/start`
   arrives at the same time, for example from a second window on the same
   chat. `turn/start` re-reads the thread after waiting on a running turn
