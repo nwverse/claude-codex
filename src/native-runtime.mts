@@ -605,8 +605,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (typeof query.stopTask !== 'function') return false
     live.requestedStops.add(taskId)
     try {
-      await query.stopTask(taskId)
-      return true
+      // A delete or archive waits on the stop, so a session that never
+      // answers must not hold it up; the stop stays requested.
+      const settled = await settlesWithin(query.stopTask(taskId), SESSION_CONTROL_TIMEOUT_MS)
+      if (!settled) debugLog('native.task.stop_timeout', { threadId, taskId })
+      return settled
     } catch (error) {
       live.requestedStops.delete(taskId)
       debugLog('native.task.stop_failed', {

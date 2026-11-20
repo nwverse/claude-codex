@@ -199,6 +199,39 @@ test('a turn/start keeps a rename that lands while it starts', { timeout: 20_000
   })
 })
 
+test('moving a thread between sections tells every client, as Codex does', {
+  timeout: 20_000,
+}, async () => {
+  await withServer(async (connect) => {
+    const a = connect('a')
+    const b = connect('b')
+    const threadId = await startThread(a)
+    // b follows no thread: the sidebar is everyone's.
+    await b.request('threadSection/list', {})
+    const { section } = (await a.request('threadSection/create', { name: 'Work' })).result
+    const changed = (message: any) => message.method === 'thread/section/changed'
+
+    await a.request('thread/section/move', { threadId, sectionId: section.id })
+    for (const peer of [a, b])
+      assert.deepEqual((await peer.until(changed)).at(-1).params, {
+        threadId,
+        sectionId: section.id,
+      })
+    await b.request('thread/section/move', { threadId, sectionId: null })
+    for (const peer of [a, b])
+      assert.deepEqual((await peer.until(changed)).at(-1).params, { threadId, sectionId: null })
+
+    // A refused move says nothing.
+    await assert.rejects(
+      a.request('thread/section/move', { threadId, sectionId: 'gone' }),
+      /unknown section: gone/,
+    )
+    await a.request('thread/read', { threadId })
+    assert.equal(a.received.filter(changed).length, 2)
+    assert.equal(b.received.filter(changed).length, 2)
+  })
+})
+
 test('an approval left by an interrupted turn is not shown to a later follower', {
   timeout: 20_000,
 }, async () => {

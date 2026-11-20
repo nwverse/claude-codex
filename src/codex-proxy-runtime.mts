@@ -63,13 +63,12 @@ export class CodexProxyRuntime implements ClaudeRuntime {
     return new Promise<void>((resolve, reject) => {
       // `codex exec --json` emits one JSONL event per line. Flags:
       //   --skip-git-repo-check        run anywhere, mirroring App behavior
-      //   --dangerously-bypass-...     skip codex's own approval modal — our
-      //                                adapter handles policies upstream via
-      //                                approvalPolicy/sandboxMode; codex
-      //                                would otherwise prompt on stdin and
-      //                                deadlock the JSONL stream.
-      //   -s <mode>                    read-only / workspace-write sandbox (any other mode takes
-      //                                the bypass flag)
+      //   --dangerously-bypass-...     danger-full-access threads only: no
+      //                                sandbox and no approvals
+      //   -s <mode>                    read-only / workspace-write sandbox. A thread stored
+      //                                with no sandbox (an older row, or a value the adapter
+      //                                does not know) runs workspace-write, as the App is
+      //                                told it does (sandboxEnvelope), never unsandboxed
       //   -m <model>                   the model the user picked in the App
       //   -C <cwd>                     anchor the workspace
       //   --add-dir <dir>              extra writable roots (CLAUDE_CODEX_ADD_DIRS)
@@ -78,10 +77,10 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       //                                of its own
       const resumeId = context.claudeSessionId
       const args: string[] = ['exec', '--json', '--skip-git-repo-check']
-      if (context.sandboxMode === 'read-only' || context.sandboxMode === 'workspace-write') {
-        args.push('-s', context.sandboxMode)
-      } else {
+      if (context.sandboxMode === 'danger-full-access') {
         args.push('--dangerously-bypass-approvals-and-sandbox')
+      } else {
+        args.push('-s', context.sandboxMode === 'read-only' ? 'read-only' : 'workspace-write')
       }
       if (context.model) args.push('-m', context.model)
       if (context.cwd) args.push('-C', context.cwd)

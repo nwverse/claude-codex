@@ -321,6 +321,49 @@ test('old turn diffs leave the store open at once and go a few rows per write', 
   }
 })
 
+test('a diff cleanup a failing write stops says so in the debug log, and the next start goes on', async () => {
+  const { home, path } = await cleanStore()
+  const log = join(home, 'debug.jsonl')
+  const previous = process.env.CLAUDE_CODEX_DEBUG_LOG
+  process.env.CLAUDE_CODEX_DEBUG_LOG = log
+  const raw = new DatabaseSync(path)
+  try {
+    olderBuildWrite(raw, 'old', 'x'.repeat(1024))
+    // Stands in for a write that fails, such as one another adapter's write
+    // lock holds up past the busy timeout.
+    raw.exec(`CREATE TRIGGER failing_diff_clear BEFORE UPDATE OF diff ON turns
+      BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END`)
+    let store = new SessionStore(path)
+    try {
+      await store.clearStoredTurnDiffs()
+    } finally {
+      store.close()
+    }
+    assert.deepEqual(diffBytes(raw), ['old:1024'])
+    const stopped = (existsSync(log) ? readFileSync(log, 'utf8') : '')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.event === 'store.diff_clear_stopped')
+    assert.equal(stopped.length, 1)
+    assert.match(stopped[0].error, /simulated write failure/)
+
+    raw.exec('DROP TRIGGER failing_diff_clear')
+    store = new SessionStore(path)
+    try {
+      await store.clearStoredTurnDiffs()
+    } finally {
+      store.close()
+    }
+    assert.deepEqual(diffBytes(raw), ['old:0'])
+  } finally {
+    raw.close()
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_DEBUG_LOG
+    else process.env.CLAUDE_CODEX_DEBUG_LOG = previous
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('another adapter can finish a column migration between the probe and the write', async (t) => {
   const { home, path } = await cleanStore()
   const other = new DatabaseSync(path)
