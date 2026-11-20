@@ -571,6 +571,12 @@ versioning or publishing metadata.
   removes a socket at its path only when the socket refuses a connection, so
   of two daemons that do start, the one that binds second leaves the socket
   to the first and exits. (#329)
+- An adapter starting on a new state directory creates its state database in
+  one commit instead of 56. With every commit flushed to disk, that took over
+  200 fsyncs before the first daemon listened, which a busy disk stretched to
+  seconds. The debug log now records when each startup step ends
+  (`adapter.startup`, in ms since the process started), so a slow start shows
+  where the time went. (#345)
 - With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
   Code processes one at a time: a new session waits until the previous
   launch has sent its first SDK message, has ended, or has held the slot for
