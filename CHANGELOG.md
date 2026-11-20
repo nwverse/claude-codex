@@ -370,7 +370,11 @@ versioning or publishing metadata.
   subagent thread of a chat being deleted now goes with it instead of failing
   with `unknown thread`. Deleting or archiving a chat ends its turns before
   its background agents, so a turn on a subagent thread can no longer launch
-  an agent that keeps running in the archived chat. (#341)
+  an agent that keeps running in the archived chat. A second `thread/archive`
+  or `thread/delete` of the same chat waits for the first and answers with
+  it, instead of finishing early and letting a new turn in, and a background
+  agent whose stop Claude Code never confirms holds either up for at most
+  5 seconds. (#341)
 - Startup recovery streams the completed history and rechecks a turn before
   repairing its activity markers. A report another adapter finished while
   recovery was scanning stays in the conversation.

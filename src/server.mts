@@ -707,12 +707,13 @@ export class CodexClaudeAppServer {
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
   // Threads a thread/delete is removing, and threads a thread/archive is
-  // putting away. Each waits for their turns to end first; a turn, review,
-  // compaction, shell command or continuation in that gap, on one of them or
-  // on a subagent thread below one, is refused, and no queued message starts,
-  // rather than starting a turn on a thread that is about to go.
-  private deletingThreads = new Set<string>()
-  private archivingThreads = new Set<string>()
+  // putting away, each with the work under way. Each waits for their turns to
+  // end first; a turn, review, compaction, shell command or continuation in
+  // that gap, on one of them or on a subagent thread below one, is refused,
+  // and no queued message starts, rather than starting a turn on a thread
+  // that is about to go.
+  private deletingThreads = new Map<string, Promise<void>>()
+  private archivingThreads = new Map<string, Promise<void>>()
   private readonly startingTurnByThread = new Map<string, Promise<void>>()
   // Turns whose runtime run is scheduled or has not returned yet. A turn outside this
   // set has nothing left that would ever end it.
@@ -2529,12 +2530,9 @@ export class CodexClaudeAppServer {
   // background agents) and archives the subagent threads it spawned with it.
   private async threadArchive(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = this.knownThreadId(params)
-    this.archivingThreads.add(threadId)
-    try {
-      await this.archiveThread(peer, threadId)
-    } finally {
-      this.archivingThreads.delete(threadId)
-    }
+    await this.whileMarked(this.archivingThreads, threadId, () =>
+      this.archiveThread(peer, threadId),
+    )
     return {}
   }
 
@@ -3527,13 +3525,28 @@ export class CodexClaudeAppServer {
       if (params.missingRolloutRecovery === true) return {}
       throw new Error(`no rollout found for thread id ${threadId}`)
     }
-    this.deletingThreads.add(threadId)
-    try {
-      await this.removeThread(peer, threadId)
-    } finally {
-      this.deletingThreads.delete(threadId)
-    }
+    await this.whileMarked(this.deletingThreads, threadId, () => this.removeThread(peer, threadId))
     return {}
+  }
+
+  // Runs a thread/delete or thread/archive with its thread marked in
+  // `running` until the work is done. The same request for the same thread
+  // meanwhile waits for that work and shares its outcome; on its own it would
+  // find nothing left to stop, finish first and unmark the thread too soon.
+  private whileMarked(
+    running: Map<string, Promise<void>>,
+    threadId: string,
+    work: () => Promise<void>,
+  ): Promise<void> {
+    let done = running.get(threadId)
+    if (!done) {
+      // The mark goes on before any of the work runs.
+      done = Promise.resolve()
+        .then(work)
+        .finally(() => running.delete(threadId))
+      running.set(threadId, done)
+    }
+    return done
   }
 
   private async removeThread(peer: RpcPeer, threadId: string): Promise<void> {
@@ -3569,9 +3582,7 @@ export class CodexClaudeAppServer {
     // compaction or user shell of its own; each ends like the parent's turn.
     // Turns end first: one still running could launch another agent while
     // the agents stop.
-    for (const id of this.store.subagentTreeIds(threadId)) {
-      if (this.activeTurnByThread.has(id)) await this.turnInterrupt(peer, { threadId: id })
-    }
+    for (const id of this.store.subagentTreeIds(threadId)) await this.endActiveTurn(peer, id)
     for (const entry of [...this.backgroundSubagents.values()]) {
       if (!entry.running) continue
       if (
@@ -3582,6 +3593,20 @@ export class CodexClaudeAppServer {
         continue
       await this.stopBackgroundSubagent(entry)
     }
+  }
+
+  // Ends the thread's running turn, if any, as turn/interrupt ends it. Unlike
+  // a Stop on the thread, it never stops the thread's own background agent in
+  // the turn's place: the parent can resume that agent while the user runs a
+  // turn on its thread.
+  private async endActiveTurn(peer: RpcPeer, threadId: string): Promise<void> {
+    const turnId = this.activeTurnByThread.get(threadId)
+    if (!turnId) return
+    this.subscribe(threadId, peer)
+    // A user shell on its own has no runtime turn to interrupt.
+    const shell = this.userShells.get(turnId)?.standalone === true
+    this.settleInterruptedTurn(peer, threadId, turnId)
+    if (!shell) await this.runtime.interrupt(threadId)
   }
 
   private async threadShellCommand(
@@ -4685,8 +4710,8 @@ export class CodexClaudeAppServer {
     return this.inTreeOf(this.archivingThreads, threadId)
   }
 
-  private inTreeOf(roots: Set<string>, threadId: string): boolean {
-    for (const id of roots)
+  private inTreeOf(roots: Map<string, unknown>, threadId: string): boolean {
+    for (const id of roots.keys())
       if (id === threadId || this.isSubagentDescendant(threadId, id)) return true
     return false
   }
