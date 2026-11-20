@@ -284,6 +284,10 @@ versioning or publishing metadata.
   A window attached to another adapter can read the chat while a turn runs and
   retry a message after it completes. A surviving adapter can start the next
   turn after the previous owner exits. (#283)
+- A message, shell command or review sent to the thread of a subagent that is
+  still working is refused with "this agent is still working; message it from
+  its parent chat or wait for it to report", instead of naming an active turn
+  in another adapter process that does not exist. (#335)
 - A `turn/start` sent while another is still starting on the same thread, or
   a goal continuation that waited on it, joins that turn instead of opening a
   second run whose answer was dropped, and a late cleanup from an older turn
@@ -387,6 +391,14 @@ versioning or publishing metadata.
   with continuation turns, token and time budgets and goal tools for Claude;
   steer errors in Codex's wording; `thread/queue/*`; and a `turn/start` that
   races a running turn joins it instead of orphaning it.
+- A queued message that starts after the App disconnected is no longer killed
+  by the unix daemon's idle exit 15 s into its turn, with the message already
+  gone from the queue; nor is any other turn that starts while the daemon
+  counts down, such as Claude answering a background agent's report. The
+  daemon exits once nothing runs. (#335)
+- After an interrupt, the queue stays held until `thread/queue/start` or the
+  user's next message. A `!` shell command, review or compaction in between
+  used to send the next queued message on its own. (#335)
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.

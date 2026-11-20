@@ -238,6 +238,11 @@ async function main(): Promise<void> {
     )
       return
     idleTimer = setTimeout(() => {
+      idleTimer = null
+      // Work can start with no peer connected while the timer runs (a queued
+      // message, a goal continuation, Claude's own follow-up). It is left
+      // alone, and its end checks idle again.
+      if (activePeers > 0 || server.hasActiveTurns()) return
       debugLog('adapter.idleExit', { idleExitMs, pid: process.pid })
       process.stderr.write(
         `[claude-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`,

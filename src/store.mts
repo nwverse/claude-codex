@@ -1378,11 +1378,12 @@ export class SessionStore {
   // Atomically claims the thread's one active foreground turn. A live owner
   // in another adapter wins; a dead owner's turn is settled before this one
   // replaces it. The write lock makes the check and insert one operation
-  // across every server sharing this database.
+  // across every server sharing this database. A refusal says whether the
+  // live turn is this process's own.
   claimTurn(
     turn: TurnRecord,
     onClaim?: () => void,
-  ): { claimed: true } | { claimed: false; activeTurn: TurnRecord } {
+  ): { claimed: true } | { claimed: false; activeTurn: TurnRecord; ownedBySelf: boolean } {
     // ps can take seconds, so read liveness before taking the write lock. An
     // owner can only go from alive to dead meanwhile, so a stale answer at
     // worst rejects this claim, never displaces a live owner.
@@ -1413,17 +1414,22 @@ export class SessionStore {
       )
       const activeRows = inProgress.all(turn.threadId) as StaleTurnRow[]
       const self = currentProcessOwner()
+      const ownedBySelf = (row: StaleTurnRow): boolean =>
+        row.owner_pid === self.pid && row.owner_started === self.started
       const ownerAlive = (row: StaleTurnRow): boolean => {
-        if (row.owner_pid === self.pid && row.owner_started === self.started) {
-          return true
-        }
+        if (ownedBySelf(row)) return true
         // An older adapter can still write rows with no owner information.
         // The writer may be live, so leave these to startup recovery.
         if (row.owner_pid == null) return true
         return aliveOf(Number(row.owner_pid), row.owner_started)
       }
       const live = activeRows.find(ownerAlive)
-      if (live) return { claimed: false as const, activeTurn: this.rowToTurn(live) }
+      if (live)
+        return {
+          claimed: false as const,
+          activeTurn: this.rowToTurn(live),
+          ownedBySelf: ownedBySelf(live),
+        }
 
       // Settled the way startup recovery settles them: items the owner left
       // running end too, and the row keeps naming the owner that ran it.
