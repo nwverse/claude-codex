@@ -2574,7 +2574,7 @@ export class CodexClaudeAppServer {
     this.goalToolHandlers.delete(threadId)
     this.leaderThreads.forget(threadId)
     this.elicitationCounts.delete(threadId)
-    // An unarchived thread's queue holds as its newest turn says.
+    // An unarchived thread's queue holds as its stored turns say.
     this.queueHolds.delete(threadId)
   }
 
@@ -3073,15 +3073,18 @@ export class CodexClaudeAppServer {
   // turn of their own (thread/queue/start runs one). A shell command, review,
   // compaction, goal continuation or Claude's own follow-up in between leaves
   // the hold as it was. Until this process starts a turn on the thread, the
-  // newest stored turn says.
+  // stored turns say, so a hold outlives a restart.
   private queueHeld(threadId: string): boolean {
-    return this.queueHolds.get(threadId) ?? this.store.lastTurnStatus(threadId) === 'interrupted'
+    return this.queueHolds.get(threadId) ?? this.store.interruptedSinceUserTurn(threadId)
   }
 
-  // Before a turn is stored: from then on the hold no longer follows the
-  // newest turn, which may not be the user's.
-  private keepQueueHold(threadId: string): void {
-    if (!this.queueHolds.has(threadId)) this.queueHolds.set(threadId, this.queueHeld(threadId))
+  // Pins the hold in memory before turn/start stores a turn: the stored
+  // turns would take a structured summary turn for the user's own. Only this
+  // adds an entry. A helper thread (a title, description or summary) has no
+  // queue, and is never archived or deleted to drop its entry.
+  private keepQueueHold(thread: ThreadRecord): void {
+    if (!thread.ephemeral && !this.queueHolds.has(thread.id))
+      this.queueHolds.set(thread.id, this.queueHeld(thread.id))
   }
 
   // Runs one queued submission as a regular user turn. The submission leaves
@@ -4538,7 +4541,7 @@ export class CodexClaudeAppServer {
       thread.preview = prompt.slice(0, 200)
       thread.updatedAt = nowSeconds()
     }
-    this.keepQueueHold(threadId)
+    this.keepQueueHold(thread)
     // Claim before publishing a preview, a policy change, or a model run. A
     // local side turn that crossed an await can still accept this input.
     for (;;) {
@@ -4589,7 +4592,7 @@ export class CodexClaudeAppServer {
     else if (params.outputSchema == null) {
       this.goalIdleStreaks.delete(threadId)
       // The user's own turn releases a held queue.
-      this.queueHolds.set(threadId, false)
+      if (this.queueHolds.has(threadId)) this.queueHolds.set(threadId, false)
     }
     this.syncGoalClock(threadId, this.store.getGoal(threadId))
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
@@ -10871,7 +10874,9 @@ export class CodexClaudeAppServer {
         error: error instanceof Error ? error.message : String(error),
       })
     }
-    if (settled?.status === 'interrupted') this.queueHolds.set(threadId, true)
+    // Without an entry the stored turns already say held.
+    if (settled?.status === 'interrupted' && this.queueHolds.has(threadId))
+      this.queueHolds.set(threadId, true)
     // Let the settled turn's notifications go out first. Claude's own
     // follow-up comes before the queue and goal continuation.
     if (this.pendingAutonomousTurns.delete(threadId)) {
@@ -11072,11 +11077,12 @@ export class CodexClaudeAppServer {
   }
 
   // A standalone shell, review, compaction or continuation is also a turn.
+  // The stored turns tell it from the user's own (see
+  // interruptedSinceUserTurn), so it needs no keepQueueHold.
   private claimSideTurn(turn: TurnRecord): void {
     // stop() has settled the turns it knew of; one claimed now would never end.
     if (this.stopped) throw invalidRequest('server stopped')
     this.flushPendingTurnEnds(turn.threadId)
-    this.keepQueueHold(turn.threadId)
     const claim = this.store.claimTurn(turn)
     if (claim.claimed) return
     if (this.activeTurnByThread.get(turn.threadId) === claim.activeTurn.id)

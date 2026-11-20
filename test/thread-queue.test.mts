@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
+import { type InProcessApp, scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 const text = (value: string) => [{ type: 'text', text: value, text_elements: [] }]
 
@@ -28,6 +28,10 @@ function holdingRuntime() {
   return { runtime, prompts, releases }
 }
 
+// The server's in-memory queue holds, by thread.
+const queueHolds = (app: InProcessApp) =>
+  (app.server as unknown as { queueHolds: Map<string, boolean> }).queueHolds
+
 test('a queued message started after a turn keeps the adapter busy until its own turn ends', async () => {
   const { runtime, releases } = holdingRuntime()
   await withInProcessApp(runtime, async (app) => {
@@ -53,7 +57,7 @@ test('a queued message started after a turn keeps the adapter busy until its own
   })
 })
 
-test('a shell command, review or compaction after an interrupt leaves the queue held', async () => {
+test('a shell command, review or compaction after an interrupt leaves the queue held, after a restart too', async () => {
   const { runtime, prompts, releases } = holdingRuntime()
   await withInProcessApp(runtime, async (app) => {
     const threadId = await app.startThread({ cwd: app.home })
@@ -73,6 +77,10 @@ test('a shell command, review or compaction after an interrupt leaves the queue 
     await runSideTurn('thread/shellCommand', { command: 'true' })
     await runSideTurn('review/start', { target: { type: 'uncommittedChanges' } })
     await runSideTurn('thread/compact/start', {})
+    // A restarted adapter has only the stored turns to go by, the newest of
+    // them not the user's.
+    queueHolds(app).clear()
+    await runSideTurn('thread/shellCommand', { command: 'true' })
     // A follow-up would have started within a tick of the last one ending.
     await delay(100)
     const held = await app.request('thread/queue/list', { threadId })
@@ -92,5 +100,21 @@ test('a shell command, review or compaction after an interrupt leaves the queue 
     )
     await app.waitFor(() => (app.server.hasActiveTurns() ? undefined : true))
     assert.deepEqual((await app.request('thread/queue/list', { threadId })).data, [])
+  })
+})
+
+test('turns on a helper thread leave no queue hold behind', async () => {
+  const { runtime, releases } = holdingRuntime()
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    await app.turnCompleted(await app.startTurn(threadId, 'a chat'))
+    // Title, description and summary threads are never archived or deleted.
+    const helperId = await app.startThread({ ephemeral: true })
+    await app.turnCompleted(await app.startTurn(helperId, 'a title'))
+    const stopped = await app.startTurn(helperId, '[hold] a summary the user stops')
+    await app.waitFor(() => releases.get(stopped))
+    await app.request('turn/interrupt', { threadId: helperId, turnId: stopped })
+    await app.turnCompleted(stopped)
+    assert.deepEqual([...queueHolds(app).keys()], [threadId])
   })
 })

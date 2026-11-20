@@ -1694,6 +1694,24 @@ export class SessionStore {
     return typeof row?.status === 'string' ? (row.status as TurnRecord['status']) : null
   }
 
+  // Whether a turn of the thread ended interrupted since the user's newest
+  // turn of their own started, or that turn did: a held queue, as a restarted
+  // adapter finds it. The user's turns open with their message (or a tool's
+  // output); a review's message comes with its enteredReviewMode item, and a
+  // standalone shell command, compaction, goal continuation or Claude's own
+  // follow-up opens with none.
+  interruptedSinceUserTurn(threadId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT status FROM turns WHERE thread_id = ? AND (status = 'interrupted'
+           OR (json_extract(items_json, '$[0].type') IN ('userMessage', 'functionCallOutput')
+             AND json_extract(items_json, '$[1].type') IS NOT 'enteredReviewMode'))
+         ORDER BY started_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get(threadId) as { status?: unknown } | undefined
+    return row?.status === 'interrupted'
+  }
+
   lastTurn(threadId: string): TurnRecord | null {
     const row = this.db
       .prepare(

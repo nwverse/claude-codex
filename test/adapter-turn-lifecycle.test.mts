@@ -390,7 +390,7 @@ test('thread/queue pauses after an interrupt until thread/queue/start', async ()
   }
 })
 
-test('a held queue stays held across a restart and a shell command after it', async () => {
+test('a held queue stays held across a restart, with shell commands before and after it', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   let proc = spawnMockAdapter(home)
   let reader = new JsonLineReader(proc)
@@ -407,21 +407,23 @@ test('a held queue stays held across a restart and a shell command after it', as
     const queued = (await call(3, 'thread/queue/add', { threadId, input: textInput('held') }))
       .result.queuedSubmission
     await call(4, 'turn/interrupt', { threadId, turnId })
+    // The shell's turn becomes the thread's newest; the hold is the
+    // interrupted turn's, before a restart and after it.
+    await call(5, 'thread/shellCommand', { threadId, command: 'true' })
+    await awaitMessage(reader, (message) => message.method === 'turn/completed')
     await stopProcess(proc)
 
     proc = spawnMockAdapter(home)
     reader = new JsonLineReader(proc)
-    await call(5, 'thread/resume', { threadId })
-    // The shell's turn becomes the thread's newest; the hold is the
-    // interrupted turn's.
-    await call(6, 'thread/shellCommand', { threadId, command: 'true' })
+    await call(6, 'thread/resume', { threadId })
+    await call(7, 'thread/shellCommand', { threadId, command: 'true' })
     await awaitMessage(reader, (message) => message.method === 'turn/completed')
     const quiet = await readQuiet(reader, 400)
     assert.equal(
       quiet.some((message) => message.method === 'turn/started'),
       false,
     )
-    const held = await call(7, 'thread/queue/list', { threadId, cursor: null })
+    const held = await call(8, 'thread/queue/list', { threadId, cursor: null })
     assert.deepEqual(
       held.result.data.map((entry: any) => entry.id),
       [queued.id],

@@ -491,6 +491,10 @@ versioning or publishing metadata.
 - After an interrupt, the queue stays held until `thread/queue/start` or the
   user's next message. A `!` shell command, review or compaction in between
   used to send the next queued message on its own. (#335)
+- That hold also outlives an adapter restart, such as the unix daemon's idle
+  exit 15 s after the App disconnects: a `!` shell command, review or
+  compaction after the interrupt and another one after the restart no longer
+  send the next queued message. (#351)
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.
