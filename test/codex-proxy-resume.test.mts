@@ -84,9 +84,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
           'exec',
           '--json',
           '--skip-git-repo-check',
-          ...(sandboxMode === 'workspace-write' || sandboxMode === 'read-only'
-            ? ['-s', sandboxMode]
-            : ['--dangerously-bypass-approvals-and-sandbox']),
+          // Only Full Access runs unsandboxed: a thread with no stored sandbox
+          // runs workspace-write, as the App is told.
+          ...(sandboxMode === 'danger-full-access'
+            ? ['--dangerously-bypass-approvals-and-sandbox']
+            : ['-s', sandboxMode ?? 'workspace-write']),
           '-m',
           'gpt-test',
           '-C',

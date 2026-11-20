@@ -85,6 +85,7 @@ import {
   invalidParams,
   invalidRequest,
   invalidRequestIfThrows,
+  METHOD_NOT_FOUND,
   methodNotFound,
   RpcError,
   SERVER_ERROR,
@@ -244,6 +245,7 @@ import {
   pageLimit,
   pageTimeline,
   pageTurns,
+  readItems,
   sortDirectionOr,
   threadSnippet,
 } from './thread-history.mjs'
@@ -467,6 +469,9 @@ interface PendingServerRequest {
 const DETACHED_PEER: RpcPeer = { id: 'detached', send: () => {}, close: () => {} }
 
 const MAX_TRACKED_TASK_IDS = 512
+// Background agents that reported back and are still known as they ran (see
+// keepFinishedBackgroundSubagent).
+const MAX_FINISHED_BACKGROUND_AGENTS = 256
 // Command items a background shell's later output may still go to.
 const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
@@ -707,11 +712,14 @@ export class CodexClaudeAppServer {
   private subscribersByThread = new Map<string, Map<string, RpcPeer>>()
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
-  // Threads a thread/delete is removing. It waits for their turns to end
-  // first; a turn, review, compaction, shell command or continuation in that
-  // gap, on one of them or on a subagent thread below one, is refused rather
-  // than starting a turn on a thread that is about to go.
-  private deletingThreads = new Set<string>()
+  // Threads a thread/delete is removing, and threads a thread/archive is
+  // putting away, each with the work under way. Each waits for their turns to
+  // end first; a turn, review, compaction, shell command or continuation in
+  // that gap, on one of them or on a subagent thread below one, is refused,
+  // and no queued message starts, rather than starting a turn on a thread
+  // that is about to go.
+  private deletingThreads = new Map<string, Promise<void>>()
+  private archivingThreads = new Map<string, Promise<void>>()
   private readonly startingTurnByThread = new Map<string, Promise<void>>()
   // Turns whose runtime run is scheduled or has not returned yet. A turn outside this
   // set has nothing left that would ever end it.
@@ -730,7 +738,8 @@ export class CodexClaudeAppServer {
   // Turns review/start and thread/compact/start run, which take no steering.
   private unsteerableTurns = new Map<string, 'review' | 'compact'>()
   // Keyed by child thread id. Entries outlive the run so SendMessage can
-  // still find (and resume) an agent that already reported back.
+  // still find (and resume) an agent that already reported back, the most
+  // recent MAX_FINISHED_BACKGROUND_AGENTS of them.
   private backgroundSubagents = new Map<string, BackgroundSubagent>()
   // task_started precedes the Agent tool result that backgrounds the task.
   private taskIdByToolUse = new Map<string, string>()
@@ -1153,6 +1162,8 @@ export class CodexClaudeAppServer {
         return this.historyForPeer(peer, this.threadTurnItemsList(asRecord(params)))
       case 'thread/items/list':
         return this.historyForPeer(peer, this.threadItemsList(asRecord(params)))
+      case 'thread/items/read':
+        return this.historyForPeer(peer, this.threadItemsRead(asRecord(params)))
       case 'thread/timeline/list':
         return this.historyForPeer(peer, this.threadTimelineList(asRecord(params)))
       case 'thread/search':
@@ -1232,9 +1243,13 @@ export class CodexClaudeAppServer {
         throw new Error(
           "memory/reset is not supported: Claude Code keeps its memories in its own per-project folders, shared with Claude Code outside the App. Review or delete them with Claude Code's /memory command.",
         )
-      // Claude Code never consolidates chats into Codex memories.
+      // Claude Code never consolidates chats into Codex memories, so no
+      // thread has a memory summary either.
       case 'memory/status':
         return memoryStatus(asRecord(params))
+      case 'thread/memory/read':
+        this.knownThreadId(asRecord(params))
+        return { summary: null }
       case 'thread/unarchive':
         return this.historyForPeer(peer, this.threadUnarchive(asRecord(params)))
       case 'thread/compact/start':
@@ -1525,12 +1540,27 @@ export class CodexClaudeAppServer {
         return this.fuzzySessionUpdate(peer, asRecord(params))
       case 'fuzzyFileSearch/sessionStop':
         return this.fuzzySessionStop(peer, asRecord(params))
-      // Requests of the protocol that no App build sends. Codex itself answers
-      // thread/prediction/request with method not found, and
-      // thread/readState/update too when it keeps no read state.
-      case 'thread/items/read':
-      case 'thread/prediction/request':
+      // Codex samples one model response on a hidden fork of a thread for the
+      // App's composer predictions, which the App asks only of a thread whose
+      // modelProvider is openai. Claude Code answers only within a turn, with
+      // its tools.
+      // App rule: prediction-provider
+      case 'thread/sample':
+        this.knownThreadId(asRecord(params))
+        throw invalidRequest('thread/sample is not supported: Claude Code answers only in a turn')
+      // No sample ever runs to be cancelled.
+      case 'thread/sample/cancel':
+        return {}
+      // Codex keeps each thread's unread position in its state database and
+      // answers this with method not found when it has none. The adapter has
+      // none for Claude chats, whose thread/read carries no readState, so the
+      // App never sends this for one; a native Codex chat's update goes to its
+      // Codex child.
+      // App rule: thread-read-state
       case 'thread/readState/update':
+        throw new RpcError('durable thread read state unavailable', undefined, METHOD_NOT_FOUND)
+      // Codex itself answers this with method not found; no App build sends it.
+      case 'thread/prediction/request':
         throw methodNotFound(method)
       default: {
         const result = hostMethod(method, asRecord(params))
@@ -2217,6 +2247,11 @@ export class CodexClaudeAppServer {
       isPinned: moved.isPinned === true,
       beforeThreadId,
     })
+    // As Codex does after a move, so every window reloads its sections.
+    this.notifyAll({
+      method: 'thread/section/changed',
+      params: { threadId, sectionId: moved.sectionId ?? null },
+    })
     return {}
   }
 
@@ -2396,6 +2431,15 @@ export class CodexClaudeAppServer {
     })
   }
 
+  private threadItemsRead(params: Record<string, unknown>): unknown {
+    return {
+      data: readItems(this.store.historyTurns(this.knownThreadId(params)), {
+        turnId: stringOr(params.turnId, ''),
+        itemIds: params.itemIds,
+      }),
+    }
+  }
+
   private threadTimelineList(params: Record<string, unknown>): unknown {
     return pageTimeline(this.store.historyTurns(this.knownThreadId(params)), {
       cursor: params.cursor,
@@ -2528,6 +2572,13 @@ export class CodexClaudeAppServer {
   // background agents) and archives the subagent threads it spawned with it.
   private async threadArchive(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = this.knownThreadId(params)
+    await this.whileMarked(this.archivingThreads, threadId, () =>
+      this.archiveThread(peer, threadId),
+    )
+    return {}
+  }
+
+  private async archiveThread(peer: RpcPeer, threadId: string): Promise<void> {
     await this.stopThreadWork(peer, threadId)
     const archived = this.store.transaction(() => {
       const tree = this.store.subagentTreeIds(threadId)
@@ -2543,7 +2594,6 @@ export class CodexClaudeAppServer {
       this.notifyThread(id, { method: 'thread/archived', params: { threadId: id } })
       this.clearThreadState(id)
     }
-    return {}
   }
 
   private threadUnarchive(params: Record<string, unknown>): unknown {
@@ -2574,7 +2624,7 @@ export class CodexClaudeAppServer {
     this.goalToolHandlers.delete(threadId)
     this.leaderThreads.forget(threadId)
     this.elicitationCounts.delete(threadId)
-    // An unarchived thread's queue holds as its newest turn says.
+    // An unarchived thread's queue holds as its stored turns say.
     this.queueHolds.delete(threadId)
   }
 
@@ -3073,15 +3123,30 @@ export class CodexClaudeAppServer {
   // turn of their own (thread/queue/start runs one). A shell command, review,
   // compaction, goal continuation or Claude's own follow-up in between leaves
   // the hold as it was. Until this process starts a turn on the thread, the
-  // newest stored turn says.
+  // stored turns say, so a hold outlives a restart. Should they fail to say,
+  // the newest turn does, as before: this also runs where a throw would stop
+  // the daemon (a follow-up after a turn ends).
   private queueHeld(threadId: string): boolean {
-    return this.queueHolds.get(threadId) ?? this.store.lastTurnStatus(threadId) === 'interrupted'
+    const held = this.queueHolds.get(threadId)
+    if (held !== undefined) return held
+    try {
+      return this.store.interruptedSinceUserTurn(threadId)
+    } catch (error) {
+      debugLog('queue.hold_unreadable', {
+        threadId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return this.store.lastTurnStatus(threadId) === 'interrupted'
+    }
   }
 
-  // Before a turn is stored: from then on the hold no longer follows the
-  // newest turn, which may not be the user's.
-  private keepQueueHold(threadId: string): void {
-    if (!this.queueHolds.has(threadId)) this.queueHolds.set(threadId, this.queueHeld(threadId))
+  // Pins the hold in memory before turn/start stores a turn: the stored
+  // turns would take a structured summary turn for the user's own. Only this
+  // adds an entry. A helper thread (a title, description or summary) has no
+  // queue, and is never archived or deleted to drop its entry.
+  private keepQueueHold(thread: ThreadRecord): void {
+    if (!thread.ephemeral && !this.queueHolds.has(thread.id))
+      this.queueHolds.set(thread.id, this.queueHeld(thread.id))
   }
 
   // Runs one queued submission as a regular user turn. The submission leaves
@@ -3136,7 +3201,15 @@ export class CodexClaudeAppServer {
     if (this.stopped || settled === 'interrupted' || this.activeTurnByThread.has(threadId))
       return false
     const thread = this.store.getThread(threadId)
-    if (!thread || thread.archived) return false
+    // A queued message stays with a thread being archived, and goes unsent
+    // with one being deleted.
+    if (
+      !thread ||
+      thread.archived ||
+      this.isBeingDeleted(threadId) ||
+      this.isBeingArchived(threadId)
+    )
+      return false
     const peer = this.peerForThread(threadId)
     if (!thread.ephemeral && !this.queueHeld(threadId)) {
       const head = this.store.listQueue(threadId)[0]
@@ -3509,13 +3582,28 @@ export class CodexClaudeAppServer {
       if (params.missingRolloutRecovery === true) return {}
       throw new Error(`no rollout found for thread id ${threadId}`)
     }
-    this.deletingThreads.add(threadId)
-    try {
-      await this.removeThread(peer, threadId)
-    } finally {
-      this.deletingThreads.delete(threadId)
-    }
+    await this.whileMarked(this.deletingThreads, threadId, () => this.removeThread(peer, threadId))
     return {}
+  }
+
+  // Runs a thread/delete or thread/archive with its thread marked in
+  // `running` until the work is done. The same request for the same thread
+  // meanwhile waits for that work and shares its outcome; on its own it would
+  // find nothing left to stop, finish first and unmark the thread too soon.
+  private whileMarked(
+    running: Map<string, Promise<void>>,
+    threadId: string,
+    work: () => Promise<void>,
+  ): Promise<void> {
+    let done = running.get(threadId)
+    if (!done) {
+      // The mark goes on before any of the work runs.
+      done = Promise.resolve()
+        .then(work)
+        .finally(() => running.delete(threadId))
+      running.set(threadId, done)
+    }
+    return done
   }
 
   private async removeThread(peer: RpcPeer, threadId: string): Promise<void> {
@@ -3546,7 +3634,12 @@ export class CodexClaudeAppServer {
   // or thread/archive ends their threads.
   private async stopThreadWork(peer: RpcPeer, threadId: string): Promise<void> {
     for (const id of this.store.subagentTreeIds(threadId)) this.requireLocalOrIdle(id)
-    if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
+    // Archiving or deleting a parent takes its child threads with it. The user
+    // can talk to a child thread directly, so it can run a turn, review,
+    // compaction or user shell of its own; each ends like the parent's turn.
+    // Turns end first: one still running could launch another agent while
+    // the agents stop.
+    for (const id of this.store.subagentTreeIds(threadId)) await this.endActiveTurn(peer, id)
     for (const entry of [...this.backgroundSubagents.values()]) {
       if (!entry.running) continue
       if (
@@ -3557,12 +3650,20 @@ export class CodexClaudeAppServer {
         continue
       await this.stopBackgroundSubagent(entry)
     }
-    // Archiving or deleting a parent takes its child threads with it. The user
-    // can talk to a child thread directly, so it can run a turn, review,
-    // compaction or user shell of its own; each ends like the parent's turn.
-    for (const id of this.store.subagentTreeIds(threadId)) {
-      if (this.activeTurnByThread.has(id)) await this.turnInterrupt(peer, { threadId: id })
-    }
+  }
+
+  // Ends the thread's running turn, if any, as turn/interrupt ends it. Unlike
+  // a Stop on the thread, it never stops the thread's own background agent in
+  // the turn's place: the parent can resume that agent while the user runs a
+  // turn on its thread.
+  private async endActiveTurn(peer: RpcPeer, threadId: string): Promise<void> {
+    const turnId = this.activeTurnByThread.get(threadId)
+    if (!turnId) return
+    this.subscribe(threadId, peer)
+    // A user shell on its own has no runtime turn to interrupt.
+    const shell = this.userShells.get(turnId)?.standalone === true
+    this.settleInterruptedTurn(peer, threadId, turnId)
+    if (!shell) await this.runtime.interrupt(threadId)
   }
 
   private async threadShellCommand(
@@ -3646,7 +3747,13 @@ export class CodexClaudeAppServer {
         group.runs.delete(item.id)
         if (!group.runs.size) this.userShells.delete(turnId)
         const current = this.store.getTurn(turnId)
-        if (current?.status !== 'inProgress') return
+        if (current?.status !== 'inProgress') {
+          // Whatever ended the turn also let go of the thread, unless the
+          // turn went with its deleted thread: then its last shell does.
+          if (!current && group.standalone && !group.runs.size)
+            this.clearActiveTurn(threadId, turnId)
+          return
+        }
         const { exitCode, aggregatedOutput, durationMs } = result
         const completedItem: ThreadItem = {
           ...item,
@@ -3929,8 +4036,9 @@ export class CodexClaudeAppServer {
     const responseTurn = this.toLifecycleTurn(turn, [userItem])
     setImmediate(() => {
       // stop() has already settled this turn; starting it now would launch
-      // Claude after the runtime stopped.
-      if (this.stopped) return
+      // Claude after the runtime stopped. So has an interrupt, or a
+      // thread/delete or thread/archive, handled before this ran.
+      if (this.stopped || this.activeTurnByThread.get(threadId) !== turnId) return
       this.notify(peer, {
         method: 'turn/started',
         params: { threadId, turn: this.toLifecycleTurn(turn) },
@@ -4000,8 +4108,9 @@ export class CodexClaudeAppServer {
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     setImmediate(() => {
       // stop() has already settled this turn; starting it now would launch
-      // Claude after the runtime stopped.
-      if (this.stopped) return
+      // Claude after the runtime stopped. So has an interrupt, or a
+      // thread/delete or thread/archive, handled before this ran.
+      if (this.stopped || this.activeTurnByThread.get(threadId) !== turnId) return
       this.notify(peer, {
         method: 'turn/started',
         params: { threadId, turn: this.toLifecycleTurn(turn) },
@@ -4538,7 +4647,7 @@ export class CodexClaudeAppServer {
       thread.preview = prompt.slice(0, 200)
       thread.updatedAt = nowSeconds()
     }
-    this.keepQueueHold(threadId)
+    this.keepQueueHold(thread)
     // Claim before publishing a preview, a policy change, or a model run. A
     // local side turn that crossed an await can still accept this input.
     for (;;) {
@@ -4589,7 +4698,7 @@ export class CodexClaudeAppServer {
     else if (params.outputSchema == null) {
       this.goalIdleStreaks.delete(threadId)
       // The user's own turn releases a held queue.
-      this.queueHolds.set(threadId, false)
+      if (this.queueHolds.has(threadId)) this.queueHolds.set(threadId, false)
     }
     this.syncGoalClock(threadId, this.store.getGoal(threadId))
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
@@ -4601,8 +4710,9 @@ export class CodexClaudeAppServer {
     setImmediate(() => {
       this.runtimeRuns.delete(turnId)
       // stop() has already settled this turn; starting it now would launch
-      // Claude after the runtime stopped.
-      if (this.stopped) return
+      // Claude after the runtime stopped. So has an interrupt, or a
+      // thread/delete or thread/archive, handled before this ran.
+      if (this.stopped || this.activeTurnByThread.get(threadId) !== turnId) return
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
       // The App renders its own optimistic user message for turn/start; a
       // turn started from the server-side queue has none, so publish it.
@@ -4645,12 +4755,22 @@ export class CodexClaudeAppServer {
   private startableThread(threadId: string): ThreadRecord {
     const thread = this.store.getThread(threadId)
     if (!thread || this.isBeingDeleted(threadId)) throw unknownThread(threadId)
+    if (this.isBeingArchived(threadId)) throw invalidRequest(`thread ${threadId} is being archived`)
     return thread
   }
 
-  // store.deleteThread takes a thread's subagent threads with it.
+  // store.deleteThread takes a thread's subagent threads with it, and
+  // thread/archive archives them with it.
   private isBeingDeleted(threadId: string): boolean {
-    for (const id of this.deletingThreads)
+    return this.inTreeOf(this.deletingThreads, threadId)
+  }
+
+  private isBeingArchived(threadId: string): boolean {
+    return this.inTreeOf(this.archivingThreads, threadId)
+  }
+
+  private inTreeOf(roots: Map<string, unknown>, threadId: string): boolean {
+    for (const id of roots.keys())
       if (id === threadId || this.isSubagentDescendant(threadId, id)) return true
     return false
   }
@@ -7481,8 +7601,9 @@ export class CodexClaudeAppServer {
     return false
   }
 
-  // A child that ran in the foreground, or before a restart, has no entry,
-  // yet SendMessage resumes it all the same: the CLI runs it on in the
+  // A child that ran in the foreground, before a restart or in the background
+  // long ago (see keepFinishedBackgroundSubagent) has no entry, yet
+  // SendMessage resumes it all the same: the CLI runs it on in the
   // background. Track it from then on like any background agent.
   private adoptChildAgent(
     thread: ThreadRecord,
@@ -7490,15 +7611,22 @@ export class CodexClaudeAppServer {
     agentId: string,
     mcpServers: string[],
   ): BackgroundSubagent | null {
-    // A direct child first; then one nested below another agent.
+    // A direct child first; then one nested below another agent. Searched by
+    // name, so an agent among more than a page of children is found too.
     const child =
       this.store
-        .listThreads({ includeEphemeral: true, parentThreadId: thread.id, limit: 200 })
+        .listThreads({
+          includeEphemeral: true,
+          parentThreadId: thread.id,
+          agentNickname: agentId,
+          limit: 200,
+        })
         .find((candidate) => candidate.agentNickname === agentId) ??
       this.store
         .listThreads({
           includeEphemeral: true,
           ancestorThreadId: thread.id,
+          agentNickname: agentId,
           sourceKinds: ['subAgentThreadSpawn'],
           limit: 200,
         })
@@ -7752,7 +7880,34 @@ export class CodexClaudeAppServer {
       context,
       status === 'completed' ? 'completed' : 'interrupted',
     )
+    this.keepFinishedBackgroundSubagent(entry)
     this.checkIdle()
+  }
+
+  // An agent that reported back stays known, so a SendMessage or TaskStop
+  // that comes later finds it as it ran. Its child turn holds its prompt now,
+  // and a resume brings its own. Only the most recently finished stay: a
+  // daemon that never restarts would keep every agent it ever ran, and a
+  // SendMessage to an older one rebuilds it from the store (adoptChildAgent).
+  // One that a SendMessage or TaskStop is on its way to stays as well.
+  private keepFinishedBackgroundSubagent(entry: BackgroundSubagent): void {
+    const id = entry.context.childThreadId
+    if (entry.running || this.backgroundSubagents.get(id) !== entry) return
+    entry.context = { ...entry.context, prompt: '' }
+    // Most recently finished last.
+    this.backgroundSubagents.delete(id)
+    this.backgroundSubagents.set(id, entry)
+    const addressed = new Set(
+      [...this.pendingAgentCalls.values()].map((call) => call.childThreadId),
+    )
+    let excess = -MAX_FINISHED_BACKGROUND_AGENTS
+    for (const other of this.backgroundSubagents.values()) if (!other.running) excess += 1
+    for (const [otherId, other] of this.backgroundSubagents) {
+      if (excess <= 0) return
+      if (other.running || addressed.has(otherId)) continue
+      this.backgroundSubagents.delete(otherId)
+      excess -= 1
+    }
   }
 
   // Subagent activity belongs to a parent turn. A background agent usually
@@ -7782,7 +7937,8 @@ export class CodexClaudeAppServer {
       return
     }
     const queue = this.queuedSubagentActivity.get(parentThreadId) ?? []
-    queue.push({ context, kind })
+    // The item names the agent only; its prompt stays out of the queue.
+    queue.push({ context: { ...context, prompt: '' }, kind })
     this.queuedSubagentActivity.set(parentThreadId, queue.slice(-MAX_QUEUED_ACTIVITY))
   }
 
@@ -8006,6 +8162,7 @@ export class CodexClaudeAppServer {
       !thread ||
       thread.archived ||
       this.isBeingDeleted(threadId) ||
+      this.isBeingArchived(threadId) ||
       this.activeTurnByThread.has(threadId) ||
       this.runtime.hasPendingContinuation?.(threadId) !== true
     ) {
@@ -10871,7 +11028,9 @@ export class CodexClaudeAppServer {
         error: error instanceof Error ? error.message : String(error),
       })
     }
-    if (settled?.status === 'interrupted') this.queueHolds.set(threadId, true)
+    // Without an entry the stored turns already say held.
+    if (settled?.status === 'interrupted' && this.queueHolds.has(threadId))
+      this.queueHolds.set(threadId, true)
     // Let the settled turn's notifications go out first. Claude's own
     // follow-up comes before the queue and goal continuation.
     if (this.pendingAutonomousTurns.delete(threadId)) {
@@ -11072,11 +11231,12 @@ export class CodexClaudeAppServer {
   }
 
   // A standalone shell, review, compaction or continuation is also a turn.
+  // The stored turns tell it from the user's own (see
+  // interruptedSinceUserTurn), so it needs no keepQueueHold.
   private claimSideTurn(turn: TurnRecord): void {
     // stop() has settled the turns it knew of; one claimed now would never end.
     if (this.stopped) throw invalidRequest('server stopped')
     this.flushPendingTurnEnds(turn.threadId)
-    this.keepQueueHold(turn.threadId)
     const claim = this.store.claimTurn(turn)
     if (claim.claimed) return
     if (this.activeTurnByThread.get(turn.threadId) === claim.activeTurn.id)

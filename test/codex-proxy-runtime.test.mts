@@ -5,6 +5,14 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { CodexProxyRuntime } from '../src/codex-proxy-runtime.mjs'
 import type { RuntimeEvent, RuntimeHandlers, RuntimeTurnContext } from '../src/types.mjs'
+import {
+  awaitMessage,
+  JsonLineReader,
+  json,
+  sendTurn,
+  spawnMockAdapter,
+  stopProcess,
+} from './support/adapter-harness.mjs'
 
 // Keep debug.jsonl out of the developer's ~/.codex.
 process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
@@ -90,3 +98,67 @@ for (const [label, sessionId] of [
     })
   }
 }
+
+// A sandbox value the adapter does not know, on thread/metadata/update,
+// thread/resume or thread/fork, leaves a thread with none stored, and the App
+// is told it is workspace-write. codex exec used to run it unsandboxed.
+test('a codex-proxy thread with no stored sandbox runs codex exec workspace-write', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-proxy-test-'))
+  const binary = join(dir, 'codex')
+  writeFileSync(binary, FAKE_CODEX)
+  chmodSync(binary, 0o755)
+  // Not mock mode: there a gpt-* thread runs on the mock runtime.
+  const proc = spawnMockAdapter(dir, {
+    CLAUDE_CODEX_MOCK: '',
+    CODEX_REAL: binary,
+    FAKE_CODEX_DIR: dir,
+    CLAUDE_CODEX_CODEX_MODELS: 'gpt-test',
+  })
+  const reader = new JsonLineReader(proc)
+  let id = 0
+  const request = async (method: string, params: Record<string, unknown>): Promise<any> => {
+    id += 1
+    proc.stdin.write(json({ id, method, params }))
+    const response = await reader.nextResponse(id)
+    assert.equal(response.error, undefined, method)
+    return response.result
+  }
+  // The sandbox flags the thread's next turn passes to codex exec.
+  const sandboxFlags = async (threadId: string): Promise<string[]> => {
+    id += 1
+    sendTurn(proc, id, threadId, 'hi')
+    await awaitMessage(
+      reader,
+      (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+    )
+    const argv = readFileSync(join(dir, 'argv'), 'utf8').split('\n')
+    return argv[3] === '-s' ? argv.slice(3, 5) : argv.slice(3, 4)
+  }
+  const fullAccess = ['--dangerously-bypass-approvals-and-sandbox']
+  try {
+    const started = await request('thread/start', { cwd: dir, model: 'gpt-test' })
+    const threadId = started.thread.id
+    assert.equal(started.sandbox.type, 'workspaceWrite')
+    assert.deepEqual(await sandboxFlags(threadId), ['-s', 'workspace-write'])
+    await request('thread/resume', { threadId, sandbox: 'danger-full-access' })
+    assert.deepEqual(await sandboxFlags(threadId), fullAccess)
+
+    await request('thread/metadata/update', { threadId, sandbox: 'granular' })
+    assert.equal((await request('thread/resume', { threadId })).sandbox.type, 'workspaceWrite')
+    assert.deepEqual(await sandboxFlags(threadId), ['-s', 'workspace-write'])
+
+    await request('thread/resume', { threadId, sandbox: 'danger-full-access' })
+    const resumed = await request('thread/resume', { threadId, sandbox: 'granular' })
+    assert.equal(resumed.sandbox.type, 'workspaceWrite')
+    assert.deepEqual(await sandboxFlags(threadId), ['-s', 'workspace-write'])
+
+    await request('thread/resume', { threadId, sandbox: 'danger-full-access' })
+    const fork = await request('thread/fork', { threadId, sandbox: 'granular' })
+    assert.equal(fork.sandbox.type, 'workspaceWrite')
+    assert.deepEqual(await sandboxFlags(fork.thread.id), ['-s', 'workspace-write'])
+    assert.deepEqual(await sandboxFlags(threadId), fullAccess)
+  } finally {
+    await stopProcess(proc)
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})

@@ -164,7 +164,15 @@ export class SessionStore {
     // A database elsewhere, as in the tests, leaves the adapter home alone.
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.conn = openDatabase(path)
-    this.migrate()
+    // A new file gets its whole schema in one transaction. Statement by
+    // statement it took over 50 commits, each a few fsyncs, which a busy disk
+    // turns into seconds before a new daemon listens. An existing store
+    // migrates as before, taking the write lock only for what it changes.
+    const existing = this.conn
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'")
+      .get()
+    if (existing) this.migrate()
+    else this.transaction(() => this.migrate())
   }
 
   // Every statement goes through here, so whatever reads, writes or opens a
@@ -462,7 +470,7 @@ export class SessionStore {
   // one batch at most. The adapter runs it on every start once it listens, so
   // diffs written during a rollback go too; a clean store takes reads only
   // (octet_length does not read the text). Resolves once none is left, the
-  // store closes or a write fails (the next start goes on).
+  // store closes or a statement fails (debug-logged; the next start goes on).
   clearStoredTurnDiffs(
     sliceMs = DIFF_CLEAR_SLICE_MS,
     pauseMs = DIFF_CLEAR_PAUSE_MS,
@@ -506,7 +514,12 @@ export class SessionStore {
           do {
             if (!batch()) return this.stopClearingDiffs()
           } while (performance.now() - started < sliceMs)
-        } catch {
+        } catch (error) {
+          // Such as another adapter holding the write lock past the busy
+          // timeout. The diffs left go on the next start.
+          debugLog('store.diff_clear_stopped', {
+            error: error instanceof Error ? error.message : String(error),
+          })
           return this.stopClearingDiffs()
         }
         const timer = setTimeout(slice, pauseMs)
@@ -539,11 +552,14 @@ export class SessionStore {
     if (probe.get(table, column)) return
     // Another adapter can add the column after the first probe. Recheck
     // under the writer lock; an already migrated store takes no write lock.
-    this.transaction(() => {
+    // A new store's schema already runs in a transaction.
+    const add = () => {
       if (!probe.get(table, column)) {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
       }
-    })
+    }
+    if (this.conn.isTransaction) add()
+    else this.transaction(add)
   }
 
   upsertThread(thread: ThreadRecord): void {
@@ -665,6 +681,8 @@ export class SessionStore {
       includeEphemeral?: boolean
       parentThreadId?: string | null
       ancestorThreadId?: string | null
+      // Keeps the threads of the agent SendMessage addresses by this name.
+      agentNickname?: string | undefined
       sourceKinds?: string[]
       sectionId?: string | null | undefined
       projectId?: string | null | undefined
@@ -764,6 +782,10 @@ export class SessionStore {
     }
     if (ancestorThreadId != null) {
       where.push('t.id IN (SELECT id FROM descendants)')
+    }
+    if (options.agentNickname !== undefined) {
+      where.push('t.agent_nickname = ?')
+      args.push(options.agentNickname)
     }
 
     if (sourceKinds.length > 0) {
@@ -1692,6 +1714,27 @@ export class SessionStore {
       )
       .get(threadId) as { status?: unknown } | undefined
     return typeof row?.status === 'string' ? (row.status as TurnRecord['status']) : null
+  }
+
+  // Whether a turn of the thread ended interrupted since the user's newest
+  // turn of their own started, or that turn did: a held queue, as a restarted
+  // adapter finds it. The user's turns open with their message (or a tool's
+  // output); a review's message comes with its enteredReviewMode item, and a
+  // standalone shell command, compaction, goal continuation or Claude's own
+  // follow-up opens with none. Items SQLite cannot parse (JSON.parse takes
+  // nesting deeper than its limit of 1000) count as the user's, so such a
+  // turn can release a hold but never keep one.
+  interruptedSinceUserTurn(threadId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT status FROM turns WHERE thread_id = ? AND CASE
+           WHEN status = 'interrupted' OR NOT json_valid(items_json) THEN 1
+           ELSE json_extract(items_json, '$[0].type') IN ('userMessage', 'functionCallOutput')
+             AND json_extract(items_json, '$[1].type') IS NOT 'enteredReviewMode' END
+         ORDER BY started_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get(threadId) as { status?: unknown } | undefined
+    return row?.status === 'interrupted'
   }
 
   lastTurn(threadId: string): TurnRecord | null {

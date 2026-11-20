@@ -152,14 +152,14 @@ export function ensureParent(path: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
 }
 
-// Per-log-file bookkeeping so a debugLog call costs one append, not a mkdir and
-// a stat as well: rpc.notify logs every streaming delta. `size` is the file's
-// size as last seen by stat plus what this process appended since.
-type DebugLogFile = { size: number; checkedAt: number }
-const debugLogFiles = new Map<string, DebugLogFile>()
+// Per-log-file bookkeeping so an appendLogLine call costs one append, not a
+// mkdir and a stat as well: rpc.notify logs every streaming delta. `size` is
+// the file's size as last seen by stat plus what this process appended since.
+type LogFile = { size: number; checkedAt: number }
+const logFiles = new Map<string, LogFile>()
 // Other adapter processes may append to the same file, so the tracked size is
 // re-read from disk at least this often (ms) rather than trusted forever.
-const DEBUG_LOG_RESTAT_MS = 1000
+const LOG_RESTAT_MS = 1000
 
 export function debugLog(event: string, data: Record<string, unknown> = {}): void {
   if (process.env.CLAUDE_CODEX_DEBUG_LOG === '0' || process.env.CLAUDE_CODEX_DEBUG_LOG === 'false')
@@ -173,43 +173,52 @@ export function debugLog(event: string, data: Record<string, unknown> = {}): voi
         event,
         ...(redact(data) as Record<string, unknown>),
       }) + '\n'
-    let file = debugLogFiles.get(path)
-    if (!file) {
-      ensureParent(path)
-      // The log holds commands, tool input and stderr excerpts. It is created
-      // owner-only below; a log and its rotated copies an older version left
-      // readable are tightened here, once per process.
-      for (let i = 0; i <= debugLogKeep(); i += 1) ownerOnly(i === 0 ? path : `${path}.${i}`)
-      file = { size: 0, checkedAt: Number.NEGATIVE_INFINITY }
-      debugLogFiles.set(path, file)
-    }
-    const maxBytes = debugLogMaxBytes()
-    const now = Date.now()
-    if (maxBytes > 0 && (file.size >= maxBytes || now - file.checkedAt >= DEBUG_LOG_RESTAT_MS)) {
-      file.size = rotateLog(path, maxBytes)
-      file.checkedAt = now
-    }
-    try {
-      appendFileSync(path, line, { mode: 0o600 })
-    } catch (error) {
-      // The log's folder was removed while we ran: recreate it once and retry.
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      ensureParent(path)
-      appendFileSync(path, line, { mode: 0o600 })
-    }
-    file.size += Buffer.byteLength(line)
+    appendLogLine(path, line)
   } catch {}
 }
 
-// Long-running adapter daemons would otherwise grow debug.jsonl until the disk
-// fills, so debugLog rotates it once it reaches this size (0 never rotates).
-function debugLogMaxBytes(): number {
-  return numericEnv('CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', 50 * 1024 * 1024)
+// Appends a line to a log the adapter keeps for its whole life, debug.jsonl
+// and the run registry's runs.jsonl: readable by its owner alone, and rotated
+// at CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES into CLAUDE_CODEX_DEBUG_LOG_KEEP old
+// copies (`<path>.1`, `.2`, ...). Throws when the line cannot be written.
+export function appendLogLine(path: string, line: string, env = process.env): void {
+  let file = logFiles.get(path)
+  if (!file) {
+    ensureParent(path)
+    // debug.jsonl holds commands, tool input and stderr excerpts. A log is
+    // created owner-only below; a log and its rotated copies an older version
+    // left readable are tightened here, once per process.
+    for (let i = 0; i <= logKeep(env); i += 1) ownerOnly(i === 0 ? path : `${path}.${i}`)
+    file = { size: 0, checkedAt: Number.NEGATIVE_INFINITY }
+    logFiles.set(path, file)
+  }
+  const maxBytes = logMaxBytes(env)
+  const now = Date.now()
+  if (maxBytes > 0 && (file.size >= maxBytes || now - file.checkedAt >= LOG_RESTAT_MS)) {
+    file.size = rotateLog(path, maxBytes, logKeep(env))
+    file.checkedAt = now
+  }
+  try {
+    appendFileSync(path, line, { mode: 0o600 })
+  } catch (error) {
+    // The log's folder was removed while we ran: recreate it once and retry.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    ensureParent(path)
+    appendFileSync(path, line, { mode: 0o600 })
+  }
+  file.size += Buffer.byteLength(line)
+}
+
+// Long-running adapter daemons would otherwise grow their logs until the disk
+// fills, so appendLogLine rotates one once it reaches this size (0 never
+// rotates).
+function logMaxBytes(env: NodeJS.ProcessEnv): number {
+  return numericEnv(env, 'CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', 50 * 1024 * 1024)
 }
 
 // At most 100 old logs: rotation and the first write walk every slot.
-function debugLogKeep(): number {
-  return Math.min(100, Math.max(1, Math.floor(numericEnv('CLAUDE_CODEX_DEBUG_LOG_KEEP', 3))))
+function logKeep(env: NodeJS.ProcessEnv): number {
+  return Math.min(100, Math.max(1, Math.floor(numericEnv(env, 'CLAUDE_CODEX_DEBUG_LOG_KEEP', 3))))
 }
 
 // Clears the group and other permissions of a regular file this user owns at
@@ -247,7 +256,7 @@ function ownerOnly(path: string): void {
 
 // Rotates `path` when it has reached `maxBytes`; returns the active log's size
 // afterwards (0 when it was rotated away or does not exist yet).
-function rotateLog(path: string, maxBytes: number): number {
+function rotateLog(path: string, maxBytes: number, keep: number): number {
   let size = 0
   try {
     size = statSync(path).size
@@ -255,7 +264,6 @@ function rotateLog(path: string, maxBytes: number): number {
     return 0 // file does not exist yet — nothing to rotate
   }
   if (size < maxBytes) return size
-  const keep = debugLogKeep()
   // Drop the oldest slot if it would push us past `keep`.
   const oldest = `${path}.${keep}`
   try {
@@ -276,8 +284,8 @@ function rotateLog(path: string, maxBytes: number): number {
   return 0
 }
 
-function numericEnv(name: string, fallback: number): number {
-  const raw = process.env[name]
+function numericEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name]
   if (!raw) return fallback
   const parsed = Number(raw)
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback

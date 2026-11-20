@@ -135,16 +135,20 @@ async function main(): Promise<void> {
   const configOverrides = configArgs(args)
   setAppPluginConfigOverrides(configOverrides)
   const isUnixDaemon = listen.startsWith('unix://')
+  // From here on each startup step goes to the debug log as it ends.
+  startupStep('options')
   const daemon = isUnixDaemon ? await ensureSingleUnixDaemon(listen) : null
   const pidFile = daemon?.pidFile ?? null
 
   const store = new SessionStore()
+  startupStep('store')
   // The Codex App normally launches the app-server over stdio, so a crashed or
   // force-quit adapter leaves its last turn persisted as `inProgress`. The
   // next stdio process is the recovery boundary just like the unix daemon;
   // only recovering unix transports leaves the App's subagent view stuck on
   // "loading" forever after a restart.
   const recovered = store.recoverStaleInProgressTurns()
+  startupStep('recovery')
   if (recovered > 0) {
     process.stderr.write(
       `[claude-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`,
@@ -153,6 +157,7 @@ async function main(): Promise<void> {
   // Same boundary for processes: a killed adapter's CLI keeps writing the
   // session this process may resume, so stop it before serving.
   const reaped = await reapOrphanedCliChildren()
+  startupStep('reap')
   if (reaped.length > 0) {
     process.stderr.write(
       `[claude-codex-adapter] stopped ${reaped.length} orphaned Claude CLI process(es)\n`,
@@ -168,6 +173,7 @@ async function main(): Promise<void> {
   }
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime, { configOverrides })
+  startupStep('server')
   let transport: RunningTransport | null = null
   let shuttingDown = false
   const shutdown = async (reason: string) => {
@@ -281,6 +287,7 @@ async function main(): Promise<void> {
     transport = await startWebSocketTransport(normalized, onMessage, onClose, onConnect, {
       ...(preparedWsAuth ? { auth: preparedWsAuth } : {}),
     })
+    startupStep('listening')
   } catch (error) {
     // Another daemon bound the socket while this one started, as when both
     // started at the same moment and neither saw the other's pid file.
@@ -364,6 +371,7 @@ async function ensureSingleUnixDaemon(listen: string): Promise<UnixDaemon> {
   const shared = checkOptions(() => prepareUnixSocketParent(socketPath))
   const pid = checkOptions(() => readDaemonPid(pidFile, shared))
   const state = pid === null ? null : await daemonState(pid, socketPath, pidFile)
+  startupStep('pidFile', { filePid: pid, state })
   if (state) {
     process.stderr.write(
       `[claude-codex-adapter] app-server already ${state} at ${socketPath} (pid ${pid})\n`,
@@ -438,6 +446,13 @@ async function daemonState(
     await sleep(200)
     if (!processIsAlive(pid)) return null
   }
+}
+
+// Logs that a startup step ended, at how many ms since the process started
+// (module loading included). A start that is slow shows which step took the
+// time; one that hangs, the last step it finished.
+function startupStep(step: string, data: Record<string, unknown> = {}): void {
+  debugLog('adapter.startup', { step, atMs: Math.round(performance.now()), ...data })
 }
 
 function processIsAlive(pid: number): boolean {
