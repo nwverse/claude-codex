@@ -747,6 +747,8 @@ export class CodexClaudeAppServer {
   // Claude started a turn of its own while the thread's turn was settling.
   private pendingAutonomousTurns = new Set<string>()
   private lastTurnParamsByThread = new Map<string, Record<string, unknown>>()
+  // Whether each thread's server-side queue holds (see queueHeld).
+  private queueHolds = new Map<string, boolean>()
   private fuzzySessions = new Map<string, { roots: string[] }>()
   // Approvals the user gave "for this session", by thread: a command, a
   // non-edit tool call, or an MCP tool (see approvalSessionKey).
@@ -1005,8 +1007,10 @@ export class CodexClaudeAppServer {
 
   // Background agents keep running (and Claude may still answer them) after
   // every turn has settled; the daemon must not idle-exit underneath them.
+  // Nor under a turn still being claimed, such as a queued message the
+  // adapter dispatched while no client was connected.
   hasActiveTurns(): boolean {
-    if (this.activeTurnByThread.size > 0) return true
+    if (this.activeTurnByThread.size > 0 || this.startingTurnByThread.size > 0) return true
     if (this.codexBridge?.busy()) return true
     for (const entry of this.backgroundSubagents.values()) if (entry.running) return true
     return this.runtime.hasBackgroundWork?.() === true
@@ -2555,6 +2559,8 @@ export class CodexClaudeAppServer {
     this.goalToolHandlers.delete(threadId)
     this.leaderThreads.forget(threadId)
     this.elicitationCounts.delete(threadId)
+    // An unarchived thread's queue holds as its newest turn says.
+    this.queueHolds.delete(threadId)
   }
 
   private threadUnsubscribe(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -3048,8 +3054,19 @@ export class CodexClaudeAppServer {
     return this.dispatchQueued(peer, threadId, submission)
   }
 
+  // The queue holds once a turn ends interrupted, until the user starts a
+  // turn of their own (thread/queue/start runs one). A shell command, review,
+  // compaction, goal continuation or Claude's own follow-up in between leaves
+  // the hold as it was. Until this process starts a turn on the thread, the
+  // newest stored turn says.
   private queueHeld(threadId: string): boolean {
-    return this.store.lastTurnStatus(threadId) === 'interrupted'
+    return this.queueHolds.get(threadId) ?? this.store.lastTurnStatus(threadId) === 'interrupted'
+  }
+
+  // Before a turn is stored: from then on the hold no longer follows the
+  // newest turn, which may not be the user's.
+  private keepQueueHold(threadId: string): void {
+    if (!this.queueHolds.has(threadId)) this.queueHolds.set(threadId, this.queueHeld(threadId))
   }
 
   // Runs one queued submission as a regular user turn. The submission leaves
@@ -3098,7 +3115,8 @@ export class CodexClaudeAppServer {
   // The thread just went idle: run the next queued message, else keep an
   // active goal going. `settled` is the status of the turn that just ended,
   // when there is one; nothing follows an interrupt, and a goal does not
-  // retry a failure on its own. Returns whether a turn was started.
+  // retry a failure on its own. Returns whether a turn was started or is
+  // being started.
   private startFollowUp(threadId: string, settled?: TurnStatus): boolean {
     if (this.stopped || settled === 'interrupted' || this.activeTurnByThread.has(threadId))
       return false
@@ -3115,7 +3133,10 @@ export class CodexClaudeAppServer {
             params: { threadId, turnId: null, willRetry: false, error: turnErrorOf(error) },
           })
         })
-        return this.activeTurnByThread.has(threadId)
+        // Its turn is claimed across an await, so it is not active yet. The
+        // start keeps the adapter busy meanwhile, and checks idle itself if
+        // it ends up starting nothing (see turnStart).
+        return true
       }
     }
     if (settled === 'failed' || !this.canContinueGoal(threadId)) return false
@@ -4329,6 +4350,9 @@ export class CodexClaudeAppServer {
         this.startingTurnByThread.delete(threadId)
       }
       releaseStarting()
+      // A start counts as busy (see hasActiveTurns). One that left nothing
+      // running may leave the adapter idle.
+      if (this.activeTurnByThread.size === 0) this.checkIdle()
     }
   }
 
@@ -4490,6 +4514,7 @@ export class CodexClaudeAppServer {
       thread.preview = prompt.slice(0, 200)
       thread.updatedAt = nowSeconds()
     }
+    this.keepQueueHold(threadId)
     // Claim before publishing a preview, a policy change, or a model run. A
     // local side turn that crossed an await can still accept this input.
     for (;;) {
@@ -4523,7 +4548,7 @@ export class CodexClaudeAppServer {
         continue
       }
       if (ownedHere) throw invalidRequest(`thread ${threadId} already has an active turn`)
-      throw this.foreignTurnError(threadId)
+      throw this.claimRefusedError(threadId, claim.ownedBySelf)
     }
     recordRunEvent('turn.started', {
       threadId,
@@ -4535,7 +4560,11 @@ export class CodexClaudeAppServer {
     })
     this.activeTurnByThread.set(threadId, turnId)
     if (hiddenPrompt) this.goalTurns.add(turnId)
-    else if (params.outputSchema == null) this.goalIdleStreaks.delete(threadId)
+    else if (params.outputSchema == null) {
+      this.goalIdleStreaks.delete(threadId)
+      // The user's own turn releases a held queue.
+      this.queueHolds.set(threadId, false)
+    }
     this.syncGoalClock(threadId, this.store.getGoal(threadId))
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     const publicTurn = this.toLifecycleTurn(turn)
@@ -9263,16 +9292,26 @@ export class CodexClaudeAppServer {
   }
 
   private async fsReadDirectory(params: Record<string, unknown>): Promise<unknown> {
-    const { readdir } = await import('node:fs/promises')
+    const { readdir, stat } = await import('node:fs/promises')
     const path = stringOr(params.path, process.cwd())
     const entries = await readdir(path, { withFileTypes: true })
-    return {
-      entries: entries.map((entry) => ({
-        fileName: entry.name,
-        isDirectory: entry.isDirectory(),
-        isFile: entry.isFile(),
-      })),
-    }
+    // Like Codex, a symlink is listed as what it resolves to, as in
+    // fs/getMetadata, and one that resolves to nothing (dangling, a loop) is
+    // left out.
+    const listed = await Promise.all(
+      entries.map(async (entry) => {
+        let type: { isDirectory(): boolean; isFile(): boolean } = entry
+        if (entry.isSymbolicLink()) {
+          try {
+            type = await stat(join(path, entry.name))
+          } catch {
+            return []
+          }
+        }
+        return [{ fileName: entry.name, isDirectory: type.isDirectory(), isFile: type.isFile() }]
+      }),
+    )
+    return { entries: listed.flat() }
   }
 
   private async fsGetMetadata(params: Record<string, unknown>): Promise<unknown> {
@@ -10753,6 +10792,7 @@ export class CodexClaudeAppServer {
         error: error instanceof Error ? error.message : String(error),
       })
     }
+    if (settled?.status === 'interrupted') this.queueHolds.set(threadId, true)
     // Let the settled turn's notifications go out first. Claude's own
     // follow-up comes before the queue and goal continuation.
     if (this.pendingAutonomousTurns.delete(threadId)) {
@@ -10952,11 +10992,24 @@ export class CodexClaudeAppServer {
   // A standalone shell, review, compaction or continuation is also a turn.
   private claimSideTurn(turn: TurnRecord): void {
     this.flushPendingTurnEnds(turn.threadId)
+    this.keepQueueHold(turn.threadId)
     const claim = this.store.claimTurn(turn)
     if (claim.claimed) return
     if (this.activeTurnByThread.get(turn.threadId) === claim.activeTurn.id)
       throw invalidRequest(`thread ${turn.threadId} already has an active turn`)
-    throw this.foreignTurnError(turn.threadId)
+    throw this.claimRefusedError(turn.threadId, claim.ownedBySelf)
+  }
+
+  // A live turn of this process that is not the thread's active turn is a
+  // subagent's own: its agent runs inside the parent chat's turn or in the
+  // background, where only the parent can reach it.
+  private claimRefusedError(threadId: string, ownedBySelf: boolean): RpcError {
+    if (!ownedBySelf) return this.foreignTurnError(threadId)
+    if (this.store.getThread(threadId)?.threadSource === 'subagent')
+      return invalidRequest(
+        'this agent is still working; message it from its parent chat or wait for it to report',
+      )
+    return invalidRequest(`thread ${threadId} already has an active turn`)
   }
 
   private foreignTurnError(threadId: string): RpcError {

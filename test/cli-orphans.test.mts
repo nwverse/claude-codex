@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
 import { parseProcessRows, reapOrphanedCliChildren } from '../src/cli-orphans.mjs'
+import { processStartTime } from '../src/process-owner.mjs'
 
 // Keep debug.jsonl out of the developer's ~/.codex.
 process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
@@ -142,4 +143,33 @@ test('parseProcessRows reads ps lstart rows', () => {
       command: 'claude --input-format stream-json',
     },
   ])
+})
+
+test('processStartTime reads a start time in any time zone, or null when ps cannot', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const empty = await mkdtemp(join(tmpdir(), 'claude-codex-no-ps-'))
+  const child = spawn('sleep', ['30'], { stdio: 'ignore' })
+  const saved = { TZ: process.env.TZ, PATH: process.env.PATH }
+  process.env.TZ = 'Asia/Tokyo'
+  try {
+    await once(child, 'spawn')
+    const pid = child.pid as number
+    const started = processStartTime(pid)
+    // Whole seconds, in UTC whatever the local time zone.
+    assert.ok(started !== null && started <= Date.now() && started > Date.now() - 60_000)
+    process.env.PATH = empty
+    assert.equal(processStartTime(pid), null)
+    process.env.PATH = saved.PATH
+    child.kill('SIGKILL')
+    await once(child, 'exit')
+    assert.equal(processStartTime(pid), null)
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    child.kill('SIGKILL')
+    await rm(empty, { recursive: true, force: true })
+  }
 })

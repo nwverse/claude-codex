@@ -390,6 +390,48 @@ test('thread/queue pauses after an interrupt until thread/queue/start', async ()
   }
 })
 
+test('a held queue stays held across a restart and a shell command after it', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  let proc = spawnMockAdapter(home)
+  let reader = new JsonLineReader(proc)
+  const call = async (id: number, method: string, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    const turnId = (
+      await call(2, 'turn/start', { threadId, input: textInput('slow turn that the user stops') })
+    ).result.turn.id
+    await awaitMessage(reader, (message) => message.method === 'item/agentMessage/delta')
+    const queued = (await call(3, 'thread/queue/add', { threadId, input: textInput('held') }))
+      .result.queuedSubmission
+    await call(4, 'turn/interrupt', { threadId, turnId })
+    await stopProcess(proc)
+
+    proc = spawnMockAdapter(home)
+    reader = new JsonLineReader(proc)
+    await call(5, 'thread/resume', { threadId })
+    // The shell's turn becomes the thread's newest; the hold is the
+    // interrupted turn's.
+    await call(6, 'thread/shellCommand', { threadId, command: 'true' })
+    await awaitMessage(reader, (message) => message.method === 'turn/completed')
+    const quiet = await readQuiet(reader, 400)
+    assert.equal(
+      quiet.some((message) => message.method === 'turn/started'),
+      false,
+    )
+    const held = await call(7, 'thread/queue/list', { threadId, cursor: null })
+    assert.deepEqual(
+      held.result.data.map((entry: any) => entry.id),
+      [queued.id],
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('thread/goal/set keeps the thread working until the model completes the goal', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)

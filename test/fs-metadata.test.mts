@@ -35,6 +35,36 @@ test('fs/getMetadata retains target metadata and reports a file or directory sym
   )
 })
 
+test('fs/readDirectory lists a symlink as what it resolves to and leaves out dangling ones', async () => {
+  await withInProcessApp(
+    scriptedRuntime(async () => {}),
+    async (app) => {
+      const root = join(app.home, 'workspace')
+      await mkdir(join(root, 'pkg'), { recursive: true })
+      await writeFile(join(root, 'AGENTS.md'), 'example')
+      await symlink('AGENTS.md', join(root, 'CLAUDE.md'), 'file')
+      await symlink('pkg', join(root, 'pkg-link'), 'dir')
+      await symlink('missing', join(root, 'dangling'), 'file')
+      await symlink('loop', join(root, 'loop'), 'file')
+
+      const { entries } = await app.request('fs/readDirectory', { path: root })
+      entries.sort((a: any, b: any) => (a.fileName < b.fileName ? -1 : 1))
+      assert.deepEqual(entries, [
+        { fileName: 'AGENTS.md', isDirectory: false, isFile: true },
+        { fileName: 'CLAUDE.md', isDirectory: false, isFile: true },
+        { fileName: 'pkg', isDirectory: true, isFile: false },
+        { fileName: 'pkg-link', isDirectory: true, isFile: false },
+      ])
+      // A listed link reads the same as fs/getMetadata reports it.
+      for (const entry of entries) {
+        const metadata = await app.request('fs/getMetadata', { path: join(root, entry.fileName) })
+        assert.equal(entry.isDirectory, metadata.isDirectory, entry.fileName)
+        assert.equal(entry.isFile, metadata.isFile, entry.fileName)
+      }
+    },
+  )
+})
+
 test('fs/getMetadata reads dangling links but preserves missing-path and target-loop errors', async () => {
   await withInProcessApp(
     scriptedRuntime(async () => {}),

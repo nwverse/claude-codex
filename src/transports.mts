@@ -4,6 +4,7 @@ import net from 'node:net'
 import { dirname } from 'node:path'
 import readline from 'node:readline'
 import { WebSocket, WebSocketServer } from 'ws'
+import { socketAccepts } from './cli-probes.mjs'
 import type { RpcPeer, WireMessage } from './types.mjs'
 import { checkedSocketPath, defaultSocketPath, ensureParent, newId, sleep } from './util.mjs'
 import {
@@ -148,12 +149,15 @@ export async function startWebSocketTransport(
     ws.on('close', () => onClose(peer))
   })
 
+  // A socket that does not refuse a connection stays, and the bind below
+  // fails with EADDRINUSE: it belongs to a server still running, such as a
+  // daemon that started at the same moment as this one.
+  if (parsed.kind === 'unix')
+    await removeStaleSocket(parsed.path, prepareUnixSocketParent(parsed.path))
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject)
     server.once('listening', resolve)
     if (parsed.kind === 'unix') {
-      const shared = prepareUnixSocketParent(parsed.path)
-      removeStaleSocket(parsed.path, shared)
       // Bind with owner-only access even when the chosen directory is shared.
       // Change the mask only for the synchronous bind, before user commands run.
       const previous = process.umask()
@@ -226,15 +230,19 @@ export function prepareUnixSocketParent(path: string): boolean {
   return true
 }
 
-// Clears the way for a listener at the path: a socket there is one an earlier
-// daemon left behind, anything else is the user's and is never removed.
-export function removeStaleSocket(path: string, shared = false): void {
+// Clears the way for a listener at the path: a socket there that refuses a
+// connection is one an earlier daemon left behind. Any other socket stays,
+// as it may belong to a running server that was slow to answer; anything
+// else is the user's and is never removed. False when a socket stays.
+export async function removeStaleSocket(path: string, shared = false): Promise<boolean> {
   const stat = lstatSync(path, { throwIfNoEntry: false })
-  if (!stat) return
+  if (!stat) return true
   if (!stat.isSocket()) throw new Error(`refusing to replace non-socket file at ${path}`)
   if (shared && stat.uid !== process.getuid?.())
     throw new Error(`Unix socket at ${path} belongs to another user`)
+  if ((await socketAccepts(path)) !== false) return false
   rmSync(path, { force: true })
+  return true
 }
 
 // A file's device and inode, or null when nothing is at the path.
