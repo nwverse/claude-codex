@@ -43,6 +43,23 @@ versioning or publishing metadata.
   the rest of its process group with it, as a stopped one does, so helpers it
   started, such as MCP servers that ignore stdin EOF, no longer run on after
   every crash. (#334)
+- Archiving or deleting a native Codex chat now also interrupts the turns of
+  the subagent threads it spawned, and is refused while one of them runs in
+  another adapter. Such a turn used to run on in the deleted chat and keep the
+  adapter busy for good: its idle Codex child never stopped and the daemon
+  never idle-exited. A turn Codex says it no longer runs counts as ended
+  instead of failing every retry, and when Codex does not stop a turn within
+  `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` the change fails and the chat stays, where
+  it used to wait forever. (#344)
+- A native turn Codex accepted but has not announced yet (a shell command,
+  review or compaction) now keeps the Codex child and the daemon up. A small
+  `CLAUDE_CODEX_NATIVE_IDLE_MS` could stop the child in that gap and end the
+  compaction it had just begun. (#344)
+- An inline native review is tracked from Codex's answer, which carries its
+  turn: it holds the chat until Codex ends it, and archive or delete
+  interrupts it even before Codex announces it. The adapter used to wait for
+  the announcement for `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` at most and then
+  let the chat go while the review still ran. (#344)
 - With native mode on, `thread/items/read`, `thread/memory/read` and
   `thread/readState/update` for a native Codex chat go to its Codex child,
   like the chat's other history requests. The App can load a command output
@@ -557,6 +574,10 @@ versioning or publishing metadata.
 - After an interrupt, the queue stays held until `thread/queue/start` or the
   user's next message. A `!` shell command, review or compaction in between
   used to send the next queued message on its own. (#335)
+- That hold also outlives an adapter restart, such as the unix daemon's idle
+  exit 15 s after the App disconnects: a `!` shell command, review or
+  compaction after the interrupt and another one after the restart no longer
+  send the next queued message. (#351)
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.
@@ -1047,6 +1068,17 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- `runs.jsonl`, the run registry, rotates like `debug.jsonl`: at
+  `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` (50 MiB by default) it moves to
+  `runs.jsonl.1`, and `CLAUDE_CODEX_DEBUG_LOG_KEEP` old files (3 by default)
+  stay, all readable by their owner alone. An adapter appends to it on every
+  thread, turn and subagent event, and it used to grow for as long as the
+  adapter home existed. (#350)
+- When the background cleanup of the turn diffs older versions stored stops
+  on a failed write, such as another adapter holding the state database past
+  its busy timeout, the debug log says so (`store.diff_clear_stopped`, with
+  the error). It used to stop without a trace; the next start still goes on
+  where it stopped. (#350)
 - Settings saves from adapters whose `config.json` is a link to one shared
   file all stay. Each save is now locked next to the file the link points to,
   in an empty owner-only `config.json.lock.sqlite`, as the shared Claude model
@@ -1257,6 +1289,12 @@ versioning or publishing metadata.
 
 ### Provider and multi-agent boundaries
 
+- A long-running adapter no longer keeps every background agent it ran, each
+  with its full prompt, until its chat is deleted. It keeps the 256 that
+  finished last, without their prompts, which their child threads hold. A
+  SendMessage to an older agent reopens its child thread as one to an agent
+  from before a restart does, and that lookup now finds the agent by name,
+  also in a chat with more than 200 agents. (#350)
 - **Behavior change:** a Codex (`gpt-*`) chat on the `codex-proxy` route that
   has no sandbox stored runs `codex exec` with `-s workspace-write`, the
   sandbox the App shows for it. It used to run with

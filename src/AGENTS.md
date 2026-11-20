@@ -55,7 +55,8 @@ Persistence:
 
 - `store.mts` — SQLite thread/turn persistence via `node:sqlite` (Node 24+).
 - `run-registry.mts` — append-only `runs.jsonl` of thread/turn/subagent events
-  (`CLAUDE_CODEX_RUN_LOG`, `0` to disable), with redaction.
+  (`CLAUDE_CODEX_RUN_LOG`, `0` to disable), with redaction; rotated like
+  debug.jsonl (`appendLogLine` in `util.mts`).
 - `claude-session-relocation.mts` — copies a Claude transcript to the
   project folder of a thread's new workspace, so a chat resumes after its
   folder is moved or renamed, and decides when a missing transcript is
