@@ -897,25 +897,166 @@ test('a native claim for a turn Codex never announced ends with its child or ada
   }
 })
 
-test('a native claim for a turn Codex never announced ends when the idle child stops', async () => {
-  // The idle stop comes far later than the probe right after the compaction
-  // can take on a loaded machine; the second adapter is up before it starts.
-  const first = startAdapter({ env: { CLAUDE_CODEX_NATIVE_IDLE_MS: '6000' } })
+test('an idle child waits for a turn Codex accepted but has yet to announce', async () => {
+  // Many idle periods pass before the wait ends, even on a loaded machine;
+  // the second adapter is up before the compaction starts.
+  const first = startAdapter({
+    env: { CLAUDE_CODEX_NATIVE_IDLE_MS: '200', CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '6000' },
+  })
   const second = startAdapter({ home: first.home, log: join(first.home, 'second.log') })
   try {
     await initialize(second)
     const threadId = await startChat(first)
     await runTurn(first, threadId, 'accept')
-    const exits = () => first.childLog().filter((entry) => entry.event === 'exit').length
-    const before = exits()
     assert.equal((await first.request('thread/compact/start', { threadId })).error, undefined)
+    const child = first.childLog().findLast((entry) => entry.event === 'spawn').pid as number
+    const stopped = () =>
+      first.childLog().some((entry) => entry.event === 'exit' && entry.pid === child)
+    await delay(1000)
+    assert.equal(stopped(), false, 'the child was stopped before Codex announced the turn')
+    assert.equal(nativeOwner(first.home, threadId), first.proc.pid)
     const probe = () => second.request('thread/rollback', { threadId, numTurns: 1 })
     assert.match((await probe()).error?.message ?? '', /active turn in another adapter process/)
-    await eventually(() => exits() > before, 'idle child stop')
+    // Once the wait ends, nothing runs: the claim ends and the idle child stops.
     await eventually(() => nativeOwner(first.home, threadId) === null, 'claim release')
+    await eventually(stopped, 'idle child stop')
     assert.deepEqual((await probe()).result, {})
   } finally {
     await Promise.all([first.stop(), second.stop()])
+  }
+})
+
+test('archive and delete end the native turns of a chat’s subagent threads', async () => {
+  const first = startAdapter({ env: { FAKE_SUBAGENT: '1', CLAUDE_CODEX_NATIVE_IDLE_MS: '300' } })
+  const second = startAdapter({ home: first.home, log: join(first.home, 'second.log') })
+  try {
+    await initialize(second)
+    // The chat's turn ends; the subagent it spawned works on.
+    const withAgent = async () => {
+      const threadId = await startChat(first)
+      const { seen } = await runTurn(first, threadId, 'accept')
+      const spawned = seen.find(
+        (message) =>
+          message.method === 'thread/started' && message.params.thread.parentThreadId === threadId,
+      )
+      assert.ok(spawned, 'no subagent thread')
+      const agentId = spawned.params.thread.id as string
+      assert.equal(nativeOwner(first.home, agentId), first.proc.pid)
+      return { threadId, agentId }
+    }
+    const interrupted = () =>
+      first
+        .childLog()
+        .filter((entry) => entry.method === 'turn/interrupt')
+        .map((entry) => entry.params.threadId)
+
+    const deleted = await withAgent()
+    // Another adapter cannot stop the subagent's turn, so it leaves the chat alone.
+    const refusal = `thread ${deleted.threadId} has an active turn in another adapter process`
+    for (const method of ['thread/archive', 'thread/delete']) {
+      const answer = await second.request(method, { threadId: deleted.threadId })
+      assert.ok(answer.error?.message?.startsWith(refusal), `${method}: ${answer.error?.message}`)
+    }
+    assert.deepEqual(second.childLog(), [])
+    const child = first.childLog().findLast((entry) => entry.event === 'spawn').pid as number
+    assert.equal(
+      (await first.request('thread/delete', { threadId: deleted.threadId })).error,
+      undefined,
+    )
+    assert.ok(interrupted().includes(deleted.agentId))
+    // Nothing runs on: the idle child stops.
+    await eventually(
+      () => first.childLog().some((entry) => entry.event === 'exit' && entry.pid === child),
+      'idle child stop',
+    )
+
+    const archived = await withAgent()
+    assert.equal(
+      (await first.request('thread/archive', { threadId: archived.threadId })).error,
+      undefined,
+    )
+    assert.ok(interrupted().includes(archived.agentId))
+    assert.equal(nativeOwner(first.home, archived.agentId), null)
+  } finally {
+    await Promise.all([first.stop(), second.stop()])
+  }
+})
+
+test('an inline review Codex answers with its turn holds the chat until that turn ends', async () => {
+  const app = startAdapter({
+    env: { FAKE_REVIEW_TURN: '1', CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '300' },
+  })
+  try {
+    const threadId = await startChat(app)
+    await runTurn(app, threadId, 'accept')
+    // One Codex started and ended before answering is over, whatever the answer says.
+    const done = await app.request('review/start', {
+      threadId,
+      target: { type: 'commit', sha: '1234567' },
+    })
+    assert.equal(done.result.turn.id, 'turn-review-done')
+    await eventually(() => nativeOwner(app.home, threadId) === null, 'claim release')
+    const review = await app.request('review/start', {
+      threadId,
+      target: { type: 'uncommittedChanges' },
+    })
+    assert.equal(review.result.turn.id, 'turn-review')
+    // Long past the wait for an unannounced turn, the review still runs.
+    await delay(1000)
+    assert.equal(nativeOwner(app.home, threadId), app.proc.pid)
+    assert.equal((await app.request('thread/archive', { threadId })).error, undefined)
+    assert.ok(
+      app
+        .childLog()
+        .some(
+          (entry) => entry.method === 'turn/interrupt' && entry.params.turnId === 'turn-review',
+        ),
+    )
+    assert.equal(nativeOwner(app.home, threadId), null)
+  } finally {
+    await app.stop()
+  }
+})
+
+test('archive goes ahead when Codex no longer runs a subagent turn it never reported ended', async () => {
+  const app = startAdapter({ env: { FAKE_SUBAGENT: '1', FAKE_INTERRUPT: 'gone' } })
+  try {
+    const threadId = await startChat(app)
+    const { seen } = await runTurn(app, threadId, 'accept')
+    const agentId = seen.find(
+      (message) =>
+        message.method === 'thread/started' && message.params.thread.parentThreadId === threadId,
+    ).params.thread.id
+    assert.equal((await app.request('thread/archive', { threadId })).error, undefined)
+    assert.equal(nativeOwner(app.home, agentId), null)
+  } finally {
+    await app.stop()
+  }
+})
+
+test('archive and delete fail, keeping the chat, when Codex does not stop its turn in time', async () => {
+  const app = startAdapter({
+    env: { FAKE_INTERRUPT: 'stuck', CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '500' },
+  })
+  try {
+    const threadId = await startChat(app)
+    await app.request('turn/start', { threadId, input: [{ type: 'text', text: 'hello' }] })
+    await app.reader.until((message) => message.method?.endsWith('requestApproval'))
+    for (const method of ['thread/archive', 'thread/delete']) {
+      const answer = await app.request(method, { threadId })
+      assert.match(answer.error?.message ?? '', /did not stop the running turn in time/, method)
+    }
+    const list = await app.request('thread/list', { archived: false })
+    assert.ok(list.result.data.some((row: any) => row.id === threadId))
+    assert.equal(
+      app
+        .childLog()
+        .filter((entry) => entry.method === 'thread/archive' || entry.method === 'thread/delete')
+        .length,
+      0,
+    )
+  } finally {
+    await app.stop()
   }
 })
 

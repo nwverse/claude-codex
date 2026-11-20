@@ -469,6 +469,9 @@ interface PendingServerRequest {
 const DETACHED_PEER: RpcPeer = { id: 'detached', send: () => {}, close: () => {} }
 
 const MAX_TRACKED_TASK_IDS = 512
+// Background agents that reported back and are still known as they ran (see
+// keepFinishedBackgroundSubagent).
+const MAX_FINISHED_BACKGROUND_AGENTS = 256
 // Command items a background shell's later output may still go to.
 const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
@@ -735,7 +738,8 @@ export class CodexClaudeAppServer {
   // Turns review/start and thread/compact/start run, which take no steering.
   private unsteerableTurns = new Map<string, 'review' | 'compact'>()
   // Keyed by child thread id. Entries outlive the run so SendMessage can
-  // still find (and resume) an agent that already reported back.
+  // still find (and resume) an agent that already reported back, the most
+  // recent MAX_FINISHED_BACKGROUND_AGENTS of them.
   private backgroundSubagents = new Map<string, BackgroundSubagent>()
   // task_started precedes the Agent tool result that backgrounds the task.
   private taskIdByToolUse = new Map<string, string>()
@@ -7597,8 +7601,9 @@ export class CodexClaudeAppServer {
     return false
   }
 
-  // A child that ran in the foreground, or before a restart, has no entry,
-  // yet SendMessage resumes it all the same: the CLI runs it on in the
+  // A child that ran in the foreground, before a restart or in the background
+  // long ago (see keepFinishedBackgroundSubagent) has no entry, yet
+  // SendMessage resumes it all the same: the CLI runs it on in the
   // background. Track it from then on like any background agent.
   private adoptChildAgent(
     thread: ThreadRecord,
@@ -7606,15 +7611,22 @@ export class CodexClaudeAppServer {
     agentId: string,
     mcpServers: string[],
   ): BackgroundSubagent | null {
-    // A direct child first; then one nested below another agent.
+    // A direct child first; then one nested below another agent. Searched by
+    // name, so an agent among more than a page of children is found too.
     const child =
       this.store
-        .listThreads({ includeEphemeral: true, parentThreadId: thread.id, limit: 200 })
+        .listThreads({
+          includeEphemeral: true,
+          parentThreadId: thread.id,
+          agentNickname: agentId,
+          limit: 200,
+        })
         .find((candidate) => candidate.agentNickname === agentId) ??
       this.store
         .listThreads({
           includeEphemeral: true,
           ancestorThreadId: thread.id,
+          agentNickname: agentId,
           sourceKinds: ['subAgentThreadSpawn'],
           limit: 200,
         })
@@ -7868,7 +7880,34 @@ export class CodexClaudeAppServer {
       context,
       status === 'completed' ? 'completed' : 'interrupted',
     )
+    this.keepFinishedBackgroundSubagent(entry)
     this.checkIdle()
+  }
+
+  // An agent that reported back stays known, so a SendMessage or TaskStop
+  // that comes later finds it as it ran. Its child turn holds its prompt now,
+  // and a resume brings its own. Only the most recently finished stay: a
+  // daemon that never restarts would keep every agent it ever ran, and a
+  // SendMessage to an older one rebuilds it from the store (adoptChildAgent).
+  // One that a SendMessage or TaskStop is on its way to stays as well.
+  private keepFinishedBackgroundSubagent(entry: BackgroundSubagent): void {
+    const id = entry.context.childThreadId
+    if (entry.running || this.backgroundSubagents.get(id) !== entry) return
+    entry.context = { ...entry.context, prompt: '' }
+    // Most recently finished last.
+    this.backgroundSubagents.delete(id)
+    this.backgroundSubagents.set(id, entry)
+    const addressed = new Set(
+      [...this.pendingAgentCalls.values()].map((call) => call.childThreadId),
+    )
+    let excess = -MAX_FINISHED_BACKGROUND_AGENTS
+    for (const other of this.backgroundSubagents.values()) if (!other.running) excess += 1
+    for (const [otherId, other] of this.backgroundSubagents) {
+      if (excess <= 0) return
+      if (other.running || addressed.has(otherId)) continue
+      this.backgroundSubagents.delete(otherId)
+      excess -= 1
+    }
   }
 
   // Subagent activity belongs to a parent turn. A background agent usually
@@ -7898,7 +7937,8 @@ export class CodexClaudeAppServer {
       return
     }
     const queue = this.queuedSubagentActivity.get(parentThreadId) ?? []
-    queue.push({ context, kind })
+    // The item names the agent only; its prompt stays out of the queue.
+    queue.push({ context: { ...context, prompt: '' }, kind })
     this.queuedSubagentActivity.set(parentThreadId, queue.slice(-MAX_QUEUED_ACTIVITY))
   }
 

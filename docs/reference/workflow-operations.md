@@ -96,6 +96,10 @@ Run events are appended to `runs.jsonl` in the adapter home, by default:
 The registry redacts prompt-like fields, model responses, and secret-like
 values before writing. Set `CLAUDE_CODEX_RUN_LOG=0` to disable the registry, or
 set `CLAUDE_CODEX_RUN_LOG=/path/to/runs.jsonl` to choose another JSONL file.
+The file is readable by its owner alone and rotates like the debug log: at
+`CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` (50 MiB by default) it moves to
+`runs.jsonl.1`, keeping `CLAUDE_CODEX_DEBUG_LOG_KEEP` old files (3 by default);
+events older than those are deleted.
 
 The registry is for operational evidence, not transcript storage. Do not depend
 on it for raw prompt, response, credential, or user-secret recovery.

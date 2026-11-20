@@ -499,7 +499,8 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 
 # Rotate once the log reaches this many bytes (default 52428800, 50 MiB;
 # 0 never rotates), keeping this many old files as debug.jsonl.1, .2, ...
-# (default 3, at least 1, at most 100).
+# (default 3, at least 1, at most 100). The run registry (runs.jsonl)
+# rotates by the same two settings.
 export CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES="52428800"
 export CLAUDE_CODEX_DEBUG_LOG_KEEP="3"
 ```
@@ -631,8 +632,8 @@ the profile's `env` or env file.
 | `CLAUDE_CODEX_NATIVE_CODEX` | `on` runs new Codex chats in a real `codex app-server` child (one per model provider) instead of one `codex exec --json` per turn: approvals, diffs, plan mode, MCP, images, compaction, steer, rollback and fork behave as in Codex. Also adds the Codex+AsterGate models and harness labels to the picker. See [Harnesses](/guide/backends#harnesses). |
 | `CLAUDE_CODEX_CODEX_AG_MODELS` | With the native harness: the models offered as `codex-ag:<model>` (comma-separated), which run in Codex on `CLAUDE_CODEX_CODEX_AG_PROVIDER`. Without it, every non-OpenAI model of the Codex model catalog (`model_catalog_json` in `config.toml`, else `model_catalog.json`). |
 | `CLAUDE_CODEX_CODEX_AG_PROVIDER` | The `[model_providers.<id>]` of the Codex `config.toml` that `codex-ag:` models run on. Default `astergate_claude`. Each native conversation keeps the provider it started on. |
-| `CLAUDE_CODEX_NATIVE_IDLE_MS` | How long the Codex children stay up with nothing to do (default 600000; `0` keeps them). |
-| `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` | How long an adapter keeps a native chat to itself after Codex accepts a shell command, review or compaction whose turn it has not announced yet (default 30000). Other adapters sharing the state directory refuse to run or change the chat meanwhile. |
+| `CLAUDE_CODEX_NATIVE_IDLE_MS` | How long the Codex children stay up with nothing to do (default 600000; `0` keeps them). A turn Codex accepted but has not announced yet counts as something to do. |
+| `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` | How long an adapter keeps a native chat to itself after Codex accepts a shell command, review or compaction whose turn it has not announced yet (default 30000). Other adapters sharing the state directory refuse to run or change the chat meanwhile. A review Codex answers with its turn holds the chat until that turn ends. Archive and delete also wait this long at most for Codex to stop a running turn, then fail. |
 | `CLAUDE_CODEX_HARNESS_LABELS` | `1`/`0` forces the "Claude Code · / Codex · / Codex+AsterGate ·" picker labels on or off; on with the native harness. |
 | `CLAUDE_CODEX_DISABLE_CODEX_PROXY` | `1` turns Codex model routing off, unless the Codex proxy is the selected loop: the picker offers only Claude models, a new thread on a Codex model is refused, and the App's title and summary threads run on `CLAUDE_CODEX_SUMMARY_MODEL` (else `CLAUDE_CODEX_TITLE_MODEL`, else haiku; with model process profiles, the profile they name, else the default profile). |
 | `CLAUDE_CODEX_SUMMARY_MODEL` / `CLAUDE_CODEX_TITLE_MODEL` | The Claude model for summary work that names a Codex model or none: structured (`outputSchema`) turns such as the App's title and summary turns, and the summary `/compact` writes for a Codex thread (default `haiku`; `CLAUDE_CODEX_SUMMARY_MODEL` wins). With model process profiles they name a profile (default: the default profile), and a thread on a profile summarizes on its own. See [Profiles and the other model settings](#profiles-and-the-other-model-settings). |
@@ -686,8 +687,8 @@ the profile's `env` or env file.
 | `CLAUDE_CODEX_MOCK` | Run the protocol without Claude credentials. |
 | `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS` | How long a state-database write waits for another connection's lock before it fails (default `5000`). |
 | `CLAUDE_CODEX_DEBUG_LOG` | Debug log path (default `debug.jsonl` in the adapter home); `0` or `false` turns it off. Keep another path in a folder only you can write to, not `/tmp`. See [Debug log](#debug-log). |
-| `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` / `_KEEP` | Size at which the debug log rotates (default 50 MiB; `0` never rotates) and how many rotated files stay (default `3`). |
-| `CLAUDE_CODEX_RUN_LOG` | Run registry, the JSON Lines file of thread, turn and subagent events (default `runs.jsonl` in the adapter home); `0` or `false` turns it off. See [Run registry](/reference/workflow-operations#run-registry). |
+| `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` / `_KEEP` | Size at which the debug log and the run registry rotate (default 50 MiB; `0` never rotates) and how many rotated files of each stay (default `3`). |
+| `CLAUDE_CODEX_RUN_LOG` | Run registry, the JSON Lines file of thread, turn and subagent events (default `runs.jsonl` in the adapter home, owner-only, rotated like the debug log); `0` or `false` turns it off. See [Run registry](/reference/workflow-operations#run-registry). |
 | `CLAUDE_CODEX_HTTP_*`, `CLAUDE_CODEX_CLAUDE_P_*` | Tuning for the `agent-http`, `agentapi` and `claude-p` backends. See [agent-http and agentapi settings](/guide/backends#agent-http-and-agentapi-settings) and [claude-p](/guide/backends#claude-p). |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | Claude auth / custom endpoint configuration. Keep real values out of git. |
 | `CLAUDE_CODE_FORK_SUBAGENT` | Claude Code's own switch, passed on from the adapter's environment: `0` keeps Claude from starting fork subagents (`subagent_type: "fork"`), which Claude Code 2.1.302 and later offer by default. With model process profiles, only a profile that inherits or sets it passes it on. See [Claude Code variables](#claude-code-variables). |

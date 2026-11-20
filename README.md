@@ -565,7 +565,10 @@ Run events are appended to `runs.jsonl` in the adapter home by default. The
 registry redacts prompt-like fields, model responses, and secret-like values
 before writing. Set
 `CLAUDE_CODEX_RUN_LOG=0` to disable it, or set `CLAUDE_CODEX_RUN_LOG=/path/log`
-to choose a different JSONL file.
+to choose a different JSONL file. The file rotates like the debug log: at
+`CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` (50 MiB by default) it moves to
+`runs.jsonl.1`, `CLAUDE_CODEX_DEBUG_LOG_KEEP` old files (3 by default) stay, and
+events older than those are deleted.
 
 Optional per-thread worktree isolation is off by default: set
 `CLAUDE_CODEX_AUTO_WORKTREE=1` to enable it, and optionally

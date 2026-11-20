@@ -470,7 +470,7 @@ export class SessionStore {
   // one batch at most. The adapter runs it on every start once it listens, so
   // diffs written during a rollback go too; a clean store takes reads only
   // (octet_length does not read the text). Resolves once none is left, the
-  // store closes or a write fails (the next start goes on).
+  // store closes or a statement fails (debug-logged; the next start goes on).
   clearStoredTurnDiffs(
     sliceMs = DIFF_CLEAR_SLICE_MS,
     pauseMs = DIFF_CLEAR_PAUSE_MS,
@@ -514,7 +514,12 @@ export class SessionStore {
           do {
             if (!batch()) return this.stopClearingDiffs()
           } while (performance.now() - started < sliceMs)
-        } catch {
+        } catch (error) {
+          // Such as another adapter holding the write lock past the busy
+          // timeout. The diffs left go on the next start.
+          debugLog('store.diff_clear_stopped', {
+            error: error instanceof Error ? error.message : String(error),
+          })
           return this.stopClearingDiffs()
         }
         const timer = setTimeout(slice, pauseMs)
@@ -676,6 +681,8 @@ export class SessionStore {
       includeEphemeral?: boolean
       parentThreadId?: string | null
       ancestorThreadId?: string | null
+      // Keeps the threads of the agent SendMessage addresses by this name.
+      agentNickname?: string | undefined
       sourceKinds?: string[]
       sectionId?: string | null | undefined
       projectId?: string | null | undefined
@@ -775,6 +782,10 @@ export class SessionStore {
     }
     if (ancestorThreadId != null) {
       where.push('t.id IN (SELECT id FROM descendants)')
+    }
+    if (options.agentNickname !== undefined) {
+      where.push('t.agent_nickname = ?')
+      args.push(options.agentNickname)
     }
 
     if (sourceKinds.length > 0) {
