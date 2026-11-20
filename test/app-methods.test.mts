@@ -1895,6 +1895,33 @@ test('getConversationSummary refuses a thread it does not know and dates one it 
   })
 })
 
+test('an upgraded adapter serves at once and empties the turn diffs older versions stored', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-app-methods-'))
+  const path = join(home, 'claude-codex-adapter', 'state.sqlite')
+  await mkdir(join(home, 'claude-codex-adapter'))
+  new SessionStore(path).close()
+  const raw = new DatabaseSync(path)
+  raw.exec(`INSERT INTO threads (id, session_id, preview, cwd, model, model_provider, source,
+    created_at, updated_at, status_json) VALUES ('old', 'old', 'old chat', '${home}', 'm',
+    'anthropic', 'appServer', 1, 1, '{"type":"idle"}')`)
+  const insert =
+    raw.prepare(`INSERT INTO turns (id, thread_id, status, started_at, items_json, diff)
+    VALUES (?, 'old', 'completed', ?, '[]', ?)`)
+  for (let index = 0; index < 40; index++) insert.run(`turn-${index}`, index, 'x'.repeat(65_536))
+  const stored = async () =>
+    (raw.prepare('SELECT SUM(octet_length(diff)) AS bytes FROM turns').get() as { bytes: number })
+      .bytes
+  const server = new AppServer(home)
+  try {
+    const page = await server.request('thread/turns/list', { threadId: 'old', limit: 50 })
+    assert.equal(page.data.length, 40)
+    await eventually(stored, 0)
+  } finally {
+    raw.close()
+    await server.close()
+  }
+})
+
 test('notifications a client opts out of are not sent, nor a diff taken for them', async () => {
   // A git on PATH that logs each run, to count the diffs the server takes.
   const tools = await mkdtemp(join(tmpdir(), 'claude-codex-git-runs-'))
@@ -1910,7 +1937,7 @@ test('notifications a client opts out of are not sent, nor a diff taken for them
   const diffRuns = async () =>
     (await readFile(log, 'utf8').catch(() => ''))
       .split('\n')
-      .filter((line) => line.startsWith('diff ')).length
+      .filter((line) => line.replace(/^(-c \S+ )+/, '').startsWith('diff ')).length
   const env = { PATH: `${tools}${delimiter}${process.env.PATH ?? ''}` }
   // Like Codex, an opt-out names exact methods; the App opts out of the diff.
   const run = async (optOutNotificationMethods: string[]) => {

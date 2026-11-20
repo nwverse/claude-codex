@@ -11,6 +11,10 @@ const DIFF_FILE_BYTES = 256 * 1024
 const DIFF_INLINE_BYTES = 2 * 1024 * 1024
 const MAX_LISTED_FILES = 256
 const MAX_PER_FILE_DIFFS = 32
+// `git diff` names files from the top of the work tree even where the user
+// set diff.relative. As config rather than --no-relative (git 2.28), so an
+// older git, which has no diff.relative, still runs it.
+const GIT_DIFF = ['-c', 'diff.relative=false', 'diff', '--no-ext-diff']
 
 // `git diff` failing is expected outside a repo, so we still return '' to keep
 // turns working — but the reason is written to the debug log instead of being
@@ -123,7 +127,7 @@ function listGitRecords(
     child.once('error', reject)
     child.once('close', (code) => {
       if (code === 0) resolve({ records, omitted })
-      else reject(new Error(`git ${args[0]} exited with ${code ?? 'a signal'}`))
+      else reject(new Error(`git ${args.join(' ')} exited with ${code ?? 'a signal'}`))
     })
   })
 }
@@ -135,7 +139,7 @@ function bufferOverflow(error: unknown): boolean {
 }
 
 async function trackedDiffFallback(cwd: string, budget: InlineBudget): Promise<string> {
-  const args = ['diff', '--no-ext-diff', '--no-renames', '--no-relative']
+  const args = [...GIT_DIFF, '--no-renames']
   const { records, omitted } = await listGitRecords(cwd, [...args, '--numstat', '-z', '--'])
   const files = records.map((record) => {
     const first = record.indexOf('\t')
@@ -186,12 +190,11 @@ export async function gitDiff(cwd: string): Promise<string> {
   const budget = { remaining: DIFF_INLINE_BYTES }
   let tracked: string
   try {
-    // Paths from the top of the work tree even with diff.relative set.
-    const { stdout } = await execFileAsync(
-      'git',
-      ['diff', '--no-ext-diff', '--no-relative', '--'],
-      { cwd, timeout: 10_000, maxBuffer: TRACKED_DIFF_BYTES },
-    )
+    const { stdout } = await execFileAsync('git', [...GIT_DIFF, '--'], {
+      cwd,
+      timeout: 10_000,
+      maxBuffer: TRACKED_DIFF_BYTES,
+    })
     tracked = stdout
   } catch (error) {
     if (!bufferOverflow(error)) {

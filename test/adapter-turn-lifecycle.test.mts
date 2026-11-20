@@ -2113,7 +2113,7 @@ async function blockingGitDiff(home: string): Promise<{ repo: string; env: NodeJ
       "  printf 'true\\n'",
       '  exit 0',
       'fi',
-      'if [ "$1" = "diff" ]; then',
+      'if [ "$1" = "diff" ] || [ "$3" = "diff" ]; then',
       '  : > "$CLAUDE_CODEX_TEST_GIT_DIFF_STARTED"',
       '  while [ ! -f "$CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE" ]; do sleep 0.01; done',
       "  printf 'diff --git a/file b/file\\n--- a/file\\n+++ b/file\\n@@ -1 +1 @@\\n-old\\n+new\\n'",

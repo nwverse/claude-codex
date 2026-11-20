@@ -192,3 +192,42 @@ test('a git that fails to run does not make a repository look like a folder', as
     assert.match(await gitDiff(cwd), /\+git runs again/)
   })
 })
+
+test('a git before 2.28, without --no-relative, still diffs from the top', async () => {
+  await withRepository(async (cwd) => {
+    // That git refuses the option (exit 129) and ignores the config key.
+    const bin = await mkdtemp(join(tmpdir(), 'turn-diff-old-git-'))
+    const { stdout: realGit } = await execFileAsync('sh', ['-c', 'command -v git'])
+    await writeFile(
+      join(bin, 'git'),
+      [
+        '#!/bin/sh',
+        'for arg in "$@"; do',
+        '  if [ "$arg" = "--no-relative" ]; then echo "error: unknown option" >&2; exit 129; fi',
+        'done',
+        `exec '${realGit.trim()}' "$@"`,
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    )
+    const pkg = join(cwd, 'pkg')
+    await mkdir(pkg)
+    await writeFile(join(pkg, 'large.txt'), `${'before'.repeat(170)}\n`.repeat(6_000))
+    await writeFile(join(pkg, 'small.txt'), 'before\n')
+    await execFileAsync('git', ['add', '--', '.'], { cwd })
+    await execFileAsync('git', ['config', 'diff.relative', 'true'], { cwd })
+    await writeFile(join(pkg, 'large.txt'), `${'after!'.repeat(170)}\n`.repeat(6_000))
+    await writeFile(join(pkg, 'small.txt'), 'after\n')
+    const path = process.env.PATH
+    process.env.PATH = `${bin}:${path ?? ''}`
+    try {
+      // Over the size limit, so the per-file fallback runs too.
+      const diff = await gitDiff(pkg)
+      assert.match(diff, /^Binary files a\/pkg\/large\.txt and b\/pkg\/large\.txt differ$/m)
+      assert.match(diff, /^diff --git a\/pkg\/small\.txt b\/pkg\/small\.txt\n[\s\S]*\n\+after$/m)
+    } finally {
+      process.env.PATH = path
+      await rm(bin, { recursive: true, force: true })
+    }
+  })
+})

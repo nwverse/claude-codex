@@ -219,9 +219,12 @@ versioning or publishing metadata.
 - A file the turn diff leaves out (too large, binary or past the size limit)
   shows as a binary change with the reason after it, which renderers show
   without content and `git apply` refuses. It used to be a one-line hunk that
-  `git apply` accepted, writing `[omitted: …]` into the file. New files in a
-  chat that runs in a subfolder are named from the repository root, as the
-  changed tracked files are. (#336)
+  `git apply` accepted, writing `[omitted: …]` into the file; that includes
+  `gitDiffToRemote`, which the App sends as a cloud task's starting diff. New
+  files in a chat that runs in a subfolder are named from the repository root,
+  as the changed tracked files are, also where `diff.relative` is set, and a
+  tracked diff over the 5 MB limit is no longer empty with a git older than
+  2.28. (#336)
 - A folder that becomes a repository after a chat first diffed it shows its
   changes in `turn/diff/updated` and `gitDiffToRemote` within 30 seconds,
   and one whose `git` timed out once on a busy machine at the next diff. The
@@ -892,9 +895,12 @@ versioning or publishing metadata.
   every history read or search decoded them: five turns in a repository with
   a 3.5 MB diff grew the file to 21 MB, now 160 KB. Clients that listen still
   get `turn/diff/updated`; the turn's end no longer runs `git diff` when every
-  client opted out of it, as the App does. The adapter empties diffs older
-  versions stored when it starts (SQLite reuses the space; the file does not
-  shrink), and an older version still opens the state. (#336)
+  client opted out of it, as the App does. After the upgrade the adapter
+  empties the diffs older versions stored gradually, a few turns per write in
+  the background once it serves, so a large state file neither delays its
+  start nor locks out another adapter for long; reads skip them meanwhile.
+  SQLite reuses the space (the file does not shrink), and an older version
+  still opens the state. (#336)
 - A deleted chat stays deleted and a rename sticks when a `turn/start`
   arrives at the same time, for example from a second window on the same
   chat. `turn/start` re-reads the thread after waiting on a running turn
