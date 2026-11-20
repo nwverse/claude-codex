@@ -1489,6 +1489,14 @@ versioning or publishing metadata.
   Codex harness and the shared process-group and JSON-file helpers, and the
   root AGENTS.md points to the configuration reference table for the full
   list of variables. (#338)
+- `npm audit --omit=dev` reports no known advisories; it reported 9
+  packages (1 critical, 5 high). The lockfile takes fixed versions within the
+  existing ranges: zod 4.6.7, which checks the arguments of the adapter's
+  in-process MCP tools, and the MCP SDK 1.32.2 that npm installs as a peer of
+  the Claude Agent SDK, with its HTTP server packages (`express`'s
+  `body-parser`, `qs` and `proxy-addr`, `hono`, `@hono/node-server`,
+  `ip-address`, `fast-uri`), which the adapter does not load. The Claude Agent
+  SDK stays at 0.3.322. (#340)
 
 ### Validation and release gates
 
