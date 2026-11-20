@@ -93,8 +93,12 @@ export function watchPath(
 // (`rm -rf .git && git init`). Returns the function that closes the watch.
 function watchEntry(path: string, onEntry: () => void): () => void {
   const parent = dirname(path)
+  // Never null again once set: onEvent relies on anchor() not throwing then,
+  // and an exception in an fs.watch listener would end the adapter.
   let watcher: FSWatcher | null = null
   let watched: Folder | null = null
+  // The entry as last reported, so that a move reports it only if it changed.
+  let reported = ''
   // Watches the nearest existing folder unless it is watched already, then
   // checks again: a folder further down may have appeared before the new
   // watch started. At most one move per level, so a folder that keeps being
@@ -126,11 +130,15 @@ function watchEntry(path: string, onEntry: () => void): () => void {
   const onEvent = (aboutEntry: boolean): void => {
     const was = watched
     anchor()
-    // After a move the entry may exist (created before the watch got down to
-    // it) or be gone with the folder the watch was on.
-    if (aboutEntry || (watched !== was && (was?.path === parent || entryExists(path)))) onEntry()
+    // After a move the entry may have appeared (created before the watch got
+    // down to it) or be gone with the folder the watch was on. A new watch on
+    // the same folder, as without statx, leaves it as it was.
+    if (!aboutEntry && (watched === was || entryStamp(path) === reported)) return
+    reported = entryStamp(path)
+    onEntry()
   }
   anchor()
+  reported = entryStamp(path)
   return () => watcher?.close()
 }
 
@@ -161,8 +169,9 @@ function symlinkTarget(path: string): string | null {
 // path, since on Linux a watch stays with the folder it was started on. The
 // birth time is part of it because ext4 often gives a folder created right
 // after another was deleted the old inode number. Where Linux lacks statx,
-// Node reports the change time as birth time, and a change inside the folder
-// starts a new watch on it: extra work, but no loop.
+// Node reports the change time as birth time, so each entry created or
+// removed in the folder starts a new watch on it; the re-check after it finds
+// the same folder, and the watched entry is reported only if it changed.
 interface Folder {
   path: string
   id: string
@@ -177,12 +186,13 @@ function nearestFolder(path: string): Folder {
   }
 }
 
-function entryExists(path: string): boolean {
+// What tells a change of the entry at `path`; '' while it is missing.
+function entryStamp(path: string): string {
   try {
-    lstatSync(path)
-    return true
+    const stats = lstatSync(path, { throwIfNoEntry: false })
+    return stats ? `${stats.dev}:${stats.ino}:${stats.mtimeMs}:${stats.size}` : ''
   } catch {
-    return false
+    return ''
   }
 }
 

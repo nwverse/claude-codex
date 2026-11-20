@@ -6,8 +6,10 @@ import fs, {
   type FSWatcher,
   mkdirSync,
   mkdtempSync,
+  type PathLike,
   renameSync,
   rmSync,
+  type StatSyncOptions,
   symlinkSync,
   utimesSync,
   type WatchOptionsWithStringEncoding,
@@ -18,6 +20,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
+import { FS_WATCH_DEBOUNCE_MS } from '../src/fs-watch.mjs'
 import { INVALID_REQUEST } from '../src/host-methods.mjs'
 import { MockRuntime } from '../src/mock-runtime.mjs'
 import type { RpcPeer, WireMessage } from '../src/types.mjs'
@@ -156,6 +159,22 @@ function spyOnWatch(
     handles.disable()
   })
   return { paths, open: () => open.size }
+}
+
+// Makes fs.statSync report the change time as birth time for the rest of the
+// test, also as the code under test imported it, as Node does on Linux
+// without statx (kernel < 4.11, some seccomp filters, WSL1).
+function birthTimeIsChangeTime(t: TestContext): void {
+  const original = fs.statSync
+  fs.statSync = ((path: PathLike, options?: StatSyncOptions) => {
+    const stats = original(path, options)
+    return stats && Object.assign(stats, { birthtimeMs: stats.ctimeMs })
+  }) as typeof fs.statSync
+  syncBuiltinESMExports()
+  t.after(() => {
+    fs.statSync = original
+    syncBuiltinESMExports()
+  })
 }
 
 // Waits until exactly `count` fs.watch handles are open; a closed handle is
@@ -320,6 +339,39 @@ test('a watched file recovers when its folder is replaced before the watch sees 
       assert.deepEqual(update, [head])
       await openWatches(spy, 1)
     }
+    await app.request('fs/unwatch', { watchId: 'head' })
+    await openWatches(spy, 0)
+  })
+})
+
+test('files coming and going beside a watched file do not report it, also without statx', async (t) => {
+  // Without statx each file created or removed in .git changes the birth
+  // time Node reports for it, so the watch starts again on the same folder.
+  birthTimeIsChangeTime(t)
+  const spy = spyOnWatch(t)
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    const git = gitDir()
+    const head = join(git, 'HEAD')
+    await watchLive(app, 'head', head, head)
+    const seen = changes(app, 'head').length
+    const watches = spy.paths.length
+    // `git status` a few times: index.lock comes and goes, HEAD stays.
+    for (let index = 0; index < 3; index++) {
+      writeFileSync(join(git, 'index.lock'), '')
+      rmSync(join(git, 'index.lock'))
+    }
+    await poll('the watch to start again on .git', () =>
+      spy.paths.length > watches ? true : undefined,
+    )
+    assert.deepEqual(spy.paths.slice(watches, watches + 1), [git])
+    // A report would have been due one debounce window after the watch
+    // started again, so before this wait ends.
+    await delay(FS_WATCH_DEBOUNCE_MS * 2)
+    assert.equal(changes(app, 'head').length, seen)
+    // HEAD itself changing is still reported.
+    const update = await probeChange(app, 'head', () => gitUpdate(head, 'ref: refs/heads/a\n'))
+    assert.deepEqual(update, [head])
+    await openWatches(spy, 1)
     await app.request('fs/unwatch', { watchId: 'head' })
     await openWatches(spy, 0)
   })
