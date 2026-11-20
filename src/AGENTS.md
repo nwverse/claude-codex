@@ -79,6 +79,9 @@ Codex and Claude Code config bridging:
 - `ask-rules.mts` — `permissions.ask` rules enforced through a PreToolUse
   callback, including compound Bash command lines
   (`CLAUDE_CODEX_CLAUDE_PERMISSIONS=1`).
+- `shell-commands.mts` — every command a Bash command line may run (wrappers,
+  `sh -c`, `eval`, `xargs`, `find -exec`), read as bash and zsh read it and
+  failing closed, for the ask rules and hook `if` conditions.
 - `permission-suggestions.mts` — Claude's "don't ask again" suggestions mapped
   to the App's approval-card choices (session rules and folders only with
   `CLAUDE_CODEX_SESSION_SUGGESTIONS=1`).

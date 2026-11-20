@@ -328,11 +328,16 @@ denied tool stays refused whatever the approval policy. So does
 adapter registers a `PreToolUse` callback that sends the calls they cover to the
 Codex approval prompt, even when an allow rule or a hook would approve them. It
 matches them as Claude Code does and errs towards asking: a Bash rule covers
-each command of a compound command line and what wrappers such as `timeout`,
-`xargs` or `sh -c` run, a command line with command substitution, a heredoc or
-a command named by a variable is asked about under any Bash rule, since it could
-run anything, and an `Edit` rule covers every tool that edits files, a `Read`
-rule `Glob` and `Grep` by the folder they search. Under Full Access the prompt
+each command of a compound command line, what wrappers such as `sudo`,
+`timeout`, `xargs`, `find -exec` or `sh -c` run whatever their options, and the
+command of a `Monitor` call; a word the shell expands (`$VAR`, a glob) may stand
+for any text, and a command line whose commands only the shell can tell
+(command substitution, a heredoc, a shell reading its commands from stdin) is
+asked about under any Bash rule, since it could run anything. An `Edit` rule
+covers every tool that edits files, a `Read` rule `Glob` and `Grep` by the
+folder they search and the folder a glob starts from; file rules match paths in
+any case and through symlinks, and `*` in a tool name or a `domain:` works as in
+Claude Code. Under Full Access the prompt
 is approved without asking, as every other one is; in plan mode an asked-for
 call is refused. `permissions.allow` lets matching tool calls run without a
 Codex approval prompt; the user's rules always count, a project's only once the

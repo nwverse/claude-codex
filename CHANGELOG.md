@@ -975,6 +975,25 @@ versioning or publishing metadata.
   listed Bash used to run in those threads with no card, a listed Write too
   in a read-only sandbox, and in plan mode a listed WebFetch ran instead of
   being refused. Other sandboxes keep the whole list. (#339)
+- With `CLAUDE_CODEX_CLAUDE_PERMISSIONS=1`, `permissions.ask` rules (and hook
+  `if` conditions) now cover calls the guard used to let through without a
+  prompt: a shell's `-c` script after its other options (`bash -c -e '…'`) or
+  behind a wrapper (`nohup sh -c 'cd app && git push'`); wrappers it did not
+  know, whichever of their options take a value (`setsid`, `flock`, `env -S`,
+  `watch`, `su -c`, `trap`, `sudo -EH -u root`, zsh's `noglob`, `-` and
+  `repeat`, and more); what `xargs` and `find -exec` add; words the shell
+  expands (`$'…'`, `$VAR` arguments, globs and brace lists, also in a command
+  name); a command in another case or as zsh's `=cmd`; zsh's short `if` and
+  `always` forms; a `Monitor` call's command; file paths in another case,
+  through `..` after a symlink, relative to the session's current folder, or
+  where a `Glob` pattern points; `*` in a tool name or a `domain:`, and a
+  `domain:` with a trailing dot, a port or a non-ASCII name; and a subagent
+  call that names no `subagent_type`. A command line whose commands cannot be
+  told apart (a shell reading stdin, an `alias`, an array subscript holding
+  `$(…)`, a zsh glob in a command name) is asked about under any Bash rule.
+  `timeout 5 grep rm`, `command -v rm` and `$((…))` no longer ask under
+  `Bash(rm:*)`, and a rule with several `*` no longer takes seconds to match a
+  long command, blocking the adapter meanwhile. (#346)
 
 ### Trustworthy history and settings
 
