@@ -1,3 +1,4 @@
+import { evaluatesHiddenText, runsLater } from './shell-eval.mjs'
 import { parseLine, RESERVED, type Word } from './shell-words.mjs'
 import { UNKNOWN } from './wildcards.mjs'
 
@@ -12,8 +13,9 @@ import { UNKNOWN } from './wildcards.mjs'
 // only the shell can tell has none, and the caller treats it as running
 // anything: command substitution, a heredoc, a shell reading its commands
 // from stdin, a zsh glob or extended pattern group anywhere (zsh's
-// *(e:...:) runs code), and text the shell may run later (a substitution in
-// an array subscript, PS4, a function table entry, an exported function).
+// *(e:...:) runs code), and text the shell may run later (see
+// shell-eval.mts). This reads the line as text, before it runs: it is not
+// a sandbox against a command hidden on purpose.
 
 export { UNKNOWN }
 
@@ -26,7 +28,7 @@ export const COMMAND_NAMES_IGNORE_CASE =
 // when that cannot be told.
 export function commandCandidates(line: string): string[] | null {
   const out = new Candidates()
-  if (!collect(line, 0, false, out)) return null
+  if (!collect(line, 0, NO_SCOPE, out)) return null
   // The whole line too, for a rule naming a compound command. It does not
   // count against the budget, so one long command can still be read.
   const whole = line.trim().replace(/\s+/g, ' ')
@@ -179,19 +181,49 @@ class Candidates {
   }
 }
 
-// `env` says whether the line set BASH_ENV or ENV, the file a shell reads
-// its commands from before anything else.
-function collect(line: string, depth: number, env: boolean, out: Candidates): boolean {
+// What a line around a command sets up, by name, however it is set:
+// BASH_ENV (a shell runs that file's commands first), ENV (an interactive
+// POSIX shell does), and an array (declare reads an expansion into one as
+// code).
+interface Scope {
+  readonly bashEnv: boolean
+  readonly env: boolean
+  readonly arrays: boolean
+}
+const NO_SCOPE: Scope = { bashEnv: false, env: false, arrays: false }
+
+function collect(line: string, depth: number, outer: Scope, out: Candidates): boolean {
   if (depth > MAX_DEPTH) return false
-  const commands = parseLine(line)
-  if (commands === null) return false
-  const shellEnv =
-    env || commands.some((words) => words.some((word) => /^(?:BASH_ENV|ENV)=/.test(word.text)))
-  return commands.every((words) => analyze(words, depth, shellEnv, out))
+  const parsed = parseLine(line)
+  if (parsed === null || runsLater(line)) return false
+  if (evaluatesHiddenText(line, parsed.commands, parsed.subscripts)) return false
+  const scope: Scope = {
+    bashEnv: outer.bashEnv || /\bBASH_ENV\b/.test(line),
+    env: outer.env || /\bENV\b/.test(line),
+    arrays: outer.arrays || makesArrays(line, parsed.commands),
+  }
+  return parsed.commands.every((words) => analyze(words, depth, scope, out))
+}
+
+// Whether a line makes an array: name=(...), read -a, mapfile, or a
+// declaration with -a or -A.
+function makesArrays(line: string, commands: readonly (readonly Word[])[]): boolean {
+  if (/[A-Za-z0-9_]\+?=\(/.test(line)) return true
+  return commands.some((words) =>
+    words.some((word, at) => {
+      const name = programName(word.text)
+      if (name === 'mapfile' || name === 'readarray') return true
+      if (!['read', 'declare', 'typeset', 'local'].includes(name)) return false
+      const array = name === 'read' ? /^-[a-zA-Z]*a/ : /^[-+][a-zA-Z]*[aA]/
+      for (let option = at + 1; /^[-+]/.test(words[option]?.text ?? ''); option += 1)
+        if (array.test(words[option]?.text ?? '')) return true
+      return false
+    }),
+  )
 }
 
 // The commands of one simple command: its own, and those its wrappers run.
-function analyze(words: readonly Word[], depth: number, env: boolean, out: Candidates): boolean {
+function analyze(words: readonly Word[], depth: number, scope: Scope, out: Candidates): boolean {
   if (depth > MAX_DEPTH) return false
   const starts = new Set([0])
   for (let index = 0; index < words.length; index += 1) {
@@ -204,7 +236,7 @@ function analyze(words: readonly Word[], depth: number, env: boolean, out: Candi
     if (word.assignment === 'maybe') starts.add(index + 1)
     if (!out.add(words.slice(index))) return false
     const args = words.slice(index + 1).map((next) => next.text)
-    const call: Call = { name: programName(word.text), words, index, args, depth, env, out }
+    const call: Call = { name: programName(word.text), words, index, args, depth, scope, out }
     const more = runs(call)
     if (more === null) return false
     for (const start of more) starts.add(start)
@@ -219,7 +251,7 @@ interface Call {
   readonly index: number
   readonly args: readonly string[]
   readonly depth: number
-  readonly env: boolean
+  readonly scope: Scope
   readonly out: Candidates
 }
 
@@ -273,14 +305,16 @@ const HANDLERS: Record<string, Handler> = {
   watch: watchRuns,
   xargs: inputRuns,
   zargs: zargsRuns,
+  // zstyle -e stores code that later lookups run.
+  zstyle: (call) => (leadingOptions(call.args).some((arg) => /^-[a-zA-Z]*e/.test(arg)) ? null : []),
 }
 
 function reparse(call: Call, text: string): boolean {
-  return collect(text, call.depth + 1, call.env, call.out)
+  return collect(text, call.depth + 1, call.scope, call.out)
 }
 
 function analyzeNested(call: Call, words: readonly Word[]): boolean {
-  return analyze(words, call.depth + 1, call.env, call.out)
+  return analyze(words, call.depth + 1, call.scope, call.out)
 }
 
 function runnerStarts(call: Call): { starts: number[]; ends: number[] } {
@@ -343,10 +377,11 @@ function leadingOptions(args: readonly string[]): readonly string[] {
 // from stdin, and one started after BASH_ENV or ENV was set reads that
 // file first: unknown.
 function shellRuns(call: Call, shell: string): boolean {
-  if (call.env) return false
+  if (call.scope.bashEnv) return false
   const args = call.args
   let script = false
   let stdin = false
+  let interactive = false
   let info = false
   let exact = SH.has(shell)
   let at = 0
@@ -360,6 +395,7 @@ function shellRuns(call: Call, shell: string): boolean {
       const letters = arg.slice(1)
       if (arg.startsWith('-') && letters.includes('c')) script = true
       if (arg.startsWith('-') && letters.includes('s')) stdin = true
+      if (arg.startsWith('-') && letters.includes('i')) interactive = true
       const value = letters.search(/[oO]/)
       if (value >= 0) {
         // -o or -O amid other letters: which word is its value is unsure.
@@ -375,10 +411,12 @@ function shellRuns(call: Call, shell: string): boolean {
         if (!reparse(call, arg.slice(arg.indexOf('=') + 1))) return false
       } else if (['--rcfile', '--init-file', '--emulate'].includes(arg)) at += 1
       else if (arg === '--version' || arg === '--help') info = true
+      else if (arg === '--interactive') interactive = true
       continue
     }
     break
   }
+  if (call.scope.env && interactive) return false
   if (script) {
     if (exact) return at >= args.length || reparse(call, args[at] ?? '')
     // Any word after the -c may be the script.
@@ -455,10 +493,17 @@ function trapRuns(call: Call): number[] | null {
   return action === undefined || action === '-' || reparse(call, action) ? [] : null
 }
 
-// declare and its kin read a quoted name=(...) as an array again, running
-// what it holds.
+// declare and its kin read a value as an array again, running what it
+// holds, when it is a quoted name=(...), or (declare, typeset and local)
+// when it holds an expansion and the variable is an array: given -a or
+// -A, or made one on the same line.
 function declareRuns(call: Call): number[] | null {
-  return call.args.some((arg) => arg.includes('=(')) ? null : []
+  if (call.args.some((arg) => arg.includes('=('))) return null
+  if (!call.scope.arrays || !['declare', 'local', 'typeset'].includes(call.name)) return []
+  const expands = call.args.some(
+    (arg) => /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/.test(arg) && arg.includes(UNKNOWN),
+  )
+  return expands ? null : []
 }
 
 // mapfile -C runs its callback every few lines it reads.
@@ -506,8 +551,15 @@ function inputRuns(call: Call): number[] | null {
     if (attached?.[1]) replace.add(attached[1])
   }
   const placeholder = (text: string) => [...replace].some((value) => text.includes(value))
-  for (const start of starts)
-    if (!analyzeNested(call, substituted(call.words.slice(start), placeholder, true))) return null
+  for (const start of starts) {
+    let command = call.words.slice(start)
+    // GNU parallel's inputs (::: a b, :::: file) end its command.
+    if (call.name === 'parallel') {
+      const inputs = command.findIndex((word) => /^:{3,4}\+?$/.test(word.text))
+      if (inputs >= 0) command = command.slice(0, inputs)
+    }
+    if (!analyzeNested(call, substituted(command, placeholder, true))) return null
+  }
   return []
 }
 
@@ -552,7 +604,7 @@ function substituted(
 }
 
 function unknownWord(): Word {
-  return { text: UNKNOWN, plain: false, assignment: 'no' }
+  return { text: UNKNOWN, plain: false, assignment: 'no', free: true }
 }
 
 // The program's file name, lowercased.

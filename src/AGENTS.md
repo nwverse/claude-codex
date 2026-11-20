@@ -87,6 +87,8 @@ Codex and Claude Code config bridging:
   failing closed, for the ask rules and hook `if` conditions.
 - `shell-words.mts` — a command line read into simple commands and words
   (quotes, expansions, case patterns, arrays, `[[ ]]`) for `shell-commands.mts`.
+- `shell-eval.mts` — text a command line has the shell run later (PS4,
+  BASH_ENV, zsh tables, subscripts and names that arithmetic evaluates).
 - `wildcards.mts` — text with wildcards on both sides (a rule's `*`, what the
   shell expands) compared in linear time.
 - `permission-suggestions.mts` — Claude's "don't ask again" suggestions mapped

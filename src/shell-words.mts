@@ -4,7 +4,9 @@ import { UNKNOWN } from './wildcards.mjs'
 // bash and zsh read it, for shell-commands.mts. Quotes are removed, what
 // the shell expands when it runs (a variable, a glob, a brace list) is
 // UNKNOWN, and a line only the shell can tell apart (command substitution,
-// a heredoc, a zsh glob group, text it runs later) reads as null.
+// a heredoc, a zsh glob group) reads as null. Whether a subscript holds an
+// expansion is noted for shell-eval.mts, which decides whether the line
+// evaluates it.
 
 export interface Word {
   // The word as the program gets it, with UNKNOWN for what the shell expands.
@@ -14,6 +16,9 @@ export interface Word {
   // A variable assignment (NAME=value) before a command; maybe when its
   // subscript holds quotes or expansions.
   readonly assignment: 'yes' | 'no' | 'maybe'
+  // Its unknown text may be anything: not only an arithmetic result, which
+  // is a number.
+  readonly free: boolean
 }
 
 interface Part {
@@ -36,6 +41,24 @@ export const RESERVED = new Set([
   'while',
 ])
 
+// Builtins that take name=(...) arguments as arrays.
+const DECLARATIONS = new Set([
+  'declare',
+  'export',
+  'float',
+  'integer',
+  'local',
+  'readonly',
+  'typeset',
+])
+
+// A command line's simple commands, and whether a word holds what an array
+// subscript would run (see subscriptHazard).
+export interface ParsedLine {
+  readonly commands: Word[][]
+  readonly subscripts: boolean
+}
+
 // A case being read: its word, its patterns or a pattern's commands.
 interface CaseState {
   at: 'subject' | 'patterns' | 'body'
@@ -49,13 +72,20 @@ interface CaseState {
 // A case's patterns and an array's elements are left out (they only match
 // or hold text), and a [[ ]] test is one command whatever ( ) | & < > it
 // holds.
-export function parseLine(line: string): Word[][] | null {
+export function parseLine(line: string): ParsedLine | null {
   if (line.includes(UNKNOWN)) return null
   const commands: Word[][] = []
   let words: Word[] = []
   let parts: Part[] = []
   let skipNext = false
-  let unknown = false
+  let subscripts = false
+  let free = false
+  // The current command so far: only reserved words; only those and
+  // assignments; a redirection seen; its command name.
+  let reservedOnly = true
+  let assigning = true
+  let redirected = false
+  let commandName = ''
   const cases: CaseState[] = []
   let array = false
   let test = false
@@ -69,17 +99,31 @@ export function parseLine(line: string): Word[][] | null {
     if (last && last.quoted === quoted) parts[parts.length - 1] = { text: last.text + text, quoted }
     else parts.push({ text, quoted })
   }
+  const pushWord = (word: Word): void => {
+    words.push(word)
+    const reserved = word.plain && RESERVED.has(word.text)
+    if (!reserved) reservedOnly = false
+    if (!reserved && word.assignment !== 'yes' && assigning) {
+      assigning = false
+      commandName = word.text
+    }
+  }
   const endCommand = (): void => {
     if (words.length > 0) commands.push(words)
     words = []
+    reservedOnly = true
+    assigning = true
+    redirected = false
+    commandName = ''
     // A case with no `in` after its word is not read as one.
     if (cases.at(-1)?.at === 'subject') cases.pop()
   }
   const endWord = (): void => {
     if (parts.length === 0) return
-    if (runsLater(parts.map((part) => part.text).join(''))) unknown = true
-    const word = wordOf(parts)
+    if (subscriptHazard(parts.map((part) => part.text).join(''))) subscripts = true
+    const word = wordOf(parts, free)
     parts = []
+    free = false
     if (skipNext) {
       skipNext = false
       return
@@ -94,7 +138,7 @@ export function parseLine(line: string): Word[][] | null {
     }
     if (now === 'array') return
     if (now === 'test') {
-      words.push(word)
+      pushWord(word)
       if (word.plain && word.text === ']]') {
         test = false
         endCommand()
@@ -104,7 +148,7 @@ export function parseLine(line: string): Word[][] | null {
     if (top?.at === 'subject') {
       top.seen += 1
       if (top.seen === 2 && word.plain && word.text === 'in') {
-        words.push(word)
+        pushWord(word)
         top.at = 'patterns'
         top.started = false
         endCommand()
@@ -118,12 +162,16 @@ export function parseLine(line: string): Word[][] | null {
       endCommand()
       return
     }
-    if (word.plain && words.every((before) => before.plain && RESERVED.has(before.text))) {
-      if (word.text === '[[') test = true
-      else if (word.text === 'case') cases.push({ at: 'subject', seen: 0, started: false })
+    // [[ and case are reserved only before any other word or redirection:
+    // after `>/dev/null`, bash runs [[ as a command that fails, and what
+    // follows || runs.
+    if (word.plain && reservedOnly) {
+      if (word.text === '[[' && !redirected) test = true
+      else if (word.text === 'case' && !redirected)
+        cases.push({ at: 'subject', seen: 0, started: false })
       else if (word.text === 'esac' && top?.at === 'body') cases.pop()
     }
-    words.push(word)
+    pushWord(word)
     if (word.plain && word.text === ']]') endCommand()
   }
   for (let index = 0; index < line.length; index += 1) {
@@ -153,6 +201,7 @@ export function parseLine(line: string): Word[][] | null {
       const quoted = doubleQuoted(line, index + (char === '"' ? 1 : 2))
       if (quoted === null) return null
       add(quoted.text, true)
+      if (quoted.free) free = true
       index = quoted.end
       continue
     }
@@ -161,7 +210,10 @@ export function parseLine(line: string): Word[][] | null {
       const end = expansionEnd(line, index)
       if (end === null) return null
       if (end === index + 1) add('$', false)
-      else add(UNKNOWN, true)
+      else {
+        add(UNKNOWN, true)
+        if (!isArithmetic(line, index)) free = true
+      }
       index = end - 1
       continue
     }
@@ -187,6 +239,7 @@ export function parseLine(line: string): Word[][] | null {
       const only = parts.length === 1 ? parts[0] : undefined
       if (only && !only.quoted && /^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$/.test(only.text)) parts = []
       endWord()
+      redirected = true
       while (/[>&|]/.test(line[index + 1] ?? '')) index += 1
       // >&2 and the like name no file.
       if (line[index] === '&' && /[\d-]/.test(line[index + 1] ?? '')) {
@@ -205,6 +258,17 @@ export function parseLine(line: string): Word[][] | null {
         return null
       }
       if (now === 'array') return null
+      // (( ... )) at the start of a command is arithmetic and runs no
+      // command, unless its first group closes before the end: ((a) | (b))
+      // is two subshells.
+      if (parts.length === 0 && next === '(' && reservedOnly && !redirected) {
+        const end = arithmeticCommandEnd(line, index)
+        if (end === null) return null
+        if (end > 0) {
+          index = end - 1
+          continue
+        }
+      }
       if (parts.length > 0) {
         const before = parts.map((part) => part.text).join('')
         // name() defines a function.
@@ -213,10 +277,13 @@ export function parseLine(line: string): Word[][] | null {
           endCommand()
           continue
         }
-        // name=( sets an array.
+        // name=( sets an array where an assignment goes, or for a
+        // declaration builtin. Anywhere else zsh reads it as a glob, whose
+        // (e:...:) qualifier runs code.
         if (
           parts.every((part) => !part.quoted) &&
-          /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=$/.test(before)
+          /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=$/.test(before) &&
+          (assigning || DECLARATIONS.has(commandName))
         ) {
           endWord()
           array = true
@@ -273,23 +340,21 @@ export function parseLine(line: string): Word[][] | null {
   }
   endWord()
   endCommand()
-  return unknown ? null : commands
+  return { commands, subscripts }
 }
 
-// Whether a word's text may run as code later: PS4 (traced commands expand
-// it), an entry of zsh's function or alias tables, an exported bash
-// function, or a substitution, an expansion or a printf escape inside an
-// array subscript (bash and zsh evaluate subscripts in arithmetic and in
-// builtins such as printf -v, running a $(...) they hold). A [ that closes
-// first, as in markdown, does not count.
-function runsLater(text: string): boolean {
-  if (/^(?:PS4=|BASH_FUNC_)|^(?:functions|aliases|galiases|saliases)(?:\[|\+?=)/.test(text))
-    return true
+// Whether a word holds, inside an array subscript (a [ right after a name
+// or unknown text), a substitution, an expansion or a printf escape. bash
+// and zsh evaluate subscripts in arithmetic and in builtins such as
+// printf -v, running a $(...) they hold or come to hold. A [ after anything
+// else, as in markdown or a regular expression, does not count.
+function subscriptHazard(text: string): boolean {
   let depth = 0
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index]
-    if (char === '[') depth += 1
-    else if (char === ']') depth = Math.max(0, depth - 1)
+    if (char === '[') {
+      if (depth > 0 || /[A-Za-z0-9_\u0000]/.test(text[index - 1] ?? '')) depth += 1
+    } else if (char === ']') depth = Math.max(0, depth - 1)
     else if (
       depth > 0 &&
       (char === UNKNOWN ||
@@ -302,7 +367,12 @@ function runsLater(text: string): boolean {
   return false
 }
 
-function wordOf(parts: readonly Part[]): Word {
+// $((...)) and $[...] give a number.
+function isArithmetic(line: string, index: number): boolean {
+  return line[index + 1] === '[' || (line[index + 1] === '(' && line[index + 2] === '(')
+}
+
+function wordOf(parts: readonly Part[], free: boolean): Word {
   const first = parts[0]
   let assignment: Word['assignment'] = 'no'
   if (first && !first.quoted) {
@@ -310,17 +380,19 @@ function wordOf(parts: readonly Part[]): Word {
     else if (/^[A-Za-z_][A-Za-z0-9_]*\[/.test(first.text)) assignment = 'maybe'
   }
   const plain = parts.length === 1 && first !== undefined && !first.quoted
-  return { text: expandedText(parts), plain, assignment }
+  const { text, globbed } = expandedText(parts)
+  return { text, plain, assignment, free: free || globbed }
 }
 
 // A word's text with what an unquoted glob or brace list expands to as
-// unknown text.
-function expandedText(parts: readonly Part[]): string {
+// unknown text, and whether it has one.
+function expandedText(parts: readonly Part[]): { text: string; globbed: boolean } {
   const raw = parts.map((part) => part.text).join('')
   const lastClose = raw.lastIndexOf(']')
   let offset = 0
   let out = ''
   let braces = false
+  let globbed = false
   for (const part of parts) {
     if (part.quoted) {
       out += part.text
@@ -336,19 +408,23 @@ function expandedText(parts: readonly Part[]): string {
         const comma = raw.indexOf(',', at)
         const dots = raw.indexOf('..', at)
         const separator = Math.min(...[comma, dots].filter((found) => found >= 0))
-        if (Number.isFinite(separator) && raw.lastIndexOf('}') > separator) return UNKNOWN
+        if (Number.isFinite(separator) && raw.lastIndexOf('}') > separator)
+          return { text: UNKNOWN, globbed: true }
       }
-      if (char === '*' || char === '?') out += UNKNOWN
-      else if (char === '[' && lastClose > at) {
-        const close = part.text.indexOf(']', index + 1)
-        if (close < 0) return UNKNOWN
+      if (char === '*' || char === '?') {
         out += UNKNOWN
+        globbed = true
+      } else if (char === '[' && lastClose > at) {
+        const close = part.text.indexOf(']', index + 1)
+        if (close < 0) return { text: UNKNOWN, globbed: true }
+        out += UNKNOWN
+        globbed = true
         index = close
       } else out += char
     }
     offset += part.text.length
   }
-  return out
+  return { text: out, globbed }
 }
 
 // The most hex digits $'\x', $'\u' and $'\U' take.
@@ -404,12 +480,21 @@ function ansiCString(line: string, start: number): { text: string; end: number }
   return null
 }
 
+// How deep "..." and ${...} may nest inside each other before the line is
+// unknown.
+const MAX_NESTING = 32
+
 // "...": the text, with UNKNOWN for each expansion, and the closing quote.
-function doubleQuoted(line: string, start: number): { text: string; end: number } | null {
+function doubleQuoted(
+  line: string,
+  start: number,
+  nesting = 0,
+): { text: string; end: number; free: boolean } | null {
   let text = ''
+  let free = false
   for (let index = start; index < line.length; index += 1) {
     const char = line[index] ?? ''
-    if (char === '"') return { text, end: index }
+    if (char === '"') return { text, end: index, free }
     if (char === '\\') {
       // Only these lose the backslash; it joins lines before a newline.
       const next = line[index + 1] ?? ''
@@ -422,9 +507,10 @@ function doubleQuoted(line: string, start: number): { text: string; end: number 
     }
     if (char === '`') return null
     if (char === '$') {
-      const end = expansionEnd(line, index)
+      const end = expansionEnd(line, index, nesting)
       if (end === null) return null
       text += end === index + 1 ? '$' : UNKNOWN
+      if (end !== index + 1 && !isArithmetic(line, index)) free = true
       index = end - 1
       continue
     }
@@ -436,7 +522,7 @@ function doubleQuoted(line: string, start: number): { text: string; end: number 
 // Where the expansion at a $ ends (index + 1 for a $ that is just itself);
 // null for command substitution, an expansion that may run code or does
 // not close.
-function expansionEnd(line: string, index: number): number | null {
+function expansionEnd(line: string, index: number, nesting = 0): number | null {
   let at = index + 1
   const sigil = line[at] ?? ''
   const named = /[A-Za-z_{]/.test(line[at + 1] ?? '')
@@ -446,7 +532,7 @@ function expansionEnd(line: string, index: number): number | null {
   if (/[=^+]/.test(sigil) && named) at += 1
   const next = line[at] ?? ''
   if (next === '(') return line[at + 1] === '(' ? arithmeticEnd(line, at) : null
-  if (next === '{') return braceEnd(line, at)
+  if (next === '{') return braceEnd(line, at, nesting)
   if (next === '[') {
     // $[...], old arithmetic.
     const close = line.indexOf(']', at)
@@ -461,19 +547,46 @@ function expansionEnd(line: string, index: number): number | null {
   return index + 1
 }
 
-// Where ${...} ends. Its insides are read only as far as needed: a brace
-// or a quote inside (which bash and zsh count differently), zsh's (flags)
-// and ~, bash's @P prompt expansion and ${ cmd; } run code or could, so
-// any of them makes the line unknown.
-function braceEnd(line: string, open: number): number | null {
-  if (/[\s|(~]/.test(line[open + 1] ?? '')) return null
+// Where ${...} ends. A "..." or ${...} inside is read as bash and zsh both
+// read it. A bare brace, a single quote or a substitution inside (which
+// they count differently, or run), zsh's (flags) and ~, bash's @P prompt
+// expansion and ${ cmd; } run code or could, so any of them makes the line
+// unknown.
+function braceEnd(line: string, open: number, nesting = 0): number | null {
+  if (nesting > MAX_NESTING || /[\s|(~]/.test(line[open + 1] ?? '')) return null
   for (let scan = open + 1; scan < line.length; scan += 1) {
     const char = line[scan] ?? ''
     if (char === '\\') scan += 1
     else if (char === '}') return line.slice(open + 1, scan).includes('@P') ? null : scan + 1
-    else if ('{\'"`'.includes(char) || (char === '$' && line[scan + 1] === '(')) return null
+    else if (char === '"') {
+      const quoted = doubleQuoted(line, scan + 1, nesting + 1)
+      if (quoted === null) return null
+      scan = quoted.end
+    } else if (char === '$' && line[scan + 1] === '{') {
+      const end = braceEnd(line, scan + 1, nesting + 1)
+      if (end === null) return null
+      scan = end - 1
+    } else if ("{'`".includes(char) || (char === '$' && line[scan + 1] === '(')) return null
   }
   return null
+}
+
+// Where an arithmetic command (( ... )) ends; 0 when it is subshells after
+// all, null when it holds a substitution or quotes.
+function arithmeticCommandEnd(line: string, open: number): number | null {
+  let depth = 0
+  for (let scan = open; scan < line.length; scan += 1) {
+    const char = line[scan] ?? ''
+    if (char === '(') depth += 1
+    else if (char === ')') {
+      depth -= 1
+      if (depth === 1) {
+        if (line[scan + 1] !== ')') return 0
+        return /[`'"\\]|\$\(/.test(line.slice(open + 2, scan)) ? null : scan + 2
+      }
+    }
+  }
+  return 0
 }
 
 // Where $((...)) ends; null when it is a command substitution after all

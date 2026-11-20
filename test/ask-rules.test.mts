@@ -389,6 +389,112 @@ test('case patterns, array elements, [[ ]] tests and markdown are not read as co
     assert.equal(bashRuleCovers('git push:*', line), true, line)
 })
 
+test('a redirection before [[ makes it a command, and name=( is an array only where it assigns', () => {
+  // bash runs [[ after a redirection as a command that fails, so || runs.
+  for (const line of [
+    '>/dev/null [[ x || rm -rf build ]]',
+    '2>/dev/null [[ x || rm -rf build ]]',
+    '</dev/null [[ x || rm -rf build ]]',
+    'true; >/dev/null [[ x || rm -rf build ]]',
+  ])
+    assert.equal(bashRuleCovers('rm:*', line), true, line)
+  // Outside an assignment zsh reads x=(...) as a glob with qualifiers.
+  for (const line of ["touch x=; echo x=(e:'rm -rf build':)", "touch x=; ls x=(e:'rm -rf build':)"])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+  for (const line of ['x=(a b); echo "${x[0]}"', 'local -a files=(*.ts)', 'if x=(1); then :; fi'])
+    assert.equal(bashRuleCovers('git push:*', line), false, line)
+})
+
+test('text the shell runs later is found by name, however it is set', () => {
+  for (const line of [
+    "PS4+='$(rm -rf build)'; set -x; :",
+    "printf -v PS4 '$(rm -rf build)'; set -x; :",
+    "echo 'rm -rf build' | { : ${BASH_ENV:=/dev/stdin}; export BASH_ENV; bash -c :; }",
+    "echo 'rm -rf build' | { printf -v BASH_ENV /dev/stdin; export BASH_ENV; bash -c :; }",
+    ': ${functions[f]::=rm -rf build}; f',
+    "setopt globsubst; x='*(e:rm -rf build:)'; ls $x",
+    'setopt GLOB_SUBST; ls $x',
+    "zstyle -e ':x' y 'rm -rf build'; zstyle -s ':x' y z",
+    "y='($(rm -rf build))'; declare -a x=$y",
+    'read -a x <<< q; declare x=$y',
+    // ENV runs only for an interactive POSIX shell, set however.
+    "echo 'rm -rf build' | { export ENV=/dev/stdin; sh -ic true; }",
+    "echo 'rm -rf build' | ENV=/dev/stdin dash -ic true",
+    "echo 'rm -rf build' | { : ${ENV:=/dev/stdin}; export ENV; ksh -i -c true; }",
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+  // ENV for anything else, and declarations that read no array, are quiet.
+  for (const line of [
+    'ENV=prod bash scripts/deploy.sh',
+    'ENV=test sh -c "npm test"',
+    "export ENV=staging && bash -c 'npm run deploy'",
+    'make ENV=prod && bash x.sh',
+    'f() { local dir=$1; cd "$dir"; }',
+    'export PATH="$HOME/.local/bin:$PATH"',
+    'declare x=$y',
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), false, line)
+})
+
+test('arithmetic and name evaluation ask only for text the line does not show', () => {
+  // A subscript built at run time, or read from input, that arithmetic or a
+  // name lookup then evaluates.
+  for (const line of [
+    "x='a['; x+='$(rm -rf build)]'; (( x ))",
+    "o='['; d='$'; x=\"a${o}${d}(rm -rf build)]\"; (( x ))",
+    "printf -v x 'a\\x5b\\x24(rm -rf build)]'; (( x ))",
+    "printf -v x '%s%s%s' 'a[' '$(' 'rm -rf build)]'; (( x ))",
+    "y='$(rm -rf build)'; printf '%s[%s]\\n' a \"$y\" | { read x; (( x )); }",
+    "x='a['; x+='$(rm -rf build)]'; s=abc; echo ${s:x}",
+    "x='a['; x+='$(rm -rf build)]'; a[x]=1",
+    "x='a['; x+='$(rm -rf build)]'; a=(1); echo $a[x]",
+    "x='a['; x+='$(rm -rf build)]'; echo ${!x}",
+    'read y; x=y; (( x ))',
+    'declare -i n; read x; n=x',
+    "bash -c 'read x; (( x ))'",
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+  // A line that evaluates nothing, or only names it shows, stays quiet.
+  for (const line of [
+    'while read l; do (( n++ )); done < file.txt',
+    'git commit -m "[$TICKET] fix login"',
+    'echo "[$i/$n] $f"',
+    'jq ".[$i].name" data.json',
+    "LC_ALL=C grep -n '[^\\x00-\\x7F]' file.txt",
+    "tr -d '[\\000-\\037]' < in > out",
+    'echo -e "[\\033[32mOK\\033[0m]"',
+    'count=0; count=$((count + 1)); echo $count',
+    'for f in *.ts; do (( n++ )); echo "[$n] $f"; done',
+    'if (( $# > 0 )); then echo args; fi',
+    'for ((i = 0; i < 3; i++)); do echo $i; done',
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), false, line)
+})
+
+test('${...} holding "..." or ${...} is read as bash and zsh both read it', () => {
+  for (const line of [
+    'echo "${NAME:-"world"}"',
+    'dir="${1:-"."}"; ls "$dir"',
+    'echo "${HOME:+"$HOME/bin"}"',
+    'echo "${x%%"-suffix"}"',
+    'echo "${x:-${y:-z}}"',
+  ])
+    assert.equal(bashRuleCovers('git push:*', line), false, line)
+  // A single quote, a backtick or $(...) inside still asks.
+  for (const line of ["echo ${x:-'{'}; git push; echo }", 'echo "${x:-$(git push)}"'])
+    assert.equal(bashRuleCovers('rm:*', line), true, line)
+})
+
+test('GNU parallel inputs end its command, and many reserved words read in linear time', () => {
+  for (const line of ["parallel sh -c ::: 'rm -rf build'", "parallel bash -c ::: 'rm -rf build'"])
+    assert.equal(bashRuleCovers('git push:*', line), true, line)
+  assert.equal(bashRuleCovers('rm:*', 'parallel echo ::: a b'), false)
+  const start = performance.now()
+  assert.equal(bashRuleCovers('rm:*', `${'if '.repeat(60000)}true`), false)
+  assert.equal(bashRuleCovers('rm:*', `${'! '.repeat(60000)}true`), false)
+  assert.ok(performance.now() - start < 5000)
+})
+
 test('only a command name matches in any case, and only where the system ignores case', () => {
   const folds = process.platform === 'darwin' || process.platform === 'win32'
   assert.equal(bashRuleCovers('rm -rf:*', 'RM -rf build'), folds)

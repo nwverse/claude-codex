@@ -336,7 +336,12 @@ command line whose commands only the shell can tell (command substitution, a
 heredoc, a shell reading its commands from stdin, a zsh glob or extended
 pattern group, text the shell runs later such as `$(…)` in an array subscript)
 is asked about under any Bash rule, since it could run anything; so is a call
-the guard cannot check. An `Edit` rule
+the guard cannot check. The guard reads the command line as text, before it
+runs: shell syntax and the programs a command can start are open-ended, so it
+asks whenever it cannot be sure, but it is not a sandbox against a model that
+sets out to hide a command (behind a renamed copy of a program, say, or text
+the shell only builds while it runs). For a hard boundary, use deny rules and
+the thread's sandbox and approval policy. An `Edit` rule
 covers every tool that edits files, a `Read` rule `Glob` and `Grep` by the
 folder they search and the folder a glob starts from; file rules match paths in
 any case and through symlinks, and `*` in a tool name or a `domain:` works as in
