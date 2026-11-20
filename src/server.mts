@@ -1545,8 +1545,10 @@ export class CodexClaudeAppServer {
       case 'thread/sample/cancel':
         return {}
       // Codex keeps each thread's unread position in its state database and
-      // answers this with method not found when it has none, as the adapter
-      // does: the App then keeps the unread dot to itself.
+      // answers this with method not found when it has none. The adapter has
+      // none for Claude chats, whose thread/read carries no readState, so the
+      // App never sends this for one; a native Codex chat's update goes to its
+      // Codex child.
       // App rule: thread-read-state
       case 'thread/readState/update':
         throw new RpcError('durable thread read state unavailable', undefined, METHOD_NOT_FOUND)

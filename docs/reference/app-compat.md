@@ -84,7 +84,7 @@ line a rule touches.
 | `mcp-tool-approval` | draws an `mcpServer/elicitation/request` with `_meta.codex_approval_kind` `mcp_tool_call` as a tool approval card, offering "Allow for this session" and "Always allow" as `_meta.persist` lists them, and answers with `_meta.persist` `session` or `always` | an MCP tool call asks to allow the server to run the tool; after "Allow for this session" the next call does not ask; after "Always allow" the project's `.claude/settings.local.json` allows `mcp__<server>__<tool>` |
 | `declined-tool-items` | shows a `commandExecution` or `fileChange` item with status `declined` as declined, without output or an exit code | a declined command shows as declined and Claude goes on; a cancelled one stops the turn |
 | `auto-review` | sends its auto-review preset as `approvalsReviewer` `guardian_subagent` (`auto_review` in newer builds), sets its picker from the `approvalsReviewer` of thread responses and `thread/settings/updated`, and draws `item/autoApprovalReview/completed` as a review card on the item named by `targetItemId` | on a model with auto mode the picker stays on auto-review and a call Claude's classifier blocks shows as declined with its reason; on one without, the picker goes back to the default with a config warning |
-| `thread-read-state` | with `threadReadState` on, syncs a thread's unread dot with the server only once `thread/read` or `thread/list` returned a `readState` for it, and keeps the dot to itself after `thread/readState/update` fails with `-32601` | the bundle still gives up before the update without a `readState`; a chat that finishes a turn in the background shows its unread dot, and opening it clears the dot |
+| `thread-read-state` | with `threadReadState` on, syncs a thread's unread dot with the server only once `thread/read` or `thread/list` returned a `readState` for it, and keeps the dot to itself after `thread/readState/update` fails with `-32601` | the bundle still gives up before the update without a `readState`; a chat that finishes a turn in the background shows its unread dot, and opening it clears the dot, for a native Codex chat too |
 
 The full text of each rule, including the adapter side, is in
 `src/app-compat.mts`.
@@ -222,9 +222,11 @@ Cloud setup (`account/gcp/setup`) and model provider settings
 sign-in to switch to (`accountSession/switch`), no feedback bundle to save
 (`feedback/save`), and no response to sample outside a turn
 (`thread/sample`). `thread/items/read` returns the stored items it names.
-`thread/readState/update` gets `-32601`, as from a Codex without its state
-database (rule `thread-read-state`), and so does
-`thread/prediction/request`, which Codex does not implement either.
+A Claude chat has no read state: its `thread/read` carries no `readState`,
+and `thread/readState/update` gets `-32601`, as from a Codex without its state
+database (rule `thread-read-state`); a native Codex chat's read state is its
+Codex child's, which answers both. `thread/prediction/request` gets `-32601`
+too, since Codex does not implement it either.
 
 ### What the gates change
 

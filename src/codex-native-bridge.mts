@@ -53,6 +53,9 @@ const FORWARDED = new Set([
   'thread/items/list',
   'thread/items/read',
   'thread/timeline/list',
+  // The child's thread/read carries its readState, so its update goes there.
+  // App rule: thread-read-state
+  'thread/readState/update',
   'thread/searchOccurrences',
   'thread/settings/update',
   'thread/compact/start',
