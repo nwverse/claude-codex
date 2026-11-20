@@ -54,6 +54,10 @@ Persistence:
 - `store.mts` — SQLite thread/turn persistence via `node:sqlite` (Node 24+).
 - `run-registry.mts` — append-only `runs.jsonl` of thread/turn/subagent events
   (`CLAUDE_CODEX_RUN_LOG`, `0` to disable), with redaction.
+- `claude-session-relocation.mts` — copies a Claude transcript to the
+  project folder of a thread's new workspace, so a chat resumes after its
+  folder is moved or renamed, and decides when a missing transcript is
+  certainly gone (a new session) or only out of reach (the turn fails).
 
 Codex and Claude Code config bridging:
 
@@ -85,6 +89,9 @@ Codex and Claude Code config bridging:
   whose skills Claude can run.
 - `claude-models.mts` — per-model reasoning efforts the CLI reports, cached for
   `model/list`.
+- `shared-claude-catalog.mts` — the JSON catalogs behind the two modules above
+  (`claude-commands.json`, `claude-models.json`), shared by every adapter on
+  one home, each read-modify-write held under a SQLite lock.
 - `model-profiles.mts` — per-model Claude Code process profiles
   (`CLAUDE_CODEX_MODEL_PROFILES[_FILE]`) and the fingerprint a thread pins.
 - `auto-compact.mts` — Codex `model_auto_compact_token_limit` as
@@ -108,6 +115,18 @@ Provider loop descriptors:
   (`CLAUDE_CODEX_PROVIDER`, `CLAUDE_CODEX_AGENT_LOOP`) or config.
 - `provider-loop-config.mts` — the `provider_loop_config` projection
   `config/read` reports.
+
+Native Codex harness (`CLAUDE_CODEX_NATIVE_CODEX=on`):
+
+- `harness-models.mts` — the three harnesses a model id picks (Claude Code,
+  Codex, Codex+AsterGate `codex-ag:<model>`), their menu labels and the Codex
+  catalog models.
+- `codex-native-bridge.mts` — runs a Codex thread's conversation in a real
+  `codex app-server` child: maps thread ids both ways and passes requests,
+  server requests and notifications through as Codex sent them.
+- `codex-app-server-child.mts` — one `codex app-server --listen stdio://`
+  child per Codex model provider, started by the first request and again by
+  the next one after a crash.
 
 Turn input and lifecycle:
 
@@ -133,6 +152,9 @@ Tools and item presentation:
   actions that fold a read-only Bash command into the App's "Explored" row.
 - `command-output.mts` — live Bash output from polling the CLI's
   `get_task_output`.
+- `user-shell.mts` — a shell command the user types (`thread/shellCommand`):
+  no stdin, output capped but drained to the end, its process group killed
+  when it is stopped or times out.
 - `foreground-shells.mts` — a foreground Bash call the CLI hands to a
   background task when its timeout expires: keeps its command item tied to
   that task until the CLI reports its exit.
@@ -168,6 +190,8 @@ Subagents and workflows:
   (`enqueue`, `schedule`, `heartbeat`, `complete`, `fail`, `block`, `status`,
   `health`, `ingest-github`).
 - `workflow-state.mts` — the queue's versioned state file and store.
+- `workflow-write-lock.mts` — the worker that holds a SQLite write lock while
+  `workflow-state.mts` changes the state file, so concurrent CLI runs queue.
 - `workflow-scheduler.mts` — lease-based task scheduling and transitions.
 - `workflow-health.mts` — healthy/stalled/failed report from leases and the run
   registry.
@@ -179,10 +203,19 @@ Git and worktrees:
 - `worktree.mts` — optional per-thread git worktree isolation.
 - `git-info.mts` — a thread's Codex `gitInfo`: cached lookups and remote URL
   sanitizing.
+- `turn-diff.mts` — the whole-tree `git diff` behind `turn/diff/updated` and
+  `gitDiffToRemote`, untracked files and symlinks included, within size caps.
 
-Utilities:
+Utilities (reuse these instead of writing another copy):
 
 - `util.mts` — shared helpers.
+- `process-group.mts` — signals or stops a child's whole process group
+  (SIGTERM, then SIGKILL after 1 s or as soon as the leader exits), for
+  anything that spawns a process.
+- `json-file.mts` — atomic owner-only JSON writes (temp file and rename) that
+  keep a symlinked file linked.
+- `json-syntax.mts` — why a JSON config did not parse, without quoting its
+  text, which may hold a credential.
 
 ## Runtime backends
 

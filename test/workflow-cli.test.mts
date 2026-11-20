@@ -134,6 +134,29 @@ test('workflow CLI enqueues and schedules a task through the state file', async 
   assert.equal(output.task.lease?.workerId, 'worker-a')
 })
 
+test('workflow enqueue --id replaces the queued task with that id in place', async () => {
+  const statePath = await tempStatePath()
+  const enqueue = async (id: string, prompt: string) =>
+    assert.equal(
+      await runWorkflowCli(
+        ['enqueue', '--state', statePath, '--id', id, '--prompt', prompt],
+        captureIo(),
+      ),
+      0,
+    )
+  await enqueue('task-a', 'First.')
+  await enqueue('task-b', 'Second.')
+  await enqueue('task-a', 'Replaced.')
+  const { tasks } = jsonOf<WorkflowState>(await readFile(statePath, 'utf8'))
+  assert.deepEqual(
+    tasks.map((task) => [task.id, task.prompt]),
+    [
+      ['task-a', 'Replaced.'],
+      ['task-b', 'Second.'],
+    ],
+  )
+})
+
 test('workflow CLI persists failure when the final lease expires on an idle schedule', async () => {
   const statePath = await tempStatePath()
   const run = async (...args: string[]) => {

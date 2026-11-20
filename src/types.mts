@@ -987,6 +987,9 @@ export interface ThreadTokenUsage {
 
 export interface PermissionDecision {
   decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel'
+  // What Claude is told of a call refused without the user's answer, such as
+  // a card its turn's end took down; absent, it reads as the user's decline.
+  message?: string
   updatedInput?: Record<string, unknown>
   // What Claude Code applies as it runs the call: the rule the user chose to
   // save, or what "for this session" adds for the session.
