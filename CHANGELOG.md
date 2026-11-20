@@ -47,7 +47,10 @@ versioning or publishing metadata.
   the subagent threads it spawned, and is refused while one of them runs in
   another adapter. Such a turn used to run on in the deleted chat and keep the
   adapter busy for good: its idle Codex child never stopped and the daemon
-  never idle-exited. (#344)
+  never idle-exited. A turn Codex says it no longer runs counts as ended
+  instead of failing every retry, and when Codex does not stop a turn within
+  `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` the change fails and the chat stays, where
+  it used to wait forever. (#344)
 - A native turn Codex accepted but has not announced yet (a shell command,
   review or compaction) now keeps the Codex child and the daemon up. A small
   `CLAUDE_CODEX_NATIVE_IDLE_MS` could stop the child in that gap and end the

@@ -891,9 +891,10 @@ test('archive and delete end the native turns of a chat’s subagent threads', a
 
     const deleted = await withAgent()
     // Another adapter cannot stop the subagent's turn, so it leaves the chat alone.
+    const refusal = `thread ${deleted.threadId} has an active turn in another adapter process`
     for (const method of ['thread/archive', 'thread/delete']) {
       const answer = await second.request(method, { threadId: deleted.threadId })
-      assert.match(answer.error?.message ?? '', /active turn in another adapter process/, method)
+      assert.ok(answer.error?.message?.startsWith(refusal), `${method}: ${answer.error?.message}`)
     }
     assert.deepEqual(second.childLog(), [])
     const child = first.childLog().findLast((entry) => entry.event === 'spawn').pid as number
@@ -927,6 +928,13 @@ test('an inline review Codex answers with its turn holds the chat until that tur
   try {
     const threadId = await startChat(app)
     await runTurn(app, threadId, 'accept')
+    // One Codex started and ended before answering is over, whatever the answer says.
+    const done = await app.request('review/start', {
+      threadId,
+      target: { type: 'commit', sha: '1234567' },
+    })
+    assert.equal(done.result.turn.id, 'turn-review-done')
+    await eventually(() => nativeOwner(app.home, threadId) === null, 'claim release')
     const review = await app.request('review/start', {
       threadId,
       target: { type: 'uncommittedChanges' },
@@ -944,6 +952,48 @@ test('an inline review Codex answers with its turn holds the chat until that tur
         ),
     )
     assert.equal(nativeOwner(app.home, threadId), null)
+  } finally {
+    await app.stop()
+  }
+})
+
+test('archive goes ahead when Codex no longer runs a subagent turn it never reported ended', async () => {
+  const app = startAdapter({ env: { FAKE_SUBAGENT: '1', FAKE_INTERRUPT: 'gone' } })
+  try {
+    const threadId = await startChat(app)
+    const { seen } = await runTurn(app, threadId, 'accept')
+    const agentId = seen.find(
+      (message) =>
+        message.method === 'thread/started' && message.params.thread.parentThreadId === threadId,
+    ).params.thread.id
+    assert.equal((await app.request('thread/archive', { threadId })).error, undefined)
+    assert.equal(nativeOwner(app.home, agentId), null)
+  } finally {
+    await app.stop()
+  }
+})
+
+test('archive and delete fail, keeping the chat, when Codex does not stop its turn in time', async () => {
+  const app = startAdapter({
+    env: { FAKE_INTERRUPT: 'stuck', CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '500' },
+  })
+  try {
+    const threadId = await startChat(app)
+    await app.request('turn/start', { threadId, input: [{ type: 'text', text: 'hello' }] })
+    await app.reader.until((message) => message.method?.endsWith('requestApproval'))
+    for (const method of ['thread/archive', 'thread/delete']) {
+      const answer = await app.request(method, { threadId })
+      assert.match(answer.error?.message ?? '', /did not stop the running turn in time/, method)
+    }
+    const list = await app.request('thread/list', { archived: false })
+    assert.ok(list.result.data.some((row: any) => row.id === threadId))
+    assert.equal(
+      app
+        .childLog()
+        .filter((entry) => entry.method === 'thread/archive' || entry.method === 'thread/delete')
+        .length,
+      0,
+    )
   } finally {
     await app.stop()
   }

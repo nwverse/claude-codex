@@ -241,7 +241,7 @@ export class CodexNativeBridge {
     const stopsWork = method === 'thread/archive' || method === 'thread/delete'
     if (stopsWork) {
       for (const id of this.host.store.subagentTreeIds(threadId))
-        if (this.host.store.hasForeignNativeTurn(id)) throw foreignTurnError(id)
+        if (this.host.store.hasForeignNativeTurn(id)) throw foreignTurnError(threadId)
     }
     if (method === 'thread/fork') {
       // A description fork needs its native parent's conversation. The App's
@@ -335,19 +335,26 @@ export class CodexNativeBridge {
   }
 
   // Interrupts the native turns of the thread and of the subagent threads it
-  // spawned. A turn that ended meanwhile is no failure.
+  // spawned. A turn that ended meanwhile is no failure, nor one Codex no
+  // longer runs. Codex answers once the turn has stopped; a child that does
+  // not within the turn wait fails the change rather than hang it.
   private async interruptTree(threadId: string): Promise<void> {
     for (const id of this.host.store.subagentTreeIds(threadId)) {
       const active = this.activeTurns.get(id)
       const childId = this.host.store.getThread(id)?.codexSessionId
       if (!active || !childId) continue
+      const interrupted = this.child(active.provider).request('turn/interrupt', {
+        threadId: childId,
+        turnId: active.turnId,
+      })
       try {
-        await this.child(active.provider).request('turn/interrupt', {
-          threadId: childId,
-          turnId: active.turnId,
-        })
+        await withinTurnWait(interrupted, 'Codex did not stop the running turn in time; retry')
       } catch (error) {
-        if (this.activeTurns.get(id) === active) throw error
+        if (this.activeTurns.get(id) !== active) continue
+        if (!(error instanceof RpcError) || error.message !== 'no active turn to interrupt')
+          throw error
+        // Its end went unreported.
+        this.endTurn(id, { turn: { id: active.turnId } })
       }
     }
   }
@@ -866,10 +873,19 @@ export class CodexNativeBridge {
   }
 }
 
-// How long a claim waits for Codex to announce a turn it accepted.
+// How long a claim waits for Codex to announce a turn it accepted, and
+// archive or delete for Codex to stop one.
 function turnWaitMs(): number {
   const ms = Number(process.env.CLAUDE_CODEX_NATIVE_TURN_WAIT_MS)
   return ms > 0 ? ms : 30_000
+}
+
+function withinTurnWait<T>(request: Promise<T>, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new RpcError(message)), turnWaitMs())
+  })
+  return Promise.race([request, late]).finally(() => clearTimeout(timer))
 }
 
 function requestedModel(params: Record<string, unknown>): string | null {
