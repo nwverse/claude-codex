@@ -912,6 +912,12 @@ versioning or publishing metadata.
   in a read-only thread, as the Agent SDK route runs there. It also
   pre-approved WebFetch, Task and TodoWrite, so a read-only chat could fetch
   any URL with no card. (#331)
+- On the Agent SDK route, `CLAUDE_CODEX_ALLOWED_TOOLS` pre-approves in a
+  read-only sandbox or plan mode only the tools on it that read (Read, Grep,
+  Glob, LS, WebSearch); the others ask or are refused there, as unlisted
+  tools are. A listed Bash used to run in those threads with no card, and in
+  a read-only sandbox a listed Write too. Other sandboxes keep the whole
+  list. (#339)
 
 ### Trustworthy history and settings
 
