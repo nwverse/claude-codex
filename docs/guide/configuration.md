@@ -498,7 +498,7 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 
 # Rotate once the log reaches this many bytes (default 52428800, 50 MiB;
 # 0 never rotates), keeping this many old files as debug.jsonl.1, .2, ...
-# (default 3, at least 1).
+# (default 3, at least 1, at most 100).
 export CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES="52428800"
 export CLAUDE_CODEX_DEBUG_LOG_KEEP="3"
 ```
@@ -510,7 +510,12 @@ cut at 1200 characters. The App's prompts and steers, streamed text and output
 deltas, diffs, file writes, terminal input and injected items are logged as
 sizes, counts and ids instead of their text. Writing is best-effort: a log that
 cannot be written never fails a turn. Everything else, such as commands, paths
-and bridge URLs, is written as is, so keep the file private.
+and bridge URLs, is written as is, so the adapter creates the log and its
+rotated copies readable by their owner alone (0600). When it starts writing to
+the log it also tightens a log or rotated copy an earlier version left
+readable, if that is a regular file the adapter owns; a symbolic link and its
+target, a device such as `/dev/stderr` and another user's file keep their mode.
+Keep any copy you make private too.
 
 ## WebSocket listener
 

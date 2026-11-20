@@ -1,3 +1,4 @@
+import './support/hermetic-env.mjs'
 import assert from 'node:assert/strict'
 import { type ChildProcess, spawn } from 'node:child_process'
 import { once } from 'node:events'

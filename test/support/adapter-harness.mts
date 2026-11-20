@@ -1,6 +1,7 @@
 // Shared helpers for the adapter-*.test.mts suites. Each suite runs in its own
 // node:test process, so the suites run in parallel. This file sits outside the
 // dist/test/*.mjs glob, so npm test does not run it as a suite.
+import './hermetic-env.mjs'
 import { type ChildProcess, type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -8,14 +9,6 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 export const adapter = resolve('dist/src/adapter.mjs')
-
-// The adapters these tests spawn inherit this environment. Drop what a
-// developer's shell or Claude Code session exports (credentials, a Claude
-// config folder, a live adapter or Codex home), as CI never has any of it.
-// Every adapter-* suite imports this module, so this runs before its tests.
-for (const key of Object.keys(process.env)) {
-  if (/^(ANTHROPIC_|CLAUDE|CODEX_)/.test(key)) delete process.env[key]
-}
 
 // The agent messages a thread's turn published, as their item/completed carried them.
 export function completedAgentMessages(messages: any[], threadId: string): any[] {

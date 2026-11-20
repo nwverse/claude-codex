@@ -1,3 +1,4 @@
+import './support/hermetic-env.mjs'
 import assert from 'node:assert/strict'
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -5,6 +6,9 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { CodexAppServerChild } from '../src/codex-app-server-child.mjs'
+
+// The child logs its spawn and exit: keep that out of the developer's ~/.codex.
+process.env.CLAUDE_CODEX_DEBUG_LOG = '0'
 
 // A fake `codex app-server` that starts a helper in its process group (as an
 // MCP server would run) and exits when asked to, as a crash would.

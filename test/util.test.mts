@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, statSync } from 'node:fs'
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import test from 'node:test'
 import {
   claudeCodeAtLeast,
@@ -70,11 +71,14 @@ test('isPathInside accepts strict descendants only', () => {
 test('defaultSocketPath takes CLAUDE_CODEX_SOCKET_PATH over CODEX_HOME', () => {
   const keys = ['CODEX_HOME', 'CLAUDE_CODEX_SOCKET_PATH'] as const
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+  const cwd = process.cwd()
   process.env.CODEX_HOME = '/tmp/codex-home'
   try {
     process.env.CLAUDE_CODEX_SOCKET_PATH = '/run/claude-codex/app-server.sock'
     assert.equal(defaultSocketPath(), '/run/claude-codex/app-server.sock')
-    // A relative path resolves against the working directory.
+    // A relative path resolves against the working directory. Use a short
+    // one: a deep checkout's is too long for a socket path under it.
+    process.chdir(process.platform === 'darwin' ? '/tmp' : tmpdir())
     process.env.CLAUDE_CODEX_SOCKET_PATH = ' run/app-server.sock '
     assert.equal(defaultSocketPath(), resolve('run/app-server.sock'))
     // Blank means unset.
@@ -84,6 +88,7 @@ test('defaultSocketPath takes CLAUDE_CODEX_SOCKET_PATH over CODEX_HOME', () => {
       join('/tmp/codex-home', 'app-server-control', 'app-server-control.sock'),
     )
   } finally {
+    process.chdir(cwd)
     for (const key of keys) {
       const value = previous[key]
       if (value == null) delete process.env[key]
@@ -245,4 +250,77 @@ test('debugLog notices another writer growing the log and still rotates it', asy
       assert.deepEqual(logEvents(path), ['mine.2'])
     },
   )
+})
+
+test('debugLog keeps the log and its rotated copies readable by the owner alone', async () => {
+  // The log holds commands and tool input, whatever the umask would allow.
+  const umask = process.umask(0o022)
+  const mode = (file: string) => (statSync(file).mode & 0o777).toString(8)
+  try {
+    await withDebugLogEnv(
+      { CLAUDE_CODEX_DEBUG_LOG: '<dir>/debug.jsonl', CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES: '400' },
+      (dir) => {
+        const path = join(dir, 'debug.jsonl')
+        for (let i = 0; i < 20; i += 1) debugLog(`event.${i}`, { i })
+        assert.deepEqual([path, `${path}.1`].map(mode), ['600', '600'])
+      },
+    )
+    // A log and rotated copies an older version left readable are tightened.
+    await withDebugLogEnv({ CLAUDE_CODEX_DEBUG_LOG: '<dir>/debug.jsonl' }, async (dir) => {
+      const path = join(dir, 'debug.jsonl')
+      const files = [path, `${path}.1`, `${path}.3`]
+      for (const file of files) await writeFile(file, '{"event":"old"}\n', { mode: 0o644 })
+      debugLog('new')
+      assert.deepEqual(files.map(mode), ['600', '600', '600'])
+      assert.deepEqual(logEvents(path), ['old', 'new'])
+    })
+    // A link at the log's path or at a rotated slot keeps its target's mode,
+    // and no more than 100 old logs are looked at.
+    await withDebugLogEnv(
+      { CLAUDE_CODEX_DEBUG_LOG: '<dir>/logs/debug.jsonl', CLAUDE_CODEX_DEBUG_LOG_KEEP: '1000' },
+      async (dir) => {
+        const path = join(dir, 'logs', 'debug.jsonl')
+        const target = join(dir, 'target.jsonl')
+        const unrelated = join(dir, 'unrelated.txt')
+        await mkdir(join(dir, 'logs'))
+        const files = [target, unrelated, `${path}.100`, `${path}.101`]
+        for (const file of files) await writeFile(file, '', { mode: 0o644 })
+        await symlink(target, path)
+        await symlink(unrelated, `${path}.2`)
+        debugLog('linked')
+        assert.deepEqual(files.map(mode), ['644', '644', '600', '644'])
+        assert.deepEqual(logEvents(target), ['linked'])
+      },
+    )
+  } finally {
+    process.umask(umask)
+  }
+})
+
+test('debugLog leaves the file stderr writes to alone when stderr is the log', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ccx-debuglog-stderr-'))
+  const util = new URL('../src/util.mjs', import.meta.url).href
+  const script = `const { debugLog } = await import(${JSON.stringify(util)}); debugLog('stderr')`
+  try {
+    for (const log of ['/dev/stderr', '/dev/fd/2']) {
+      const file = join(dir, `${basename(log)}.txt`)
+      await writeFile(file, '')
+      await chmod(file, 0o640)
+      const stderr = openSync(file, 'r+')
+      try {
+        const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+          stdio: ['ignore', 'ignore', stderr],
+          env: { ...process.env, CLAUDE_CODEX_DEBUG_LOG: log, NODE_NO_WARNINGS: '1' },
+          timeout: 30_000,
+        })
+        assert.equal(child.status, 0, log)
+      } finally {
+        closeSync(stderr)
+      }
+      assert.equal((statSync(file).mode & 0o777).toString(8), '640', log)
+      assert.deepEqual(logEvents(file), ['stderr'], log)
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })

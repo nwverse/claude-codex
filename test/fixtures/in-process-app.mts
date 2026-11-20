@@ -1,6 +1,7 @@
 // An adapter server in the test process, driven like the App drives it:
 // requests in, notifications and server requests out to one peer.
 
+import '../support/hermetic-env.mjs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -65,6 +66,7 @@ const SAVED_ENV = [
   'CLAUDE_CODEX_HOME',
   'CODEX_HOME',
   'CLAUDE_CODEX_DEBUG_LOG',
+  'CLAUDE_CODEX_RUN_LOG',
   'CLAUDE_CODEX_MOCK',
   'CLAUDE_CODEX_NOTICE_ROWS',
   'CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS',

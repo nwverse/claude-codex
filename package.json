@@ -38,7 +38,7 @@
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs",
-    "test": "npm run build && node --test --test-timeout=120000 --test-force-exit dist/test/*.mjs",
+    "test": "npm run build && node --test --import ./dist/test/support/hermetic-env.mjs --test-timeout=120000 --test-force-exit dist/test/*.mjs",
     "doctor": "node scripts/doctor.mjs",
     "workflow": "npm run build && node dist/src/workflow-cli.mjs",
     "workflow:schedule": "npm run workflow -- schedule",

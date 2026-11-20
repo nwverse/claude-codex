@@ -58,7 +58,6 @@ function turn(id: string, threadId: string): TurnRecord {
       { type: 'userMessage', id: 'user', content: [{ type: 'text', text: 'hi' }] },
       { type: 'agentMessage', id: 'agent', text: '', phase: null, memoryCitation: null },
     ] as ThreadItem[],
-    diff: '',
     error: null,
   }
 }

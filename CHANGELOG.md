@@ -169,6 +169,16 @@ versioning or publishing metadata.
   the App and the debug log used to carry the JSON parser's excerpt of it,
   which could include a credential; JSON wrapped in quotes was echoed whole
   as a file that was not found.
+- A Claude Code settings or config file (`~/.claude/settings.json`, a
+  project's `.claude/settings.json` or `.claude/settings.local.json`,
+  `~/.claude.json`, a project's `.mcp.json`) or a Codex `config.toml` that
+  does not parse is reported quoting none of its text. The App's hooks list
+  showed the JSON parser's excerpt of a settings file, the debug log carried
+  it for each of these JSON files, and for a `config.toml` the debug log
+  quoted the whole bad value, so a credential pasted without its quotes ended
+  up there. A TOML error names the line and what is wrong. A `\u` or `\U`
+  escape for a surrogate or a code point past U+10FFFF is now such an error,
+  as TOML requires. (#332)
 - `claude-codex-mode logs agent-http|agentapi` and `tail agent-http|agentapi`
   show the pooled bridge log written to most recently. They used to show the
   oldest one, so the log a failed bridge start pointed you to was usually
@@ -220,6 +230,20 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- A file the turn diff leaves out (too large, binary or past the size limit)
+  shows as a binary change with the reason after it, which renderers show
+  without content and `git apply` refuses. It used to be a one-line hunk that
+  `git apply` accepted, writing `[omitted: …]` into the file; that includes
+  `gitDiffToRemote`, which the App sends as a cloud task's starting diff. New
+  files in a chat that runs in a subfolder are named from the repository root,
+  as the changed tracked files are, also where `diff.relative` is set, and a
+  tracked diff over the 5 MB limit is no longer empty with a git older than
+  2.28. (#336)
+- A folder that becomes a repository after a chat first diffed it shows its
+  changes in `turn/diff/updated` and `gitDiffToRemote` within 30 seconds,
+  and one whose `git` timed out once on a busy machine at the next diff. The
+  adapter used to remember either as no repository until it restarted.
+  (#336)
 - Untracked symlinks show in the turn diff as `new file mode 120000` entries
   whose content is the link target, as `git diff` shows them. The adapter no
   longer reads through a link, so a file outside the workspace no longer leaks
@@ -921,6 +945,18 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- A turn no longer stores the whole uncommitted `git diff` of its folder,
+  which nothing read back. In a repository with a large uncommitted change
+  every turn added megabytes to `state.sqlite`, every fork copied them, and
+  every history read or search decoded them: five turns in a repository with
+  a 3.5 MB diff grew the file to 21 MB, now 160 KB. Clients that listen still
+  get `turn/diff/updated`; the turn's end no longer runs `git diff` when every
+  client opted out of it, as the App does. After the upgrade the adapter
+  empties the diffs older versions stored gradually, a few turns per write in
+  the background once it serves, so a large state file neither delays its
+  start nor locks out another adapter for long; reads skip them meanwhile.
+  SQLite reuses the space (the file does not shrink), and an older version
+  still opens the state. (#336)
 - A Claude chat keeps its conversation when its workspace folder is moved or
   renamed. The adapter looks for the transcript under the workspace it last
   recorded, in the chat's own Claude config folder, and resumes an
@@ -1025,6 +1061,14 @@ versioning or publishing metadata.
   `process/writeStdin`, `command/exec/write`, `fs/writeFile`,
   `thread/inject_items` and every streamed delta, so diffs, written files,
   terminal input and steer text no longer reach `debug.jsonl`. (#210)
+- `debug.jsonl` and its rotated copies are created readable by their owner
+  alone (0600), like `runs.jsonl`. The log got the umask's mode, usually
+  0644, so only its folder kept other local accounts from the commands, tool
+  input and stderr in it. When the adapter starts writing to the log, it also
+  tightens a log or rotated copy an earlier version left readable, if that is
+  a regular file the adapter owns: a symbolic link and its target, a device
+  such as `/dev/stderr` and another user's file keep their mode.
+  `CLAUDE_CODEX_DEBUG_LOG_KEEP` is capped at 100. (#332)
 - Settings a Claude thread cannot honor are refused with `INVALID_REQUEST`
   instead of being saved and ignored, so the App shows "Couldn't update this
   setting": `model_verbosity`, a service tier other than the default, network
@@ -1422,15 +1466,27 @@ versioning or publishing metadata.
   fixture drift gate.
 - The docs build no longer ignores dead links, so a link to a page that does not
   exist fails CI.
-- `npm test` passes in a developer's or Claude Code's shell as it does on CI:
-  `CLAUDE_CODE_WORKFLOWS=1`, `umask 077` and a global
-  `commit.gpgsign = true` no longer fail tests, the ~105 mock adapters the
-  suites on `test/support/adapter-harness.mts` start no longer get the
-  shell's `ANTHROPIC_*`, `CLAUDE*` or `CODEX_*` variables, and no suite
-  writes to the real `~/.codex` debug log. Daemon and fixture tests allow for
-  a busy machine, `npm run build` clears `dist/test` so a deleted suite stops
-  running, and a hung test fails after 2 minutes instead of holding
-  `npm test` (the CI job that runs it stops after 20 minutes).
+- `npm test` passes in a developer's or Claude Code's shell as it does on CI,
+  and leaves that shell's adapter and Claude state alone. It preloads
+  `dist/test/support/hermetic-env.mjs` into every suite, and the suites that
+  start adapters or run adapter code in-process import it too, for a direct
+  `node --test` run. No suite, and no adapter a suite starts, gets the
+  shell's `ANTHROPIC_*`, `CLAUDE*` or `CODEX_*` variables. Before, only the
+  `adapter-*` suites dropped them, and from a shell or chat that exports
+  `CLAUDE_CODEX_HOME` (as `claude-codex-isolated` does) the others wrote
+  dozens of mock threads, debug and run logs, and an
+  `approval_policy = never`, `danger-full-access` default into that live
+  adapter home. No suite writes to `~/.codex` either: a session store for a
+  database elsewhere no longer creates the adapter home, a thread's git
+  lookup that outlives its server no longer logs, and an MCP test no longer
+  reads `~/.codex/config.toml`. The relative `CLAUDE_CODEX_SOCKET_PATH` test
+  passes in a checkout deeper than about 84 bytes, and the
+  `app-server daemon version` test runs on macOS instead of skipping under
+  its long temp folder (#330). `CLAUDE_CODE_WORKFLOWS=1`, `umask 077` and a
+  global `commit.gpgsign = true` no longer fail tests. Daemon and fixture
+  tests allow for a busy machine, `npm run build` clears `dist/test` so a
+  deleted suite stops running, and a hung test fails after 2 minutes instead
+  of holding `npm test` (the CI job that runs it stops after 20 minutes).
 - The mock adapter suites, once one `adapter.test.mts`, run as parallel
   `adapter-*` suites, and tests that failed on a busy machine or with the
   long macOS temp folder pass there (#130, #193, #213, #214). Biome is 2.6,

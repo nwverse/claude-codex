@@ -24,7 +24,7 @@ npm run build          # tsc -> dist/ (production artifact)
 npm run typecheck      # tsc --noEmit
 npm run check          # biome format + lint (read-only)
 npm run check:fix      # biome auto-fix (format + safe lint)
-npm test               # build + node --test dist/test/*.mjs
+npm test               # build + node --test dist/test/*.mjs, caller env scrubbed (see test/AGENTS.md)
 npm run doctor         # environment self-check
 ```
 

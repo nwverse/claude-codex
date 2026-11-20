@@ -74,7 +74,6 @@ function addTurn(store: SessionStore, threadId: string, ...parts: string[]): voi
         content: parts.map((text) => ({ type: 'text', text, text_elements: [] })),
       },
     ],
-    diff: '',
     error: null,
   }
   store.upsertTurn(turn)
