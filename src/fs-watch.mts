@@ -186,11 +186,13 @@ function nearestFolder(path: string): Folder {
   }
 }
 
-// What tells a change of the entry at `path`; '' while it is missing.
+// What tells a change of the entry at `path`; '' while it is missing. The
+// change time is in it because a program can copy a modification time but
+// not a change time, and siblings coming and going leave both alone.
 function entryStamp(path: string): string {
   try {
     const stats = lstatSync(path, { throwIfNoEntry: false })
-    return stats ? `${stats.dev}:${stats.ino}:${stats.mtimeMs}:${stats.size}` : ''
+    return stats ? `${stats.dev}:${stats.ino}:${stats.mtimeMs}:${stats.ctimeMs}:${stats.size}` : ''
   } catch {
     return ''
   }
