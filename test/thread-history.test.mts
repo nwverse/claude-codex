@@ -30,7 +30,6 @@ function turn(id: string, items: ThreadItem[], status: TurnRecord['status'] = 'c
     completedAt: status === 'inProgress' ? null : 2,
     durationMs: status === 'inProgress' ? null : 1000,
     items,
-    diff: '',
     error: null,
   } satisfies TurnRecord
 }

@@ -735,7 +735,6 @@ test('turn interrupt completes requested in-progress turn after reconnect', asyn
         completedAt: null,
         durationMs: null,
         items: [],
-        diff: '',
         error: null,
       })
       const interrupted = []
@@ -2114,7 +2113,7 @@ async function blockingGitDiff(home: string): Promise<{ repo: string; env: NodeJ
       "  printf 'true\\n'",
       '  exit 0',
       'fi',
-      'if [ "$1" = "diff" ]; then',
+      'if [ "$1" = "diff" ] || [ "$3" = "diff" ]; then',
       '  : > "$CLAUDE_CODEX_TEST_GIT_DIFF_STARTED"',
       '  while [ ! -f "$CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE" ]; do sleep 0.01; done',
       "  printf 'diff --git a/file b/file\\n--- a/file\\n+++ b/file\\n@@ -1 +1 @@\\n-old\\n+new\\n'",
@@ -2308,7 +2307,6 @@ test('server stop during final git diff leaves the closed store alone', async ()
     try {
       const turn = store.getTurn(turnId)
       assert.equal(turn?.status, 'interrupted')
-      assert.equal(turn?.diff, '')
     } finally {
       store.close()
     }
