@@ -37,6 +37,7 @@ import {
   reasoningEffortOptions,
   reportedClaudeModel,
 } from './claude-models.mjs'
+import { type ClaudeSessionRef, claudeSessionRef } from './claude-session-ref.mjs'
 import { configRequirements } from './cli-probes.mjs'
 import { asTable, codexAutoCompactLimit } from './codex-config.mjs'
 import {
@@ -10551,6 +10552,9 @@ export class CodexClaudeAppServer {
       recencyAt: thread.updatedAt,
       status: thread.status,
       path: null,
+      // Where a Claude thread's transcript is, for clients on the same
+      // computer that also read Claude Code's (claude-session-ref.mts).
+      claudeSession: this.claudeSessionOf(thread),
       cwd: thread.cwd,
       cliVersion: codexCliVersion(),
       canAcceptDirectInput: true,
@@ -10570,6 +10574,20 @@ export class CodexClaudeAppServer {
       projectId: thread.projectId ?? null,
       turns: turns.map((turn) => this.toTurn(turn)),
     }
+  }
+
+  // The Claude Code session the thread's own turns write. A fork resumes the
+  // session it was forked from until a turn of its own has written one (see
+  // runtimeTurnContext), so until then it names none: that transcript is its
+  // parent's.
+  private claudeSessionOf(thread: ThreadRecord): ClaudeSessionRef | null {
+    if (
+      thread.forkedFromId != null &&
+      thread.claudeSessionId != null &&
+      !this.store.turnsWroteSession(thread.id, thread.claudeSessionId)
+    )
+      return null
+    return claudeSessionRef(thread)
   }
 
   private subagentDepth(thread: ThreadRecord): number {

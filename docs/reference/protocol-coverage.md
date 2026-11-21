@@ -12,6 +12,17 @@ Implemented as real remote/runtime behavior:
 - **Thread lifecycle** — start, resume, fork, list, read, turns list, name,
   archive/unarchive, unsubscribe, interrupt, delete, and rollback/revert that
   rewind Claude's session to the kept turns.
+- **Claude session on Thread** — every Thread carries `claudeSession`, so a
+  client on the same computer that also reads Claude Code transcripts can match
+  a Claude thread to its transcript: `id` is the session the thread's turns
+  resume, `cwd` the folder it was last written in, and `configDir` the
+  absolute Claude Code config directory it lives under (the thread's model
+  process profile's `CLAUDE_CONFIG_DIR`, else the adapter's own or its
+  router's, else `~/.claude`; null when the profile is no longer configured as
+  it was when the thread started). `claudeSession` is null for Codex threads,
+  before the first Claude turn, for a fork until a turn of its own has written
+  a session (it resumes its parent's until then), and for the HTTP bridges and
+  `claude-p`, which keep no Agent SDK transcript. `path` stays null.
 - **Several clients per thread** — every connection that opens a thread follows
   it: notifications reach all of them, approvals and questions go to each and
   the first answer wins, and one that opens the thread while a request is

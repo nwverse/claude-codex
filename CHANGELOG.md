@@ -270,6 +270,14 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- Every Thread now carries `claudeSession`: the Claude Code session a Claude
+  thread's turns resume (`id`), the folder it was last written in (`cwd`) and
+  the config directory it lives under (`configDir`), a model process
+  profile's own included. A client on the same computer that also lists Claude
+  Code transcripts can match a thread to its transcript instead of showing the
+  conversation twice. It is null for Codex threads, before the first Claude
+  turn, and for a fork until a turn of its own has written a session; the
+  thread's `path` stays null. (#357)
 - Codex App 26.1111.71704 is a verified build too, and the upgrade baseline.
   Its Codex, `0.169.1`, has the same app-server protocol as 26.1111.21308's,
   its gates are unchanged, and the one new method-shaped name in its scripts,
