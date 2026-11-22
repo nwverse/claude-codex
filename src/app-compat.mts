@@ -119,15 +119,15 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'server-started-threads',
     app: "Adds a thread it did not start to the sidebar as soon as thread/started announces it on its connection, and follows that thread's turns live from then on.",
     adapter:
-      "Announces a chat the leader tools start with thread/started on the leader's connection before the chat's first turn starts.",
+      "Announces a chat the leader tools start with thread/started on the leader's connection before the chat's first turn starts. A chat a client other than the App starts (a phone relay, a script) goes to every connected App that did not opt out of thread/started as its first turn starts: the App follows it from then on and gets the turn's notifications, the user message included. Ephemeral threads are not announced.",
     verify:
-      'With CLAUDE_CODEX_LEADER_TOOLS=1, ask Claude to start a chat with thread_start: it shows in the sidebar, and its first message and answer stream in when opened.',
+      'With CLAUDE_CODEX_LEADER_TOOLS=1, ask Claude to start a chat with thread_start: it shows in the sidebar, and its first message and answer stream in when opened. Start a chat and its first turn from another client of the daemon: it shows in the sidebar and the turn streams there.',
   },
   {
     id: 'added-thread-titles',
     app: "Titles a thread that thread/started adds to the sidebar from the announcement alone: it shows the thread's name if it has one; otherwise it generates a title from the thread's preview, as it does for a chat started in the composer, and saves it with thread/name/set. A thread announced with neither stays untitled. It drops a generated title when the thread's title changed meanwhile.",
     adapter:
-      'Announces a chat the leader tools start with its first message as the preview, and the title given to thread_start, if any, as its name.',
+      'Announces a chat the leader tools start with its first message as the preview, and the title given to thread_start, if any, as its name; a chat another client starts likewise, with the name it was given before its first turn, if any.',
     verify:
       'With CLAUDE_CODEX_LEADER_TOOLS=1, ask Claude to start a chat with thread_start without a title: the sidebar shows a generated title for it, not its first words; with a title, the sidebar shows that title.',
   },

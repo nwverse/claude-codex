@@ -527,6 +527,69 @@ test('a client that disconnects takes its terminals and command/exec processes w
   })
 })
 
+test('a chat another client starts reaches the App with its first turn, once', {
+  timeout: 20_000,
+}, async () => {
+  await withServer(async (connect) => {
+    const app = await desktopApp(connect('app'))
+    const relay = await otherClient(connect('relay'))
+    const threadId = await startThread(relay)
+    // Nothing to show yet: the chat has no first message.
+    assert.deepEqual(about(app, threadId), [])
+
+    await relay.request('turn/start', { threadId, input: textInput('hello from the relay') })
+    const seen = await app.until((message) => message.method === 'turn/completed')
+    // The App hears of the chat before anything else of it, with the first
+    // message as the preview it titles the chat from.
+    const [announced] = about(app, threadId)
+    assert.equal(announced.method, 'thread/started')
+    assert.equal(announced.params.thread.preview, 'hello from the relay')
+    const methods = seen.map((message) => message.method)
+    assert.ok(methods.indexOf('thread/started') < methods.indexOf('turn/started'))
+    // The App did not send the message, so it is told.
+    assert.equal(userMessages(seen).length, 2)
+    assert.equal(userMessages(seen)[0].params.item.content[0].text, 'hello from the relay')
+    assert.match(agentText(seen), /hello from the relay/)
+
+    // Announced once; the App follows the chat's later turns.
+    await relay.request('turn/start', { threadId, input: textInput('and again') })
+    const again = await app.until((message) => message.method === 'turn/completed')
+    assert.equal(again.filter((message) => message.method === 'thread/started').length, 0)
+    assert.match(agentText(again), /and again/)
+  })
+})
+
+test('helper threads, chats the App starts and Apps that opted out are not announced', {
+  timeout: 20_000,
+}, async () => {
+  await withServer(async (connect) => {
+    const app = await desktopApp(connect('app'))
+    const quiet = await desktopApp(connect('quiet'), ['thread/started'])
+    const relay = await otherClient(connect('relay'))
+
+    const helper = (await relay.request('thread/start', { cwd: process.cwd(), ephemeral: true }))
+      .result.thread.id
+    await relay.request('turn/start', { threadId: helper, input: textInput('a helper request') })
+    await relay.until((message) => message.method === 'turn/completed')
+    assert.deepEqual(about(app, helper), [])
+
+    // The App hears of its own chat once, from thread/start; the relay not at all.
+    const own = await startThread(app)
+    await app.request('turn/start', { threadId: own, input: textInput('my own chat') })
+    await app.until((message) => message.method === 'turn/completed')
+    const started = (message: any) => message.method === 'thread/started'
+    assert.equal(about(app, own).filter(started).length, 1)
+    assert.deepEqual(about(relay, own), [])
+
+    // An App that opted out of thread/started is not made to follow the chat.
+    const chat = await startThread(relay)
+    await relay.request('turn/start', { threadId: chat, input: textInput('for the App') })
+    await app.until((message) => message.method === 'turn/completed')
+    assert.equal(about(app, chat).filter(started).length, 1)
+    assert.deepEqual(about(quiet, chat), [])
+  })
+})
+
 interface Client {
   readonly received: any[]
   receive(message: any): void
@@ -725,6 +788,33 @@ function userMessages(messages: any[]): any[] {
     (message) =>
       (message.method === 'item/started' || message.method === 'item/completed') &&
       message.params.item?.type === 'userMessage',
+  )
+}
+
+// A Codex App connection, as its initialize names it.
+async function desktopApp(peer: Client, optOutNotificationMethods: string[] = []) {
+  await peer.request('initialize', {
+    clientInfo: { name: 'Codex Desktop', title: 'Codex Desktop', version: '26.1111.71704' },
+    capabilities: { optOutNotificationMethods },
+  })
+  return peer
+}
+
+// Another app-server client of the daemon, such as a phone relay.
+async function otherClient(peer: Client) {
+  await peer.request('initialize', {
+    clientInfo: { name: 'relay', version: '1.0.0' },
+    capabilities: {},
+  })
+  return peer
+}
+
+// The notifications a client got that name the thread.
+function about(peer: Client, threadId: string): any[] {
+  return peer.received.filter(
+    (message) =>
+      message.method !== undefined &&
+      (message.params?.threadId === threadId || message.params?.thread?.id === threadId),
   )
 }
 

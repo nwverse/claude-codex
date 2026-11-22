@@ -178,6 +178,15 @@ answer wins, and the others get `serverRequest/resolved`; any connected client
 may answer. A client that opens a thread while one of its turns is waiting on a
 request, such as the App after a reconnect, gets the request too.
 
+A chat another client starts, such as a phone relay or a script, reaches every
+connected Codex App when its first turn starts: the App gets `thread/started`
+with the first message as the preview (and the name the client gave the chat, if
+any), follows the chat from then on, and gets the turn's notifications, the user
+message included. It is announced once. An App that opted out of
+`thread/started`, an ephemeral thread and a chat the App started itself are left
+out; a chat the [leader tools](/guide/gui#leader-chats) start is announced on
+the leader's connection, as before.
+
 ## Quick remote probe
 
 ```bash

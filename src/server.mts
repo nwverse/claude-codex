@@ -4,7 +4,11 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual, promisify } from 'node:util'
-import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
+import {
+  DESKTOP_CLIENT_NAMES,
+  rendersCompletedSubagentActivity,
+  unverifiedAppWarning,
+} from './app-compat.mjs'
 import { type InstalledAppPlugin, stopAppPluginServers } from './app-plugin-mcp.mjs'
 import {
   appMcpServerOrigins,
@@ -771,6 +775,9 @@ export class CodexClaudeAppServer {
   private lastTurnParamsByThread = new Map<string, Record<string, unknown>>()
   // Whether each thread's server-side queue holds (see queueHeld).
   private queueHolds = new Map<string, boolean>()
+  // Chats a client other than the App started, until their first turn
+  // announces them to the connected Apps (see announceToApps).
+  private unannouncedChats = new Set<string>()
   private fuzzySessions = new Map<string, { roots: string[] }>()
   // Approvals the user gave "for this session", by thread: a command, a
   // non-edit tool call, or an MCP tool (see approvalSessionKey).
@@ -1723,7 +1730,40 @@ export class CodexClaudeAppServer {
     })
     this.subscribe(id, peer)
     this.notify(peer, { method: 'thread/started', params: { thread: this.toThread(thread, []) } })
+    // A chat another client starts (a phone relay, a script) reaches the
+    // connected Apps with its first turn; the App announces its own to itself.
+    // App rule: server-started-threads
+    if (!thread.ephemeral && this.peers.has(peer.id) && !this.isDesktopApp(peer))
+      this.unannouncedChats.add(id)
     return this.threadEnvelope(thread)
+  }
+
+  // Whether the connection is the desktop App's, as its initialize named it.
+  // App rule: client-info
+  private isDesktopApp(peer: RpcPeer): boolean {
+    const name = this.peerFeatures.get(peer)?.clientName
+    return name != null && DESKTOP_CLIENT_NAMES.includes(name)
+  }
+
+  // Puts a chat another client started into the sidebar of each connected
+  // App, which then follows its turns live, as it does a chat the leader
+  // tools start: once, as its first turn starts, so the announcement carries
+  // the first message as the preview the App titles it from, and any name
+  // the client gave it.
+  // App rule: server-started-threads
+  // App rule: added-thread-titles
+  private announceToApps(thread: ThreadRecord): void {
+    if (!this.unannouncedChats.delete(thread.id)) return
+    const announcement = {
+      method: 'thread/started',
+      params: { thread: this.toThread(thread, []) },
+    }
+    for (const peer of this.peers.values()) {
+      if (!this.isDesktopApp(peer) || this.optedOut(peer, 'thread/started')) continue
+      if (this.subscribersByThread.get(thread.id)?.has(peer.id)) continue
+      this.subscribe(thread.id, peer)
+      this.sendNotification(peer, announcement)
+    }
   }
 
   // thread_start: the chat goes through thread/start and turn/start as if
@@ -2644,6 +2684,8 @@ export class CodexClaudeAppServer {
     this.elicitationCounts.delete(threadId)
     // An unarchived thread's queue holds as its stored turns say.
     this.queueHolds.delete(threadId)
+    // Archived or deleted before its first turn: nothing announces it.
+    this.unannouncedChats.delete(threadId)
   }
 
   private threadUnsubscribe(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -4734,6 +4776,10 @@ export class CodexClaudeAppServer {
       if (ownedHere) throw invalidRequest(`thread ${threadId} already has an active turn`)
       throw this.claimRefusedError(threadId, claim.ownedBySelf)
     }
+    // A chat another client started reaches the connected Apps now, with
+    // this turn's message as its preview, ahead of the turn's notifications.
+    // App rule: server-started-threads
+    this.announceToApps(thread)
     recordRunEvent('turn.started', {
       threadId,
       turnId,

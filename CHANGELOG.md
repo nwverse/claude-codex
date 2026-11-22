@@ -289,6 +289,14 @@ versioning or publishing metadata.
   reports an App build missing from the verified list again (a
   `configWarning` in Settings, and on stderr); 26.1111 connected without
   that warning. (#347)
+- A chat another client starts on the daemon, such as a phone relay or a
+  script, reaches every connected Codex App as its first turn starts: the App
+  gets `thread/started` with the first message as the preview, follows the
+  chat, and gets the turn's notifications, the user message included, so the
+  chat shows in the sidebar and its turn streams there. It used to show up
+  only on the App's next `thread/list` refresh, without its first turn. An App
+  that opted out of `thread/started`, ephemeral threads and chats the App
+  starts itself are left out. (#359)
 - `npm run check:app-upgrade` reads Codex App 26.1111 bundles again: their
   double-quoted strings, gates without a version (shown as "never"), the
   minimum version in a constant of its own, and a `clientInfo` name taken from
