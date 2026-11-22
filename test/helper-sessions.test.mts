@@ -38,22 +38,36 @@ test('helper threads and forks run without a transcript; chats, kept forks and s
     const fork = async (params: Record<string, unknown>) =>
       (await app.request('thread/fork', { threadId: chat, ...params })).thread.id as string
 
-    // A title, in a thread of its own.
+    // A title, in a thread of its own. The session it ran in is not recorded,
+    // as it left no transcript to resume: a second turn starts from none.
     const title = await app.startThread({ ephemeral: true })
     assert.equal((await run(title, { outputSchema: TITLE_SCHEMA })).persistSession, false)
+    assert.equal(app.store.getThread(title)?.claudeSessionId, null)
+    const titleAgain = await run(title, { outputSchema: TITLE_SCHEMA })
+    assert.equal(titleAgain.persistSession, false)
+    assert.equal(titleAgain.claudeSessionId, null)
 
-    // A description fork still starts from the chat's session.
-    const described = await run(await fork({ ephemeral: true }), { outputSchema: TITLE_SCHEMA })
-    assert.equal(described.persistSession, false)
-    assert.equal(described.claudeSessionId, `session-${chat}`)
-    assert.equal(described.forkSession, true)
+    // A description fork still starts from the chat's session, and so does
+    // each later turn of it: the fork's own session was never written.
+    const described = await fork({ ephemeral: true })
+    for (let turn = 0; turn < 2; turn++) {
+      const context = await run(described, { outputSchema: TITLE_SCHEMA })
+      assert.equal(context.persistSession, false)
+      assert.equal(context.claudeSessionId, `session-${chat}`)
+      assert.equal(context.forkSession, true)
+    }
+    assert.equal(app.store.getThread(described)?.claudeSessionId, `session-${chat}`)
 
-    const kept = await run(await fork({}))
+    // A kept fork records the session its first turn wrote and resumes it.
+    const keptId = await fork({})
+    const kept = await run(keptId)
     assert.equal(persists(kept), true)
     assert.equal(kept.forkSession, true)
+    assert.equal(app.store.getThread(keptId)?.claudeSessionId, `session-${keptId}`)
 
     // A subagent thread is ephemeral, but its own turns are the user's.
-    const agent = await run(await fork({ ephemeral: true, threadSource: 'subagent' }))
-    assert.equal(persists(agent), true)
+    const agentId = await fork({ ephemeral: true, threadSource: 'subagent' })
+    assert.equal(persists(await run(agentId)), true)
+    assert.equal(app.store.getThread(agentId)?.claudeSessionId, `session-${agentId}`)
   })
 })
