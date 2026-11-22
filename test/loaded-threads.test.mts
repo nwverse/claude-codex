@@ -221,6 +221,52 @@ test('a subagent thread unloads once its agent is done, and its followers hear t
   })
 })
 
+test('workflow agents are loaded while they run and unload one by one as they finish', async () => {
+  const step = (agentId: string) => `workflow-agent:wf-task:${agentId}`
+  const [first, second] = ['a0123456789abcdef', 'a1123456789abcdef']
+  let release = () => {}
+  const halfway = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const runtime: ScriptedRuntime = scriptedRuntime(async (_context, handlers) => {
+    for (const agentId of [first, second])
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: step(agentId),
+        toolName: 'Agent',
+        input: { description: agentId, prompt: `step ${agentId}`, subagent_type: 'workflow' },
+      })
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: step(first),
+      content: `first done\nagentId: ${first}`,
+    })
+    await halfway
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: step(second),
+      content: `second done\nagentId: ${second}`,
+    })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const chat = await app.startThread({ cwd: app.home })
+    const turn = await app.startTurn(chat, 'run the workflow')
+    const agents = await app.waitFor(() => {
+      const spawned = children(app)
+      return spawned[`step ${first}`] && spawned[`step ${second}`] ? spawned : undefined
+    })
+    const [done, running] = [agents[`step ${first}`], agents[`step ${second}`]]
+    await app.waitFor(() => (closed(app).includes(done) ? true : undefined))
+    assert.deepEqual(await loaded(app), [chat, running].toSorted())
+
+    release()
+    await app.turnCompleted(turn)
+    await app.waitFor(() => (closed(app).includes(running) ? true : undefined))
+    assert.deepEqual(await loaded(app), [chat])
+  })
+})
+
 test('a helper thread unloads after its structured turn; an ephemeral chat stays loaded while followed', async () => {
   await withInProcessApp(agentsRuntime(), async (app) => {
     const chat = await app.startThread({ cwd: app.home })
