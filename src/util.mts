@@ -378,6 +378,17 @@ export function codexUserAgent(clientName: string, clientVersion: string): strin
   return `${name}/${codexCompatVersion()} (${platformOs()}; ${cpu}) ${originator} (${name}; ${version})`
 }
 
+// The App can omit text_elements when it sends a follow-up, but its renderer
+// calls flatMap on that array when displaying the message again.
+export function normalizeUserInput(input: unknown): UserInput[] {
+  if (!Array.isArray(input)) return []
+  return input.map((part: UserInput) =>
+    part?.type === 'text' && !Array.isArray(part.text_elements)
+      ? { ...part, text_elements: [] }
+      : part,
+  )
+}
+
 export function textFromInput(input: unknown): string {
   if (!Array.isArray(input)) return ''
   return input

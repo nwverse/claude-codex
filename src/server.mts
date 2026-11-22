@@ -331,6 +331,7 @@ import {
   newId,
   newThreadId,
   normalizeCodexReasoningEffort,
+  normalizeUserInput,
   nowMillis,
   nowSeconds,
   platformFamily,
@@ -598,7 +599,7 @@ function isUsageLimitError(error: unknown): boolean {
 }
 
 function queuedInput(value: unknown): UserInput[] {
-  const input = Array.isArray(value) ? (value as UserInput[]) : []
+  const input = normalizeUserInput(value)
   if (isEmptyInput(input)) throw invalidRequest('queued message input must not be empty')
   return input
 }
@@ -635,7 +636,7 @@ function interruptedUserText(turn: TurnRecord | null): string | null {
 function turnInput(params: Record<string, unknown>): UserInput[] {
   const toolOutput = turnToolOutputFromParams(params.toolOutput)
   if (toolOutput) return toolOutputInput(toolOutput.output)
-  return Array.isArray(params.input) ? (params.input as UserInput[]) : []
+  return normalizeUserInput(params.input)
 }
 
 // The item that carries a turn's input: the user's message, or the tool

@@ -21,7 +21,7 @@ import type {
   TurnRecord,
   TurnStatus,
 } from './types.mjs'
-import { adapterHome, debugLog, jsonClone, newId, nowSeconds } from './util.mjs'
+import { adapterHome, debugLog, jsonClone, newId, normalizeUserInput, nowSeconds } from './util.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -2568,7 +2568,9 @@ export class SessionStore {
     const row = this.db
       .prepare('SELECT items_json FROM thread_queues WHERE thread_id = ?')
       .get(threadId) as { items_json: string } | undefined
-    return row ? (JSON.parse(row.items_json) as QueuedSubmission[]) : []
+    const queue: QueuedSubmission[] = row ? JSON.parse(row.items_json) : []
+    for (const entry of queue) entry.input = normalizeUserInput(entry.input)
+    return queue
   }
 
   // The write lock makes the read-modify-write one operation across every
@@ -2757,6 +2759,10 @@ export class SessionStore {
   }
 
   private rowToTurn(row: any): TurnRecord {
+    const items: ThreadItem[] = JSON.parse(String(row.items_json))
+    for (const item of items) {
+      if (item.type === 'userMessage') item.content = normalizeUserInput(item.content)
+    }
     return {
       id: String(row.id),
       threadId: String(row.thread_id),
@@ -2764,7 +2770,7 @@ export class SessionStore {
       startedAt: row.started_at == null ? null : Number(row.started_at),
       completedAt: row.completed_at == null ? null : Number(row.completed_at),
       durationMs: row.duration_ms == null ? null : Number(row.duration_ms),
-      items: JSON.parse(String(row.items_json)),
+      items,
       error: row.error_json == null ? null : JSON.parse(String(row.error_json)),
       rootTurnId: row.root_turn_id == null ? null : String(row.root_turn_id),
     }
