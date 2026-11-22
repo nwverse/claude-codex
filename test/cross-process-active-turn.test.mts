@@ -530,6 +530,138 @@ test('a claim never displaces a live owner whose start time ps cannot read', asy
   }
 })
 
+test('two adapter processes preserve simultaneous queue additions', {
+  timeout: 20_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-process-queue-'))
+  const a = spawnTurnServer(home, false)
+  let b: FixtureClient | null = null
+  try {
+    const started = await call(a, 'thread/start', {
+      cwd: home,
+      experimentalRawEvents: false,
+      persistExtendedHistory: false,
+    })
+    assert.equal(started.error, undefined, started.error?.message)
+    const threadId = started.result.thread.id as string
+    b = spawnTurnServer(home, false)
+    const resumed = await call(b, 'thread/resume', { threadId })
+    assert.equal(resumed.error, undefined, resumed.error?.message)
+    seedQueueHold(home, threadId)
+    await writeFile(join(home, 'queue-barrier-armed'), 'armed')
+
+    const first = call(a, 'thread/queue/add', {
+      threadId,
+      input: textInput('simultaneous add from A'),
+    })
+    const second = call(b, 'thread/queue/add', {
+      threadId,
+      input: textInput('simultaneous add from B'),
+    })
+    await releaseQueueReadBarrier(home, [a, b])
+    const [firstReply, secondReply] = await Promise.all([first, second])
+    assert.equal(firstReply.error, undefined, firstReply.error?.message)
+    assert.equal(secondReply.error, undefined, secondReply.error?.message)
+
+    const store = new SessionStore(join(home, 'state.sqlite'))
+    try {
+      const queued = store.listQueue(threadId)
+      assert.equal(queued.length, 2, 'both RPC-successful submissions survive')
+      assert.deepEqual(queued.map((entry) => (entry.input[0] as any).text).sort(), [
+        'simultaneous add from A',
+        'simultaneous add from B',
+      ])
+    } finally {
+      store.close()
+    }
+  } finally {
+    await writeFile(join(home, 'release-queue-read'), 'release', { flag: 'w' }).catch(() => {})
+    await Promise.all([stopProcess(a), ...(b ? [stopProcess(b)] : [])])
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a concurrent queue addition survives dequeue and each submission runs once', {
+  timeout: 20_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-process-queue-'))
+  // Skip the selecting read in thread/queue/start; pause its dequeue read.
+  const a = spawnTurnServer(home, true, 1)
+  let b: FixtureClient | null = null
+  try {
+    const started = await call(a, 'thread/start', {
+      cwd: home,
+      experimentalRawEvents: false,
+      persistExtendedHistory: false,
+    })
+    assert.equal(started.error, undefined, started.error?.message)
+    const threadId = started.result.thread.id as string
+    b = spawnTurnServer(home, false)
+    const resumed = await call(b, 'thread/resume', { threadId })
+    assert.equal(resumed.error, undefined, resumed.error?.message)
+    seedQueueHold(home, threadId)
+    const queued = await call(a, 'thread/queue/add', {
+      threadId,
+      input: textInput('queued submission Q'),
+    })
+    assert.equal(queued.error, undefined, queued.error?.message)
+    const qid = queued.result.queuedSubmission.id as string
+    await writeFile(join(home, 'queue-barrier-armed'), 'armed')
+
+    const dequeued = call(a, 'thread/queue/start', {
+      threadId,
+      queuedSubmissionId: qid,
+    })
+    const added = call(b, 'thread/queue/add', {
+      threadId,
+      input: textInput('addition concurrent with Q dequeue'),
+    })
+    await releaseQueueReadBarrier(home, [a, b])
+    const [dequeuedReply, addedReply] = await Promise.all([dequeued, added])
+    assert.equal(dequeuedReply.error, undefined, dequeuedReply.error?.message)
+    assert.equal(addedReply.error, undefined, addedReply.error?.message)
+    const addedId = addedReply.result.queuedSubmission.id as string
+
+    let store = new SessionStore(join(home, 'state.sqlite'))
+    try {
+      assert.deepEqual(
+        store.listQueue(threadId).map((entry) => entry.id),
+        [addedId],
+        'dequeue removes only Q and preserves the successful concurrent addition',
+      )
+    } finally {
+      store.close()
+    }
+
+    await writeFile(join(home, 'release-turn'), 'release')
+    await waitFor(
+      () =>
+        a.messages.filter((message) => message.method === 'turn/completed').length === 2
+          ? true
+          : undefined,
+      'Q and the concurrent addition to complete',
+      a,
+    )
+    store = new SessionStore(join(home, 'state.sqlite'))
+    try {
+      assert.deepEqual(store.listQueue(threadId), [])
+      const texts = userMessageTexts(
+        store.listTurns(threadId).filter((turn) => turn.id !== 'queue-hold-turn'),
+      )
+      assert.deepEqual(texts, ['queued submission Q', 'addition concurrent with Q dequeue'])
+      assert.equal(texts.filter((text) => text === 'queued submission Q').length, 1)
+      assert.equal(readModelRuns(home).length, 2)
+    } finally {
+      store.close()
+    }
+  } finally {
+    await writeFile(join(home, 'release-turn'), 'release', { flag: 'w' }).catch(() => {})
+    await writeFile(join(home, 'release-queue-read'), 'release', { flag: 'w' }).catch(() => {})
+    await Promise.all([stopProcess(a), ...(b ? [stopProcess(b)] : [])])
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 // Writes the turn from a separate process that then exits, so the row names
 // a real owner that is no longer running. Returns that owner's pid.
 async function writeTurnFromExitedProcess(
@@ -604,6 +736,47 @@ function turnRecord(threadId: string, id: string): TurnRecord {
   }
 }
 
+function seedQueueHold(home: string, threadId: string): void {
+  const store = new SessionStore(join(home, 'state.sqlite'))
+  try {
+    store.upsertTurn({
+      ...turnRecord(threadId, 'queue-hold-turn'),
+      status: 'interrupted',
+      completedAt: Math.floor(Date.now() / 1000),
+    })
+  } finally {
+    store.close()
+  }
+}
+
+async function releaseQueueReadBarrier(home: string, clients: FixtureClient[]): Promise<void> {
+  await waitFor(() => {
+    const ready = clients.filter((client) =>
+      existsSync(join(home, `queue-read-${client.proc.pid}`)),
+    ).length
+    if (ready === clients.length) return true
+    // A transactional implementation holds SQLite's write lock across this
+    // read, so the other process cannot reach the barrier until it is released.
+    if (ready > 0 && databaseIsWriteLocked(join(home, 'state.sqlite'))) return true
+    return undefined
+  }, 'both queue readers or a serialized queue writer')
+  await writeFile(join(home, 'release-queue-read'), 'release')
+}
+
+function databaseIsWriteLocked(path: string): boolean {
+  const db = new DatabaseSync(path, { timeout: 1 })
+  try {
+    db.exec('BEGIN IMMEDIATE')
+    db.exec('ROLLBACK')
+    return false
+  } catch (error) {
+    if (String(error).includes('database is locked')) return true
+    throw error
+  } finally {
+    db.close()
+  }
+}
+
 // A reader holding the state database, as in adapter.test.mts: until the
 // returned release runs, no other connection can commit a write.
 function holdStateDatabase(path: string): () => void {
@@ -616,7 +789,7 @@ function holdStateDatabase(path: string): () => void {
   }
 }
 
-function spawnTurnServer(home: string, hold: boolean): FixtureClient {
+function spawnTurnServer(home: string, hold: boolean, queueBarrierSkip = 0): FixtureClient {
   const proc = spawn(process.execPath, [fixture], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
@@ -626,6 +799,8 @@ function spawnTurnServer(home: string, hold: boolean): FixtureClient {
       CLAUDE_CODEX_MOCK: '1',
       CLAUDE_CODEX_TEST_HOME: home,
       CLAUDE_CODEX_TEST_HOLD_TURN: hold ? '1' : '0',
+      CLAUDE_CODEX_TEST_QUEUE_BARRIER: '1',
+      CLAUDE_CODEX_TEST_QUEUE_BARRIER_SKIP: String(queueBarrierSkip),
       NODE_NO_WARNINGS: '1',
     },
   })

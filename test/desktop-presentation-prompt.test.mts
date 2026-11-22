@@ -396,7 +396,7 @@ test('server adds the SKILL.md of a picked skill to the prompt Claude reads', as
 
     // The composer's link, picked twice, is read once.
     const text = `[$review](${skillFile}) the storage layer, as [$review](${skillFile}) says`
-    const input = [{ type: 'text', text }]
+    const input = [{ type: 'text', text, text_elements: [] }]
     const linked = await turn(thread.id, { input })
     assert.equal(linked.prompt, `${text}\n\n${lead}\n\n${block}`)
     const userMessage = store.listTurns(thread.id).at(-1)?.items[0]
@@ -564,7 +564,7 @@ test('a message that runs a Claude Code command keeps its text as typed, after i
 test('server adds the App context of a message to the prompt Claude reads only', async () => {
   await withPromptServer(async ({ directory, store, request, turn, steers, nextCompletion }) => {
     const { thread } = await request('thread/start', { cwd: directory, model: 'sonnet' })
-    const input = [{ type: 'text', text: 'Continue with the plugin.' }]
+    const input = [{ type: 'text', text: 'Continue with the plugin.', text_elements: [] }]
     const context = await turn(thread.id, {
       input,
       additionalContext: {
@@ -606,7 +606,9 @@ test('server adds the App context of a message to the prompt Claude reads only',
       'Use this section.\n\nThe Codex App attached this context to the message.\n\n<app_context key="writing_block" kind="application">\nSecond paragraph.\n</app_context>',
     ])
     const steered = store.getTurn(held.id)?.items.at(-1)
-    assert.deepEqual(steered?.type === 'userMessage' ? steered.content : null, steerInput)
+    assert.deepEqual(steered?.type === 'userMessage' ? steered.content : null, [
+      { ...steerInput[0], text_elements: [] },
+    ])
   })
 })
 
@@ -664,7 +666,7 @@ test('server hands the items the App injects to the next message Claude reads, b
     })
     assert.equal(summary.prompt, 'Explain this architecture.')
 
-    const input = [{ type: 'text', text: 'An MCP app initiated this message.' }]
+    const input = [{ type: 'text', text: 'An MCP app initiated this message.', text_elements: [] }]
     const context = await turn(thread.id, {
       input,
       additionalContext: { page: { value: 'Page text.', kind: 'application' } },
