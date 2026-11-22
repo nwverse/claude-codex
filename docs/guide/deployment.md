@@ -184,8 +184,14 @@ with the first message as the preview (and the name the client gave the chat, if
 any), follows the chat from then on, and gets the turn's notifications, the user
 message included. It is announced once. An App that opted out of
 `thread/started`, an ephemeral thread and a chat the App started itself are left
-out; a chat the [leader tools](/guide/gui#leader-chats) start is announced on
-the leader's connection, as before.
+out. A chat the [leader tools](/guide/gui#leader-chats) start is announced on
+the leader's connection, as before, and, when that connection is not the App's,
+to the connected Apps too.
+
+An App titles a chat announced without a name itself, with a title turn of its
+own: one more model call for each such chat. A client that names the chat
+(`thread/name/set`) before its first turn keeps the App from generating a title
+for it.
 
 ## Quick remote probe
 

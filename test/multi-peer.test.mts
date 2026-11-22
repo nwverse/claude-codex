@@ -592,6 +592,20 @@ test('helper threads, chats the App starts and Apps that opted out are not annou
   })
 })
 
+test('a chat archived before its first turn is not announced', { timeout: 20_000 }, async () => {
+  await withServer(async (connect) => {
+    const app = await desktopApp(connect('app'))
+    const relay = await otherClient(connect('relay'))
+    const threadId = await startThread(relay)
+    await relay.request('thread/archive', { threadId })
+    await relay.request('thread/unarchive', { threadId })
+    await relay.request('turn/start', { threadId, input: textInput('after unarchiving') })
+    await relay.until((message) => message.method === 'turn/completed')
+    const started = (message: any) => message.method === 'thread/started'
+    assert.deepEqual(about(app, threadId).filter(started), [])
+  })
+})
+
 interface Client {
   readonly received: any[]
   receive(message: any): void
