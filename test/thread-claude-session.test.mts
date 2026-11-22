@@ -1,9 +1,10 @@
 import './support/hermetic-env.mjs'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { sdkSessionTranscript } from '../src/claude-config-roots.mjs'
 import { MockRuntime } from '../src/mock-runtime.mjs'
 import { type InProcessApp, withInProcessApp } from './fixtures/in-process-app.mjs'
 
@@ -12,8 +13,13 @@ import { type InProcessApp, withInProcessApp } from './fixtures/in-process-app.m
 
 const PROFILES_ENV = ['CLAUDE_CODEX_MODEL_PROFILES', 'CLAUDE_CODEX_MODEL_PROFILES_FILE'] as const
 
-// Two model process profiles, each with its own config dir under `root`.
-async function withProfiles(root: string, body: () => Promise<void>): Promise<void> {
+// Two model process profiles, each with its own config dir under `root`, and
+// any `more`.
+async function withProfiles(
+  root: string,
+  body: () => Promise<void>,
+  more: Record<string, unknown>[] = [],
+): Promise<void> {
   const saved = PROFILES_ENV.map((key) => [key, process.env[key]] as const)
   delete process.env.CLAUDE_CODEX_MODEL_PROFILES_FILE
   process.env.CLAUDE_CODEX_MODEL_PROFILES = JSON.stringify({
@@ -29,6 +35,7 @@ async function withProfiles(root: string, body: () => Promise<void>): Promise<vo
         sdkModel: 'vendor/second-1',
         env: { CLAUDE_CONFIG_DIR: join(root, 'profiles', 'second') },
       },
+      ...more,
     ],
   })
   try {
@@ -166,4 +173,79 @@ test('a thread whose profile changed since it started names its session without 
       }),
     ),
   )
+})
+
+test('a relative profile config dir is taken against the folder the session runs in', {
+  timeout: 20_000,
+}, async () => {
+  const relative = {
+    id: 'relative-model',
+    sdkModel: 'vendor/relative-1',
+    env: { CLAUDE_CONFIG_DIR: 'relative-config' },
+  }
+  await withTempRoot((root) =>
+    withProfiles(
+      root,
+      () =>
+        withInProcessApp(new MockRuntime(), async (app) => {
+          const threadId = await app.startThread({ model: 'relative-model', cwd: root })
+          await runTurn(app, threadId, 'hello')
+          const cwd = app.store.getThread(threadId)?.claudeSessionCwd
+          assert.ok(cwd)
+          const expected = storedSession(app, threadId, join(cwd, 'relative-config'))
+          assert.deepEqual(await readSession(app, threadId), expected)
+        }),
+      [relative],
+    ),
+  )
+})
+
+test('the sessions of the HTTP bridges and claude-p name no Claude session', {
+  timeout: 20_000,
+}, async () => {
+  await withInProcessApp(new MockRuntime(), async (app) => {
+    const threadId = await app.startThread()
+    await runTurn(app, threadId, 'hello')
+    const thread = app.store.getThread(threadId)
+    assert.ok(thread)
+    for (const id of ['agent-http:abc', 'agentapi:abc', 'claude-p:abc']) {
+      app.store.upsertThread({ ...thread, claudeSessionId: id })
+      assert.equal(await readSession(app, threadId), null, id)
+    }
+  })
+})
+
+test('a router config dir is found once, not for every Thread', async () => {
+  const keys = ['HOME', 'CLAUDE_CODEX_CLI', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CONFIG_DIRS'] as const
+  const saved = keys.map((key) => [key, process.env[key]] as const)
+  await withTempRoot(async (root) => {
+    // A model router runs each model from the dir named after it.
+    process.env.HOME = root
+    process.env.CLAUDE_CODEX_CLI = join(root, 'router')
+    process.env.CLAUDE_CONFIG_DIR = join(root, 'own')
+    process.env.CLAUDE_CONFIG_DIRS = join(root, 'routers')
+    try {
+      const routed = join(root, 'routers', 'sonnet')
+      await mkdir(routed, { recursive: true })
+      const session = {
+        sessionId: 's-1',
+        model: 'sonnet',
+        modelProfileFingerprint: null,
+        cwd: root,
+      }
+      assert.deepEqual(sdkSessionTranscript(session), { configDir: routed })
+      // Reused, not looked up again: the folders are not listed for each Thread.
+      await rm(routed, { recursive: true })
+      assert.deepEqual(sdkSessionTranscript(session), { configDir: routed })
+      // A model without a dir of its own runs from the adapter's.
+      assert.deepEqual(sdkSessionTranscript({ ...session, model: 'haiku' }), {
+        configDir: join(root, 'own'),
+      })
+    } finally {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
 })

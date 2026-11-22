@@ -14,7 +14,12 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join } from 'node:path'
-import { knownConfigRoots, nativeConfigRoot } from './claude-config-roots.mjs'
+import {
+  BRIDGE_SESSION_ID,
+  knownConfigRoots,
+  nativeConfigRoot,
+  sdkSessionTranscript,
+} from './claude-config-roots.mjs'
 import {
   assertTranscriptGone,
   CLAUDE_SESSION_UUID,
@@ -116,6 +121,7 @@ import type {
   RuntimeHandlers,
   RuntimeLiveTask,
   RuntimeMcpServerStatus,
+  RuntimeSessionRef,
   RuntimeSteerOptions,
   RuntimeTaskUsage,
   RuntimeTurnContext,
@@ -775,6 +781,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       MCP_STATUS_TIMEOUT_MS,
     )
     return statuses
+  }
+
+  // In the config dir the thread's turns run with (claude-config-roots.mts).
+  sessionTranscript(session: RuntimeSessionRef): { configDir: string | null } | null {
+    return sdkSessionTranscript(session)
   }
 
   async stop(): Promise<void> {
@@ -4748,7 +4759,7 @@ export function sdkResumeSessionId(
   sourceCwd?: string | null,
 ): string | null {
   if (!value) return null
-  if (/^(agent-http|agentapi|claude-p):/.test(value)) return null
+  if (BRIDGE_SESSION_ID.test(value)) return null
   if (!cwd) return value
   const slugs = projectSlugs(cwd)
   const runRoot = configRoot ?? nativeConfigRoot(model)
