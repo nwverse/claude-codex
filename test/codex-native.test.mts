@@ -1018,6 +1018,49 @@ test('a native subagent thread is loaded while its turn runs and unloads once it
   }
 })
 
+test('a native description fork unloads once its structured turn ends; reading a chat does not follow it', async () => {
+  const app = startAdapter()
+  try {
+    const threadId = await startChat(app)
+    await runTurn(app, threadId, 'accept')
+    const loaded = async () =>
+      ((await app.request('thread/loaded/list', {})).result.data as string[]).toSorted()
+
+    // The App's description: an ephemeral fork and one structured turn on it,
+    // which the client does not unsubscribe from.
+    const fork = await app.request('thread/fork', {
+      threadId,
+      ephemeral: true,
+      threadSource: 'thread_description',
+    })
+    const forkId = fork.result.thread.id as string
+    const { seen } = await runTurn(app, forkId, 'accept', {
+      outputSchema: { type: 'object', properties: { description: { type: 'string' } } },
+    })
+    assert.ok(
+      seen.some(
+        (message) => message.method === 'turn/completed' && message.params.threadId === forkId,
+      ),
+    )
+    await app.reader.until(
+      (message) => message.method === 'thread/closed' && message.params.threadId === forkId,
+    )
+    assert.deepEqual(await loaded(), [threadId])
+
+    // Reading threads, as an observer does, follows none of them.
+    assert.deepEqual((await app.request('thread/unsubscribe', { threadId })).result, {
+      status: 'unsubscribed',
+    })
+    for (const id of [threadId, forkId]) {
+      assert.equal((await app.request('thread/read', { threadId: id })).error, undefined)
+      assert.equal((await app.request('thread/turns/list', { threadId: id })).error, undefined)
+    }
+    assert.deepEqual(await loaded(), [])
+  } finally {
+    await app.stop()
+  }
+})
+
 test('an inline review Codex answers with its turn holds the chat until that turn ends', async () => {
   const app = startAdapter({
     env: { FAKE_REVIEW_TURN: '1', CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '300' },

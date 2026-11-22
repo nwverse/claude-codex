@@ -258,6 +258,45 @@ test('a helper thread unloads after its structured turn; an ephemeral chat stays
   })
 })
 
+test('a description fork unloads after its structured turn, for a client that opened the chat meanwhile too', async () => {
+  let release = () => {}
+  const described = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const runtime: ScriptedRuntime = scriptedRuntime(async (context, handlers) => {
+    if (context.prompt === 'describe this chat') await described
+    await handlers.onEvent({ type: 'completed', success: true, result: '{"description":"d"}' })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const chat = await app.startThread({ cwd: app.home })
+    await app.turnCompleted(await app.startTurn(chat, 'hello'))
+
+    // The App's description: an ephemeral fork of the chat and one structured
+    // turn on it.
+    const fork = (
+      await app.request('thread/fork', {
+        threadId: chat,
+        ephemeral: true,
+        threadSource: 'thread_description',
+      })
+    ).thread.id
+    const turn = await app.startTurn(fork, 'describe this chat', {
+      outputSchema: { type: 'object', properties: { description: { type: 'string' } } },
+    })
+    // A second window opens the chat while the description runs: it follows
+    // the running fork.
+    const late = connect(app.server, 'late')
+    await late.request('thread/resume', { threadId: chat })
+    assert.deepEqual(followers(app.server, fork), ['app', 'late'])
+
+    release()
+    await app.turnCompleted(turn)
+    await late.until(() => (closed(late).includes(fork) ? true : undefined))
+    assert.ok(closed(app).includes(fork))
+    assert.deepEqual(await loaded(late), [chat])
+  })
+})
+
 test('a client that opens a chat follows its running subagent threads, not the finished ones', async () => {
   const runtime = agentsRuntime()
   await withInProcessApp(runtime, async (app) => {

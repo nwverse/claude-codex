@@ -23,10 +23,15 @@ Implemented as real remote/runtime behavior:
   progress, a request waiting, a background agent it runs or hosts) and
   unloads when the agent is done, and an ephemeral thread unloads once its
   structured helper turn (a title, description or summary) ends: its followers
-  are dropped and get `thread/closed`, as after `thread/unsubscribe`. Opening a
-  chat follows its forks, and its subagent threads and ephemeral forks while
-  they run; a finished agent that runs again (a `SendMessage`) is followed by
-  whoever follows its chat by then, until it is done. News of an unloaded
+  are dropped and get `thread/closed`, as after `thread/unsubscribe`. That
+  holds for a client that resumed the subagent thread itself too. Opening a
+  chat the adapter runs follows its forks, and its subagent threads and
+  ephemeral forks while they run; opening a native Codex chat follows the chat
+  alone, and its running subagent threads are followed by whoever follows it
+  once they report. A finished agent that runs again (a `SendMessage`) is
+  followed by whoever follows its chat by then, until it is done. Reading a
+  thread (`thread/read`, `thread/turns/list` and the like) does not follow it,
+  native Codex threads included. News of an unloaded
   subagent thread, such as its archive, unarchive or delete with its chat,
   still reaches whoever follows its chat. An unloaded thread stays readable:
   `thread/read` and `thread/list` return it with its stored status (`idle`,

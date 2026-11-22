@@ -741,6 +741,10 @@ export class CodexClaudeAppServer {
   // Ephemeral threads whose latest turn is a structured helper turn (a title,
   // description or summary), until that turn's work ends and they unload.
   private helperThreads = new Set<string>()
+  // Whether each loaded thread is a subagent's, which never changes, so an
+  // unload sweep reads only those (unloadFinishedThreads). A sweep runs after
+  // every request the native bridge routes.
+  private subagentByThread = new Map<string, boolean>()
   private unloadScheduled = false
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
@@ -4621,10 +4625,7 @@ export class CodexClaudeAppServer {
     // summary model, for that turn alone; it never rebinds the thread's.
     const initialThread = structuredClone(thread)
     const summaryTurn = params.outputSchema != null
-    // On an ephemeral thread that is a helper's turn: the thread unloads once
-    // the turn's work ends, whether or not its client unsubscribes.
-    if (summaryTurn && thread.ephemeral) this.helperThreads.add(threadId)
-    else this.helperThreads.delete(threadId)
+    if (thread.ephemeral) this.markHelperTurn(threadId, summaryTurn)
     const requestedModel = modelFromParams(params, thread.model)
     // A helper thread on Claude maps a Codex model like thread/start does.
     // App rule: helper-thread-model
@@ -10955,6 +10956,7 @@ export class CodexClaudeAppServer {
         }
       },
       checkIdle: () => this.checkIdle(),
+      markHelperTurn: (threadId, structured) => this.markHelperTurn(threadId, structured),
     })
   }
 
@@ -11513,6 +11515,15 @@ export class CodexClaudeAppServer {
     return false
   }
 
+  // A turn on an ephemeral thread: a structured one (a title, description or
+  // summary) makes it a helper's thread, which unloads once the turn's work
+  // ends, whether or not its client unsubscribes. The native bridge reports
+  // the turns it runs here too.
+  private markHelperTurn(threadId: string, structured: boolean): void {
+    if (structured) this.helperThreads.add(threadId)
+    else this.helperThreads.delete(threadId)
+  }
+
   // Unloads the threads whose work just ended, once the notifications that
   // end it have gone out.
   private scheduleUnload(): void {
@@ -11540,14 +11551,17 @@ export class CodexClaudeAppServer {
         this.unloadThread(threadId)
       }
       for (const threadId of [...this.subscribersByThread.keys()]) {
+        // A thread found not to be a subagent's is not read again.
+        if (this.subagentByThread.get(threadId) === false) continue
         const thread = this.store.getThread(threadId)
-        if (
-          thread?.threadSource === 'subagent' &&
-          thread.status.type !== 'active' &&
-          !this.runsWork(threadId)
-        )
+        if (!thread) continue
+        const subagent = thread.threadSource === 'subagent'
+        this.subagentByThread.set(threadId, subagent)
+        if (subagent && thread.status.type !== 'active' && !this.runsWork(threadId))
           this.unloadThread(threadId)
       }
+      for (const threadId of this.subagentByThread.keys())
+        if (!this.subscribersByThread.has(threadId)) this.subagentByThread.delete(threadId)
     } catch (error) {
       // A store that cannot be read now leaves them loaded until the next
       // time. This runs inside setImmediate, where a throw stops the daemon.

@@ -273,9 +273,10 @@ versioning or publishing metadata.
 - `thread/loaded/list` no longer keeps every subagent and helper thread a
   client ever followed. A subagent thread is loaded while its agent runs and
   unloads when the agent is done, and an ephemeral thread unloads once its
-  structured helper turn (a title, description or summary) ends: their
-  followers are dropped and get `thread/closed`, as after `thread/unsubscribe`
-  (the App opts out of it). `thread/resume` still follows a chat's forks, but
+  structured helper turn (a title, description or summary) ends, on Claude
+  and native Codex chats alike: their followers are dropped and get
+  `thread/closed`, as after `thread/unsubscribe` (the App opts out of it).
+  `thread/resume` of a chat the adapter runs still follows its forks, but
   its subagent threads and ephemeral forks only while they run; it used to
   follow every one of them, finished or not, on each resume. A finished agent
   that runs again (a `SendMessage`) is followed by whoever follows its chat by
@@ -284,7 +285,10 @@ versioning or publishing metadata.
   observer that reads every loaded thread every few seconds, the list held
   hundreds of finished agent threads. Chats stay loaded while a client follows
   them, and `thread/unsubscribe` answers `notLoaded`, as Codex does, for a
-  thread no client follows. (#356)
+  thread no client follows. With native Codex on, reading a native thread
+  (`thread/read`, `thread/turns/list` and the other read-only requests) no
+  longer makes the reader follow it, as in Codex; an observer that read every
+  chat used to keep them all loaded until it disconnected. (#361)
 - Codex App 26.1111.71704 is a verified build too, and the upgrade baseline.
   Its Codex, `0.169.1`, has the same app-server protocol as 26.1111.21308's,
   its gates are unchanged, and the one new method-shaped name in its scripts,
