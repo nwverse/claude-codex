@@ -48,7 +48,11 @@ test('a queued message started after a turn keeps the adapter busy until its own
     const threadId = await app.startThread()
     const first = await app.startTurn(threadId, '[hold] first')
     const releaseFirst = await app.waitFor(() => releases.get(first))
-    await app.request('thread/queue/add', { threadId, input: text('[hold] queued') })
+    const { queuedSubmission } = await app.request('thread/queue/add', {
+      threadId,
+      input: [{ type: 'text', text: '[hold] queued' }],
+    })
+    assert.deepEqual(queuedSubmission.input, text('[hold] queued'))
     releaseFirst()
     await app.turnCompleted(first)
 

@@ -31,7 +31,7 @@ test('every follower of a thread gets its events; the others get the user messag
     const threadId = await startThread(a)
     await b.request('thread/resume', { threadId })
 
-    await a.request('turn/start', { threadId, input: textInput('hello from a') })
+    await a.request('turn/start', { threadId, input: [{ type: 'text', text: 'hello from a' }] })
     const seenA = await a.until((message) => message.method === 'turn/completed')
     const seenB = await b.until((message) => message.method === 'turn/completed')
 
@@ -42,7 +42,9 @@ test('every follower of a thread gets its events; the others get the user messag
     // A drew its own message; B did not send it, so it is told.
     assert.equal(userMessages(seenA).length, 0)
     assert.equal(userMessages(seenB).length, 2)
-    assert.equal(userMessages(seenB)[0].params.item.content[0].text, 'hello from a')
+    for (const message of userMessages(seenB)) {
+      assert.deepEqual(message.params.item.content, textInput('hello from a'))
+    }
   })
 })
 

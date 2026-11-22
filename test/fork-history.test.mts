@@ -126,6 +126,47 @@ async function withHome(run: (start: () => AppServer, home: string) => Promise<v
 
 const ids = (turns: Array<{ id: string }>): string[] => turns.map((turn) => turn.id)
 
+test('old user messages and queued follow-ups have text elements when reopened', async () => {
+  await withHome(async (start, home) => {
+    const server = start()
+    const threadId = await server.startThread()
+    const plain = { type: 'text', text: 'continue' }
+    const annotated = {
+      type: 'text',
+      text: '@docs',
+      text_elements: [{ byteRange: { start: 0, end: 5 }, placeholder: '@docs' }],
+    }
+    const mention = { type: 'mention', name: 'docs', path: '/docs' }
+    const input = [plain, annotated, mention]
+    const item = { type: 'userMessage', id: 'message', clientId: 'client', content: input }
+    const queued = { id: 'queued', clientUserMessageId: 'queued-client', input }
+    const db = new DatabaseSync(join(home, 'claude-codex-adapter', 'state.sqlite'))
+    try {
+      db.prepare('INSERT INTO turns (id, thread_id, status, items_json) VALUES (?, ?, ?, ?)').run(
+        'turn',
+        threadId,
+        'failed',
+        JSON.stringify([item]),
+      )
+      db.prepare('INSERT INTO thread_queues (thread_id, items_json) VALUES (?, ?)').run(
+        threadId,
+        JSON.stringify([queued]),
+      )
+    } finally {
+      db.close()
+    }
+
+    const expected = [{ ...plain, text_elements: [] }, annotated, mention]
+    const queue = await server.request('thread/queue/list', { threadId })
+    assert.deepEqual(queue.data, [{ ...queued, input: expected }])
+    const resumed = await server.request('thread/resume', { threadId })
+    assert.deepEqual(resumed.thread.turns[0].items, [{ ...item, content: expected }])
+    const { thread: fork } = await server.request('thread/fork', { threadId })
+    const listed = await server.request('thread/items/list', { threadId: fork.id })
+    assert.deepEqual(listed.data[0].item, { ...item, content: expected })
+  })
+})
+
 // Every turn of thread/turns/list, page by page.
 async function listedTurns(
   server: AppServer,
