@@ -982,6 +982,42 @@ test('archive and delete end the native turns of a chat’s subagent threads', a
   }
 })
 
+test('a native subagent thread is loaded while its turn runs and unloads once it ends', async () => {
+  const app = startAdapter({ env: { FAKE_SUBAGENT: '1' } })
+  try {
+    const threadId = await startChat(app)
+    const { seen } = await runTurn(app, threadId, 'accept')
+    const spawned = seen.find(
+      (message) =>
+        message.method === 'thread/started' && message.params.thread.parentThreadId === threadId,
+    )
+    assert.ok(spawned, 'no subagent thread')
+    const agentId = spawned.params.thread.id as string
+    const loaded = async () =>
+      ((await app.request('thread/loaded/list', {})).result.data as string[]).toSorted()
+    assert.deepEqual(await loaded(), [threadId, agentId].toSorted())
+
+    // The subagent's turn ends; its thread stays readable.
+    const turnId = seen.find(
+      (message) => message.method === 'turn/started' && message.params.threadId === agentId,
+    ).params.turn.id
+    assert.equal(
+      (await app.request('turn/interrupt', { threadId: agentId, turnId })).error,
+      undefined,
+    )
+    await app.reader.until(
+      (message) => message.method === 'turn/completed' && message.params.threadId === agentId,
+    )
+    assert.deepEqual(await loaded(), [threadId])
+    await app.reader.until(
+      (message) => message.method === 'thread/closed' && message.params.threadId === agentId,
+    )
+    assert.equal((await app.request('thread/read', { threadId: agentId })).error, undefined)
+  } finally {
+    await app.stop()
+  }
+})
+
 test('an inline review Codex answers with its turn holds the chat until that turn ends', async () => {
   const app = startAdapter({
     env: { FAKE_REVIEW_TURN: '1', CLAUDE_CODEX_NATIVE_TURN_WAIT_MS: '300' },

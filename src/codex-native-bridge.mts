@@ -164,6 +164,16 @@ export class CodexNativeBridge {
     )
   }
 
+  // The same for one thread: its turn, one Codex has yet to announce, a
+  // claiming request on its way, or a request of its turn waiting on a
+  // client. A subagent thread with none of them unloads.
+  runsThread(threadId: string): boolean {
+    if (this.holdsClaim(threadId) || this.startingTurns.has(threadId)) return true
+    for (const pending of this.pendingRequests.values())
+      if (pending.threadId === threadId) return true
+    return false
+  }
+
   async stop(): Promise<void> {
     this.stopped = true
     this.clearIdleTimer()
