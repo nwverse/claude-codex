@@ -537,6 +537,11 @@ export interface RuntimeTurnContext {
   // Its Claude session opens with the parent's history, all older than this,
   // and what Claude left scheduled or running there stays the parent's.
   forkedAt?: number | null
+  // false: the session writes no Claude Code transcript (the SDK's
+  // persistSession), for a helper turn nothing resumes later, which other
+  // tools would list as the user's session. A fork still reads the
+  // transcript it resumes. Unset persists; backends without it ignore it.
+  persistSession?: boolean
   mcpServers: unknown | null
   allowedTools: string[] | null
   // Tools Claude must not use, as permission rules (the CLI's --disallowedTools).

@@ -941,6 +941,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       opts.resumeSessionAt = context.resumeSessionAt
       opts.forkSession = true
     }
+    // A helper turn leaves no transcript in the config folder. A fork still
+    // starts from the transcript it resumes.
+    if (context.persistSession === false) opts.persistSession = false
 
     // Ensure extended cache TTL is explicitly requested
     if (!process.env.ANTHROPIC_BETAS) {
@@ -4658,6 +4661,7 @@ export function sessionSignature(context: RuntimeTurnContext): string {
     context.thinkingDisplay ?? null,
     context.autoCompactWindow ?? null,
     context.enableFileCheckpointing === true,
+    context.persistSession === false,
   ])
 }
 

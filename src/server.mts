@@ -172,6 +172,7 @@ import {
   fileChangeFromTool,
   gitDiff,
   hasLegacyPermissionParams,
+  helperThread,
   isSubagentToolName,
   listFiles,
   modelFromParams,
@@ -4450,6 +4451,8 @@ export class CodexClaudeAppServer {
         effort: resolveClaudeEffort(thread.reasoningEffort ?? null),
         claudeSessionId: null,
         forkSession: false,
+        // Nothing resumes this session: it leaves no transcript.
+        persistSession: false,
         mcpServers: null,
         allowedTools: ['Read', 'Glob', 'Grep'],
         // With web search off, the summary cannot search either.
@@ -5186,6 +5189,7 @@ export class CodexClaudeAppServer {
       // parent is older than the second after it.
       forkedAt:
         !isCodexThread && thread.forkedFromId != null ? (thread.createdAt + 1) * 1000 : null,
+      ...(helperThread(thread) ? { persistSession: false } : {}),
       mcpServers: mcp.sdkValue,
       allowedTools: defaultAllowedTools(),
       inheritedAllowedTools: permissionRules?.allow ?? null,
