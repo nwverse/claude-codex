@@ -116,6 +116,8 @@ commit API keys, OAuth/session data, `.env` files, or acceptance-test logs.
 
 Full walkthrough → **[Getting started](https://nwverse.github.io/claude-codex/guide/getting-started)**.
 
+With a local Persona node, the optional [Persona companion](scripts/persona/README.md) exposes this adapter’s threads, read state and model controls in Agents.
+
 ## How it works
 
 ```
