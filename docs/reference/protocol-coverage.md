@@ -25,8 +25,9 @@ Implemented as real remote/runtime behavior:
   structured helper turn (a title, description or summary) ends: its followers
   are dropped and get `thread/closed`, as after `thread/unsubscribe`. That
   holds for a client that resumed the subagent thread itself too. Opening a
-  chat the adapter runs follows its forks, and its subagent threads and
-  ephemeral forks while they run; opening a native Codex chat follows the chat
+  chat the adapter runs follows its forks, any open ephemeral side chat another
+  client still follows, and its subagent threads and helper forks while they
+  run; opening a native Codex chat follows the chat
   alone, and its running subagent threads are followed by whoever follows it
   once they report. A finished agent that runs again (a `SendMessage`) is
   followed by whoever follows its chat by then, until it is done. Reading a

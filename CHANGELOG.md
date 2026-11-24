@@ -276,9 +276,12 @@ versioning or publishing metadata.
   structured helper turn (a title, description or summary) ends, on Claude
   and native Codex chats alike: their followers are dropped and get
   `thread/closed`, as after `thread/unsubscribe` (the App opts out of it).
-  `thread/resume` of a chat the adapter runs still follows its forks, but
-  its subagent threads and ephemeral forks only while they run; it used to
-  follow every one of them, finished or not, on each resume. A finished agent
+  `thread/resume` of a chat the adapter runs still follows its forks and any
+  open ephemeral side chat another client still follows, and its subagent
+  threads and helper forks only while they run; it used to follow every one of
+  them, finished or not, on each resume. `thread/loaded/list` now pages over
+  sorted loaded thread ids with a cursor keyed on the last returned id, so
+  unloads between pages cannot skip a live chat. A finished agent
   that runs again (a `SendMessage`) is followed by whoever follows its chat by
   then, and a notification about a finished one still reaches its chat's
   followers without loading it again. On a daemon that ran for weeks with an

@@ -492,3 +492,130 @@ test('a client that leaves takes the threads only it followed off the list', asy
     assert.deepEqual(await loaded(app), [chat])
   })
 })
+
+test('paged thread/loaded/list does not skip live chats when threads unload between pages', async () => {
+  const runtime = agentsRuntime()
+  await withInProcessApp(runtime, async (app) => {
+    const chat = await app.startThread({ cwd: app.home })
+    await app.turnCompleted(await app.startTurn(chat, 'agents'))
+    const { 'background work': background } = children(app)
+    assert.ok(background)
+
+    // Ensure at least one live chat sorts strictly after the background agent
+    // so page 1 can end right on the background agent and still have later
+    // pages.
+    const chats = [chat]
+    while (!chats.some((id) => id > background)) {
+      chats.push(await app.startThread({ cwd: app.home }))
+    }
+
+    const observer = connect(app.server, 'observer')
+    const full = (await observer.request('thread/loaded/list', {})).data as string[]
+    assert.deepEqual(full, [...chats, background].toSorted())
+    const bgIndex = full.indexOf(background)
+    assert.ok(bgIndex >= 0 && bgIndex < full.length - 1)
+
+    // Page 1 ends at the background agent (so the cursor is keyed on it).
+    const first = await observer.request('thread/loaded/list', { limit: bgIndex + 1 })
+    assert.deepEqual(first.data, full.slice(0, bgIndex + 1))
+    assert.ok(typeof first.nextCursor === 'string')
+
+    // The background agent finishes and unloads before page 2 is fetched.
+    await finishBackground(runtime, chat)
+    await app.waitFor(() => (closed(app).includes(background) ? true : undefined))
+
+    const seen = [...(first.data as string[])]
+    let cursor: string | null = first.nextCursor
+    while (cursor != null) {
+      const page = await observer.request('thread/loaded/list', { cursor, limit: 1 })
+      seen.push(...(page.data as string[]))
+      cursor = page.nextCursor
+    }
+    for (const liveChat of chats) {
+      assert.ok(seen.includes(liveChat), `live chat ${liveChat} must not be skipped across pages`)
+    }
+    assert.equal(
+      seen.filter((id) => id === background).length,
+      1,
+      'unloaded agent appears only on the page fetched before it finished',
+    )
+
+    // Also verify a removal strictly before the cursor does not shift later
+    // pages: with at least 3 live chats, removing the first between pages must
+    // still return the last.
+    while (chats.length < 3) chats.push(await app.startThread({ cwd: app.home }))
+    const sortedChats = chats.toSorted()
+    const p1 = await observer.request('thread/loaded/list', { limit: 2 })
+    assert.deepEqual(p1.data, sortedChats.slice(0, 2))
+    assert.ok(typeof p1.nextCursor === 'string')
+    await app.request('thread/unsubscribe', { threadId: sortedChats[0] })
+    const p2 = await observer.request('thread/loaded/list', {
+      cursor: p1.nextCursor,
+      limit: sortedChats.length,
+    })
+    assert.deepEqual(p2, { data: sortedChats.slice(2), nextCursor: null })
+  })
+})
+
+test('a second client follows an open idle side chat and hears its later turns, without loading closed or helper forks', async () => {
+  await withInProcessApp(agentsRuntime(), async (app) => {
+    const chat = await app.startThread({ cwd: app.home })
+    await app.turnCompleted(await app.startTurn(chat, 'hello'))
+
+    // An open side chat that ran a turn and is now idle while `app` still
+    // follows it.
+    const openSide = (await app.request('thread/fork', { threadId: chat, ephemeral: true })).thread
+      .id
+    await app.turnCompleted(await app.startTurn(openSide, 'first side question'))
+
+    // A side chat that `app` already closed (unsubscribed).
+    const closedSide = (await app.request('thread/fork', { threadId: chat, ephemeral: true }))
+      .thread.id
+    await app.turnCompleted(await app.startTurn(closedSide, 'closed side question'))
+    await app.request('thread/unsubscribe', { threadId: closedSide })
+
+    // A finished description helper fork that already unloaded.
+    const descFork = (
+      await app.request('thread/fork', {
+        threadId: chat,
+        ephemeral: true,
+        threadSource: 'thread_description',
+      })
+    ).thread.id
+    await app.turnCompleted(
+      await app.startTurn(descFork, 'describe this chat', {
+        outputSchema: { type: 'object', properties: { description: { type: 'string' } } },
+      }),
+    )
+    await app.waitFor(() => (closed(app).includes(descFork) ? true : undefined))
+
+    // A second window resumes the chat while `openSide` is idle.
+    const late = connect(app.server, 'late')
+    await late.request('thread/resume', { threadId: chat })
+    assert.deepEqual(followers(app.server, openSide), ['app', 'late'])
+    assert.deepEqual(followers(app.server, closedSide), [])
+    assert.deepEqual(followers(app.server, descFork), [])
+    assert.deepEqual(await loaded(late), [chat, openSide].toSorted())
+
+    // `app` runs a second turn on `openSide`; `late` hears it too.
+    const secondTurn = await app.startTurn(openSide, 'second side question')
+    await app.turnCompleted(secondTurn)
+    await late.until(() =>
+      late
+        .notified('turn/started')
+        .find((params) => params.threadId === openSide && params.turn.id === secondTurn),
+    )
+    await late.until(() =>
+      late
+        .notified('turn/completed')
+        .find((params) => params.threadId === openSide && params.turn.id === secondTurn),
+    )
+    assert.deepEqual(await loaded(late), [chat, openSide].toSorted())
+
+    // Once both clients unsubscribe from the side chat, only the chat stays
+    // loaded.
+    await app.request('thread/unsubscribe', { threadId: openSide })
+    await late.request('thread/unsubscribe', { threadId: openSide })
+    assert.deepEqual(await loaded(app), [chat])
+  })
+})

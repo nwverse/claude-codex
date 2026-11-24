@@ -709,6 +709,16 @@ function unknownThread(threadId: string): RpcError {
   return invalidRequest(`unknown thread: ${threadId}`)
 }
 
+// Opaque cursor for thread/loaded/list: the last thread id returned by the
+// previous page over sorted loaded ids, so unloads between pages cannot shift
+// or skip later threads.
+function loadedThreadCursor(value: unknown): string | null {
+  if (value == null) return null
+  if (typeof value !== 'string' || !value.startsWith('after:') || value.length === 6)
+    throw invalidRequest('invalid loaded thread cursor')
+  return value.slice(6)
+}
+
 // What decides whether a thread is followed along with the chat it hangs off
 // (followedWithAncestor), read from its record.
 function followState(thread: ThreadRecord): DescendantThread {
@@ -2690,17 +2700,21 @@ export class CodexClaudeAppServer {
   }
 
   // The threads clients follow, as Codex lists the threads it holds in
-  // memory. A listing first unloads the subagent and helper threads whose
-  // work ended, on its first page only, so its later pages keep their offsets.
+  // memory. Sorted ids with a cursor keyed on the last returned thread id keep
+  // unloads (a sweep here, a turn/agent end, or an unsubscribe) from shifting
+  // or skipping threads on later pages.
   private threadLoadedList(params: Record<string, unknown>): unknown {
-    const offset = offsetCursor(params.cursor, 'loaded thread')
-    if (offset === 0) this.unloadFinishedThreads()
-    const loaded = Array.from(this.subscribersByThread.keys())
-    const limit = pageLimit(params.limit) ?? (loaded.length || 50)
-    const end = offset + limit
+    const after = loadedThreadCursor(params.cursor)
+    this.unloadFinishedThreads()
+    const loaded = Array.from(this.subscribersByThread.keys()).sort()
+    const remaining = after == null ? loaded : loaded.filter((id) => id > after)
+    const limit = pageLimit(params.limit)
+    const data = limit == null ? remaining : remaining.slice(0, limit)
+    const last = data.at(-1)
+    const hasMore = limit != null && remaining.length > limit
     return {
-      data: loaded.slice(offset, end),
-      nextCursor: end < loaded.length ? String(end) : null,
+      data,
+      nextCursor: hasMore && last != null ? `after:${last}` : null,
     }
   }
 
@@ -11472,19 +11486,26 @@ export class CodexClaudeAppServer {
   }
 
   // A client that opens a chat follows what hangs below it that it would
-  // see live: its forks, and its subagent threads and ephemeral forks while
-  // they run. Finished ones stay unloaded.
+  // see live: its forks, any open ephemeral side chat another client still
+  // follows, and its subagent threads and helper forks while they run.
+  // Finished agents, finished helper forks and closed side chats stay unloaded.
   private bindPeerToDescendants(peer: RpcPeer, rootThreadId: string): void {
     for (const descendant of this.store.descendantThreads(rootThreadId))
       if (this.followedWithAncestor(descendant)) this.subscribe(descendant.id, peer)
   }
 
   // Whether a thread is followed along with the chat it hangs off, by
-  // whoever follows that chat: a chat (a fork too) always, a subagent's or
-  // another ephemeral thread (a helper's, a side chat) only while it runs.
+  // whoever follows that chat: a persistent fork always; a subagent or helper
+  // fork only while it runs; an ephemeral side chat while it runs or while
+  // another client still keeps it open.
   private followedWithAncestor(thread: DescendantThread): boolean {
     if (!thread.ephemeral && thread.threadSource !== 'subagent') return true
-    return thread.active || this.runsWork(thread.id)
+    if (thread.active || this.runsWork(thread.id)) return true
+    return (
+      thread.threadSource !== 'subagent' &&
+      !this.helperThreads.has(thread.id) &&
+      this.subscribersByThread.has(thread.id)
+    )
   }
 
   // Whether this adapter runs anything on the thread or waits on a client
