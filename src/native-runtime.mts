@@ -290,6 +290,13 @@ interface LiveSession {
   // compaction falls back to; `/compact` itself runs in the thread's session.
   reusable: boolean
   signature: string
+  // Fixed at launch; permissionMode below can instead be auto or unconfirmed.
+  readonly permissionSignature: string
+  // Set before a replacement closes this session. A late endSession must not
+  // release thread-wide background state after the replacement owns it.
+  superseded: boolean
+  // Session release is a thread-wide callback; emit it at most once.
+  releaseNotified: boolean
   lastContext: RuntimeTurnContext
   // The environment the CLI runs with: its CLAUDE_CONFIG_DIR is where the
   // session's transcripts live (a model process profile has its own).
@@ -438,20 +445,33 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     const sdk = await this.loadSdk()
-    if (context.continuation) return this.attachContinuation(context, handlers)
+    if (context.continuation) {
+      // A continuation consumes output Claude already produced. It is receive-only
+      // and must not be turned into a new prompt merely because its policy fields
+      // differ from the process that produced the report.
+      return this.attachContinuation(context, handlers)
+    }
     const draining = this.sessions.get(context.threadId)
     if (draining && !draining.closed && draining.sink) await this.drainSink(draining)
     const live = this.sessions.get(context.threadId)
     // A session still waiting for the launch slot has nothing to reuse yet.
     if (live && !live.closed && live.query && this.isReusable(context)) {
       if (
-        live.signature === sessionSignature(context) ||
-        this.hasLiveWork(live) ||
-        this.holdsCronJobs(live)
+        this.nativeModesCompatible(live, context) &&
+        (live.signature === sessionSignature(context) ||
+          this.hasLiveWork(live) ||
+          this.holdsCronJobs(live))
       ) {
         return this.attachTurn(live, context, handlers, false)
       }
-      this.closeSession(live)
+      if (!this.nativeModesCompatible(live, context)) {
+        // bypassPermissions is a launch-time boundary. Do not put a new
+        // prompt into a live process with the other effective mode, even when
+        // background work or cron jobs would otherwise keep it reusable.
+        await this.retireIncompatibleSession(live)
+      } else {
+        this.closeSession(live)
+      }
     }
     return this.openSession(sdk, context, handlers)
   }
@@ -474,8 +494,24 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const session = pending.session
     if (session.firstPrompt) {
       await session.firstPrompt
-      if (session.closed) return false
+      // The first-prompt control sequence may have failed or another turn may
+      // have replaced this owner while the steer was waiting. Never enqueue a
+      // late steer into whichever session happens to be current now.
+      if (
+        session.closed ||
+        pending.resolved ||
+        session.current !== pending ||
+        this.turns.get(pending.context.turnId) !== pending
+      )
+        return false
     }
+    if (
+      session.closed ||
+      pending.resolved ||
+      session.current !== pending ||
+      this.turns.get(pending.context.turnId) !== pending
+    )
+      return false
     const uuid = this.send(
       session,
       this.buildUserMessage(prompt, options.imageInputs ?? [], options.promptContext ?? []),
@@ -1040,14 +1076,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     if (context.outputFormat) opts.outputFormat = context.outputFormat
 
-    // Codex App's pinned policies map onto Claude SDK's permissionMode. plan
-    // mode supersedes everything. Relay rejects the SDK's dangerous bypass
-    // flag outside a recognized container sandbox, so App-level Full Access
-    // stays in default mode and auto-allows through canUseTool below. An
-    // explicit env override can still opt into bypassPermissions. The mode is
-    // always named: newer Claude Code releases changed the default for SDK
-    // sessions that name none. Auto review switches to 'auto' after launch,
-    // once the model is known to support it.
+    // Codex App's pinned policies map onto Claude SDK's permissionMode. Plan
+    // mode supersedes everything. Full Access uses bypassPermissions with its
+    // required dangerous opt-in; its narrow canUseTool callback is retained
+    // only so the SDK can forward calls marked requiresUserInteraction.
+    // Restricted policies retain the normal callback path. Auto review
+    // switches to 'auto' after launch, once the model is known to support it.
     const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
     opts.permissionMode = mode
     if (mode === 'bypassPermissions') opts.allowDangerouslySkipPermissions = true
@@ -1059,16 +1093,17 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       opts.env = { ...(opts.env as NodeJS.ProcessEnv), CLAUDE_CODE_WORKFLOWS: '1' }
     }
 
-    // Per-tool approval round-trip with Codex App. In App-level Full Access,
-    // the bridge auto-allows every permission request without surfacing a UI
-    // prompt. Plan mode needs the callback too: it carries AskUserQuestion and
-    // ExitPlanMode to the App and allows goal bookkeeping (a bare allowedTools
-    // entry would shadow the callback and make the SDK warn on every
-    // session). Explicit SDK bypass omits it because Claude never calls it in
-    // that mode.
-    if (mode !== 'bypassPermissions') {
-      opts.canUseTool = this.makeCanUseTool(sessionRef)
-    }
+    // Per-tool approval round-trip with Codex App. Restricted modes and plan
+    // mode use the full bridge: it carries AskUserQuestion and ExitPlanMode to
+    // the App and allows goal bookkeeping. Full Access deliberately does not
+    // use that bridge for ordinary permissions. The SDK still requires a
+    // narrow callback for user-only interactions, though: without one the
+    // bundled CLI disables AskUserQuestion altogether. Its fail-closed wrapper
+    // rejects every callback that is not explicitly marked as user-only.
+    opts.canUseTool =
+      mode === 'bypassPermissions'
+        ? this.makeFullAccessInteractionHandler(sessionRef)
+        : this.makeCanUseTool(sessionRef)
     // MCP elicitations go to the App in every mode: they ask the user for
     // data, not for permission.
     opts.onElicitation = (request: Record<string, unknown>, options: { signal: AbortSignal }) =>
@@ -1095,6 +1130,30 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return opts
   }
 
+  private makeFullAccessInteractionHandler(sessionRef: () => LiveSession | null) {
+    const interactive = this.makeCanUseTool(sessionRef)
+    return async (
+      toolName: string,
+      input: Record<string, unknown>,
+      options: { signal: AbortSignal; requiresUserInteraction?: boolean; [key: string]: unknown },
+    ) => {
+      // Native bypassPermissions is the ordinary Full Access policy. Never
+      // turn this narrow SDK callback into a second permission bridge: a
+      // callback without the SDK's user-only marker is rejected, even if a
+      // managed rule or an explicit ask would otherwise look approvable.
+      if (options.requiresUserInteraction !== true) {
+        return {
+          behavior: 'deny' as const,
+          message: `${toolName} was denied: Full Access only forwards interactions that require the user.`,
+        }
+      }
+      // AskUserQuestion and other user-only asks keep their real App-facing
+      // paths in makeCanUseTool. That helper never auto-answers user-only
+      // calls and marks generic approval events with requiresUser: true.
+      return interactive(toolName, input, options)
+    }
+  }
+
   private makeCanUseTool(sessionRef: () => LiveSession | null) {
     return async (
       toolName: string,
@@ -1114,23 +1173,24 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       | { behavior: 'allow'; updatedInput?: unknown; updatedPermissions?: unknown[] }
       | { behavior: 'deny'; message: string; interrupt?: boolean }
     > => {
-      if (GOAL_TOOL_NAMES.has(toolName) || toolName === SESSION_CHANGES_TOOL)
-        return { behavior: 'allow' }
-      if (options.signal.aborted) return { behavior: 'deny', message: 'cancelled' }
-      const toolUseId = options.toolUseID || `tool-${newId()}`
       // Claude Code says the user has to answer this ask themselves (the card
       // is the tool's own interface, or its disclosure only shows locally): no
       // policy of the thread answers it, in any mode, auto review included.
       // App rule: auto-review
       const userOnly = options.requiresUserInteraction === true
+      if (!userOnly && (GOAL_TOOL_NAMES.has(toolName) || toolName === SESSION_CHANGES_TOOL))
+        return { behavior: 'allow' }
+      if (options.signal.aborted) return { behavior: 'deny', message: 'cancelled' }
+      const toolUseId = options.toolUseID || `tool-${newId()}`
       const session = sessionRef()
       // As in Codex, a dynamic tool runs without an approval prompt: the
       // client that registered it answers the call.
-      if (session && dynamicToolNames(session.lastContext).has(toolName))
+      if (!userOnly && session && dynamicToolNames(session.lastContext).has(toolName))
         return { behavior: 'allow' }
       // The chats leader tools start ask for their own approvals. A plan only
       // looks: plan mode turns away starting or prompting another chat.
       if (
+        !userOnly &&
         LEADER_TOOL_NAMES.has(toolName) &&
         (LEADER_PLAN_TOOL_NAMES.has(toolName) ||
           !session ||
@@ -1438,6 +1498,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         abort,
         reusable,
         signature: sessionSignature(context),
+        permissionSignature: launchPermissionSignature(context),
+        superseded: false,
+        releaseNotified: false,
         lastContext: context,
         transcriptEnv: process.env,
         model: context.model,
@@ -1491,24 +1554,36 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       this.turns.set(context.turnId, pending)
       if (reusable) {
         const previous = this.sessions.get(context.threadId)
-        if (previous && previous !== opened) this.closeSession(previous)
+        if (previous && previous !== opened) {
+          previous.superseded = true
+          this.closeSession(previous)
+        }
         this.sessions.set(context.threadId, opened)
       }
       if (settlesMode)
         opened.firstPrompt = this.serialize(opened, async () => {
-          try {
-            // Only a running Claude Code can say which modes it has.
-            if (launch) await launch
-            if (opened.query) await this.applyPermissionMode(opened, context, handlers)
-          } finally {
-            if (!opened.closed) this.send(opened, this.buildPromptMessage(context))
-            opened.firstPrompt = null
-          }
-        }).catch((error: unknown) => {
+          // Only a running Claude Code can say which modes it has. A launch
+          // failure is returned as a value by launchCli(), so do not mistake a
+          // rejected native start for a successful permission handshake.
+          const launchFailure = launch ? await launch : null
+          if (launchFailure) throw launchFailure
+          if (opened.query) await this.applyPermissionMode(opened, context, handlers)
+          // Never send the user's prompt until the permission control has been
+          // confirmed. In particular, a rejected/timeout control must not let
+          // the prompt run under an unknown mode.
+          if (!opened.closed) this.send(opened, this.buildPromptMessage(context))
+          opened.firstPrompt = null
+        }).catch(async (error: unknown) => {
+          const failure = error instanceof Error ? error : new Error(String(error))
           debugLog('native.session.auto_mode_failed', {
             threadId: context.threadId,
-            error: error instanceof Error ? error.message : String(error),
+            error: failure.message,
           })
+          const pending = opened.current
+          if (pending && !pending.resolved) await this.finishTurnAtSessionEnd(pending, failure)
+          opened.firstPrompt = null
+          this.closeSession(opened)
+          opened.abort.abort()
         })
       // Run the receive loop in the background. runTurn() resolves when this
       // turn's result arrives; the loop itself runs for the session.
@@ -1846,11 +1921,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       session.permissionMode !== 'bypassPermissions' &&
       query.setPermissionMode
     ) {
-      session.permissionMode = mode
-      await settlesWithin(
-        query.setPermissionMode(mode).catch(() => {}),
-        SESSION_CONTROL_TIMEOUT_MS,
-      )
+      try {
+        await sessionControl(query.setPermissionMode(mode), 'permission mode')
+        // Do not advertise a mode until Claude has confirmed the control
+        // request. A timeout may still apply the request later, so the next
+        // turn must not assume either outcome and will reconcile it again.
+        session.permissionMode = mode
+      } catch (error) {
+        session.permissionMode = 'unconfirmed'
+        throw error
+      }
     }
   }
 
@@ -2374,7 +2454,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // A superseded session winds down after its replacement registered; the
     // thread's background work now belongs to the replacement.
     const registered = this.sessions.get(session.threadId)
-    const superseded = registered != null && registered !== session
+    const superseded = session.superseded || (registered != null && registered !== session)
     if (registered === session) this.sessions.delete(session.threadId)
     // Release the CLI's stdin (see TurnInput).
     session.input.close()
@@ -2398,7 +2478,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     session.backlog.length = 0
     const liveTasks = [...session.liveTasks]
     session.liveTasks.clear()
-    if (session.reusable && !superseded) {
+    if (session.reusable && !superseded && !session.releaseNotified) {
+      session.releaseNotified = true
       this.listener?.onSessionReleased(session.threadId, liveTasks)
     }
   }
@@ -2455,6 +2536,42 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         pending.reject(err instanceof Error ? err : new Error(String(err)))
       }
     }
+  }
+
+  private nativeModesCompatible(session: LiveSession, context: RuntimeTurnContext): boolean {
+    return session.permissionSignature === launchPermissionSignature(context)
+  }
+
+  private async retireIncompatibleSession(session: LiveSession): Promise<void> {
+    await this.serialize(session, async () => {
+      if (session.closed) return
+      const current = session.current
+      if (current) {
+        await this.stopSessionTasks(session, this.turnTaskIds(session, current))
+        await this.stopWorkflowTasks(current)
+        this.releaseTurn(current)
+        session.current = null
+      }
+      session.steers.clear()
+      session.backlog.length = 0
+      session.autonomousRequested = false
+      const liveTasks = [...session.liveTasks]
+      session.liveTasks.clear()
+      this.notifySessionReleased(session, liveTasks)
+      this.closeSession(session)
+      session.abort.abort()
+      if (session.query)
+        await settlesWithin(
+          session.query.interrupt().catch(() => {}),
+          SESSION_CONTROL_TIMEOUT_MS,
+        )
+    })
+  }
+
+  private notifySessionReleased(session: LiveSession, liveTasks: string[]): void {
+    if (!session.reusable || session.releaseNotified) return
+    session.releaseNotified = true
+    this.listener?.onSessionReleased(session.threadId, liveTasks)
   }
 
   private isReusable(context: RuntimeTurnContext): boolean {
@@ -4054,7 +4171,7 @@ function derivePermissionMode(
   const envOverride = configuredPermissionMode()
   if (envOverride) return envOverride
   if (planMode) return 'plan'
-  if (sandboxMode === 'danger-full-access' || approvalPolicy === 'never') return 'default'
+  if (approvalPolicy === 'never' && sandboxMode === 'danger-full-access') return 'bypassPermissions'
   // acceptEdits runs edits in the workspace without canUseTool, so only a
   // sandbox that lets the workspace be written takes it; anywhere else an
   // edit asks.
@@ -4488,17 +4605,12 @@ function plans(context: RuntimeTurnContext): boolean {
   )
 }
 
-// Codex's approval policy says "never ask" (or the sandbox is wide open) and
-// no explicit permission mode overrides it: tools run without a prompt. A
-// read-only sandbox that never asks runs only reads (readOnlyUnasked).
+// Codex's approval policy says "never ask" only together with its Full Access
+// sandbox. Other policies continue through the normal callback path; a read-only
+// never-ask thread is handled separately by readOnlyUnasked.
 function autoAllowsTools(context: RuntimeTurnContext): boolean {
   const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
-  return (
-    (configuredPermissionMode() === null &&
-      (context.sandboxMode === 'danger-full-access' ||
-        (context.approvalPolicy === 'never' && context.sandboxMode !== 'read-only'))) ||
-    mode === 'dontAsk'
-  )
+  return mode === 'bypassPermissions' || mode === 'dontAsk'
 }
 
 // A read-only sandbox in a thread that never asks, with no explicit
@@ -4626,6 +4738,34 @@ function configuredAllowedTools(context: RuntimeTurnContext): string[] {
 function readRule(rule: string): boolean {
   const name = /^(\w+)(?:\([^()]*\))?$/.exec(rule)?.[1]
   return name !== undefined && readsOnly(name)
+}
+
+// Launch rights cannot follow a turn into an already-running process. Keep
+// these separate from model, effort and presentation settings: background work
+// may pin the latter, but not a tool, directory, hook or sandbox capability.
+function launchPermissionSignature(context: RuntimeTurnContext): string {
+  return JSON.stringify([
+    derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode),
+    context.approvalPolicy,
+    context.sandboxMode,
+    context.cwd,
+    context.addDirs ?? [],
+    configuredAllowedTools(context),
+    inheritedAllowedTools(context),
+    context.inheritedAskRules ?? null,
+    context.disallowedTools ?? [],
+    context.mcpEnabledTools ?? null,
+    context.mcpServers ?? null,
+    context.agents ?? null,
+    context.dynamicTools ?? null,
+    Boolean(context.goalTools),
+    Boolean(context.leaderTools),
+    Boolean(context.sessionChanges),
+    context.claudeHooks ?? null,
+    context.claudeHooks?.length ? inheritedApprovals(context) : null,
+    context.modelProfileId ?? null,
+    context.modelProfileFingerprint ?? null,
+  ])
 }
 
 // Options a live CLI process cannot change in place. A turn whose signature

@@ -1261,6 +1261,110 @@ test('native auto review keeps the user as reviewer where auto mode is unavailab
   await runtime.stop()
 })
 
+test('native permission boundary replaces a live session without sending to the old process', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+
+  const first = runtime.runTurn(context, handlers([]))
+  const oldQuery = await waitFor(() => queries[0], 'full access session')
+  oldQuery.push(...launchBackgroundAgent('boundary-agent'))
+  await first
+  assert.equal(runtime.hasBackgroundWork(), true)
+
+  const secondEvents: RuntimeEvent[] = []
+  const second = runtime.runTurn(
+    {
+      ...context,
+      turnId: 'turn-2',
+      prompt: 'continue in the workspace sandbox',
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+    },
+    handlers(secondEvents),
+  )
+  const replacement = await waitFor(() => queries[1], 'restricted replacement session')
+  await waitFor(() => replacement.prompts.length === 1, 'replacement prompt')
+
+  assert.equal(oldQuery.closed, true, 'the old Full Access process must be retired')
+  assert.equal(
+    oldQuery.prompts.length,
+    1,
+    'the old process must not receive the replacement prompt',
+  )
+  assert.deepEqual(listener.released, [{ threadId: 'thread', liveTaskIds: ['boundary-agent'] }])
+
+  replacement.push(assistant('restricted', [text('workspace response')]), {
+    type: 'result',
+    subtype: 'success',
+    result: 'workspace response',
+  })
+  await second
+  assert.deepEqual(textDeltas(secondEvents), ['workspace response'])
+  await runtime.stop()
+})
+
+test('native permission control failures remain unconfirmed instead of being recorded as applied', async () => {
+  const { runtime } = fakeRuntime()
+  const calls: string[] = []
+  const fakeSession = {
+    query: {
+      setPermissionMode: async (mode: string) => {
+        calls.push(mode)
+        throw new Error('mode refused')
+      },
+    },
+    permissionMode: 'default',
+  }
+  const apply = Reflect.get(runtime, 'applyPermissionMode') as (
+    session: typeof fakeSession,
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+  ) => Promise<void>
+
+  await assert.rejects(
+    apply.call(
+      runtime,
+      fakeSession,
+      { ...context, approvalPolicy: 'on-request', sandboxMode: 'workspace-write', planMode: true },
+      handlers([]),
+    ),
+    /Claude Code rejected the permission mode: mode refused/,
+  )
+  assert.deepEqual(calls, ['plan'])
+  assert.equal(fakeSession.permissionMode, 'unconfirmed')
+  await runtime.stop()
+})
+
+test('native permission reconciliation failure rejects before sending the first prompt', async () => {
+  const { runtime, queries } = fakeRuntime(undefined, (query) => {
+    query.refuseMode = 'default'
+  })
+  // Simulate an auto-mode switch that left the CLI mode unconfirmed so the
+  // runtime must explicitly reconcile back to 'default' before sending the
+  // first prompt.
+  Reflect.set(runtime, 'switchToAutoMode', async (session: { permissionMode: string }) => {
+    session.permissionMode = 'unconfirmed'
+    return 'Claude Code did not confirm auto mode in time'
+  })
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(
+    { ...autoReviewContext, turnId: 'permission-failure', autoReview: true },
+    handlers(events),
+  )
+  const rejected = assert.rejects(
+    turn,
+    /Claude Code rejected the permission mode: default mode is disabled/,
+  )
+  const query = await waitFor(() => queries[0], 'permission-failure session')
+
+  await rejected
+  assert.equal(query.prompts.length, 0, 'a rejected permission control must not send the prompt')
+  assert.equal(query.closed, true, 'the failed session must be closed')
+  assert.ok(events.some((event) => event.type === 'error'))
+  await runtime.stop()
+})
+
 test('native model switch mid-turn sends the permission mode again for the new model', async () => {
   // A Plan turn stays in plan mode, whatever the CLI did with the switch.
   {

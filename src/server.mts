@@ -171,7 +171,6 @@ import {
   fallbackStructuredText,
   fileChangeFromTool,
   gitDiff,
-  hasLegacyPermissionParams,
   isSubagentToolName,
   listFiles,
   modelFromParams,
@@ -186,11 +185,10 @@ import {
   normalizeUserInputAnswers,
   nullIfEmpty,
   numberOr,
+  type PermissionProfileState,
   parseExitCodeFromResult,
   parseSubagentTrailer,
-  permissionProfileIdFromParams,
   permissionProfileList,
-  permissionProfilePolicy,
   plainTurnError,
   projectMetadata,
   projectName,
@@ -198,11 +196,11 @@ import {
   REVIEW_FALLBACK,
   reasoningEffortFromParams,
   reasoningSummariesVisible,
+  resolvePermissionProfile,
   retryTurnError,
   reviewLabel,
   reviewPrompt,
   sandboxEnvelope,
-  sandboxFromTurnParams,
   stringListFromEnv,
   stringOr,
   subagentEffortFromInput,
@@ -724,6 +722,10 @@ export class CodexClaudeAppServer {
   private subscribersByThread = new Map<string, Map<string, RpcPeer>>()
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
+  private activeTurnPermissionByThread = new Map<
+    string,
+    { approvalPolicy: string | null; sandboxMode: string | null; planMode: boolean }
+  >()
   // Threads a thread/delete is removing, and threads a thread/archive is
   // putting away, each with the work under way. Each waits for their turns to
   // end first; a turn, review, compaction, shell command or continuation in
@@ -1589,6 +1591,82 @@ export class CodexClaudeAppServer {
     }
   }
 
+  private permissionDefaults(): Pick<PermissionProfileState, 'approvalPolicy' | 'sandboxMode'> {
+    return {
+      approvalPolicy: normalizeApprovalPolicy(this.configOverrides.approval_policy),
+      sandboxMode: normalizeSandboxMode(this.configOverrides.sandbox_mode),
+    }
+  }
+
+  private permissionState(thread: ThreadRecord): PermissionProfileState {
+    return {
+      id: thread.permissionProfileId ?? null,
+      approvalPolicy: thread.approvalPolicy,
+      sandboxMode: thread.sandboxMode,
+    }
+  }
+
+  private resolveThreadPermission(
+    params: Record<string, unknown>,
+    previous: ThreadRecord | null,
+  ): PermissionProfileState {
+    return resolvePermissionProfile(
+      params,
+      previous ? this.permissionState(previous) : null,
+      this.permissionDefaults(),
+    )
+  }
+
+  private applyThreadPermission(thread: ThreadRecord, state: PermissionProfileState): void {
+    if (
+      thread.approvalPolicy !== state.approvalPolicy ||
+      thread.sandboxMode !== state.sandboxMode
+    ) {
+      // Session approvals are grants for the old effective policy. Never carry
+      // one across a permission-boundary change, especially a downgrade from
+      // Full Access to a restricted profile.
+      this.sessionApprovals.delete(thread.id)
+    }
+    thread.permissionProfileId = state.id
+    thread.approvalPolicy = state.approvalPolicy
+    thread.sandboxMode = state.sandboxMode
+  }
+
+  private permissionlessTurnParams(params: Record<string, unknown>): Record<string, unknown> {
+    const {
+      permissions: _permissions,
+      activePermissionProfile: _activePermissionProfile,
+      approvalPolicy: _approvalPolicy,
+      sandbox: _sandbox,
+      sandboxPolicy: _sandboxPolicy,
+      ...rest
+    } = params
+    return rest
+  }
+
+  private hasActiveTurn(threadId: string): boolean {
+    const activeTurnId = this.activeTurnByThread.get(threadId)
+    return activeTurnId != null && this.store.turnStatus(activeTurnId) === 'inProgress'
+  }
+
+  private permissionStateChanged(
+    thread: ThreadRecord,
+    state: PermissionProfileState,
+    planMode = false,
+  ): boolean {
+    const active = this.activeTurnPermissionByThread.get(thread.id)
+    const current = active ?? {
+      approvalPolicy: thread.approvalPolicy,
+      sandboxMode: thread.sandboxMode,
+      planMode: thread.collaborationMode === 'plan',
+    }
+    return (
+      current.approvalPolicy !== state.approvalPolicy ||
+      current.sandboxMode !== state.sandboxMode ||
+      current.planMode !== planMode
+    )
+  }
+
   private threadStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
     // Another adapter can tighten the defaults between starts. Read them
     // before creating a worktree or thread, even if this peer skips config/read.
@@ -1635,8 +1713,7 @@ export class CodexClaudeAppServer {
     const requestedCwd = stringOr(params.cwd, process.cwd())
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
     const reasoningEffort = reasoningEffortFromParams(params, this.configReasoningEffort)
-    const permissionProfileId = permissionProfileIdFromParams(params)
-    const permissionProfile = permissionProfilePolicy(permissionProfileId)
+    const permission = this.resolveThreadPermission(params, null)
     const thread: ThreadRecord = {
       id,
       sessionId: id,
@@ -1667,17 +1744,9 @@ export class CodexClaudeAppServer {
       // A start that names no policy, or only a profile the adapter cannot
       // resolve, gets what config/read reports, as Codex does: never Full
       // Access by default.
-      approvalPolicy:
-        permissionProfile?.approvalPolicy ??
-        normalizeApprovalPolicy(params.approvalPolicy) ??
-        normalizeApprovalPolicy(this.configOverrides.approval_policy) ??
-        'on-request',
-      sandboxMode:
-        permissionProfile?.sandboxMode ??
-        normalizeSandboxMode(params.sandbox) ??
-        normalizeSandboxMode(this.configOverrides.sandbox_mode) ??
-        'workspace-write',
-      permissionProfileId: permissionProfile?.id ?? null,
+      approvalPolicy: permission.approvalPolicy,
+      sandboxMode: permission.sandboxMode,
+      permissionProfileId: permission.id,
       // Helper threads never ask the user anything.
       // App rule: auto-review
       approvalsReviewer: isTitleOrHelper ? null : approvalsReviewerFromParams(params),
@@ -1815,8 +1884,7 @@ export class CodexClaudeAppServer {
     const rawModel = modelFromParams(params, null)
     const model = rawModel ? normalizeSelectableModelId(rawModel, thread.model) : null
     const reasoningEffort = reasoningEffortFromParams(params, null)
-    const permissionProfileId = permissionProfileIdFromParams(params)
-    const permissionProfile = permissionProfilePolicy(permissionProfileId)
+    const permission = this.resolveThreadPermission(params, thread)
     if (model) {
       // runtimeBackend is pinned at thread/start. Refuse cross-backend
       // model changes on resume — the conversation history wouldn't carry
@@ -1855,21 +1923,28 @@ export class CodexClaudeAppServer {
       }
     }
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
-    if (permissionProfileId) {
-      thread.permissionProfileId = permissionProfileId
-      // A custom profile has no policy the adapter knows: the explicit fields
-      // set it, as on thread/start.
-      const approvalPolicy =
-        permissionProfile?.approvalPolicy ?? normalizeApprovalPolicy(params.approvalPolicy)
-      if (approvalPolicy) thread.approvalPolicy = approvalPolicy
-      const sandboxMode = permissionProfile?.sandboxMode ?? normalizeSandboxMode(params.sandbox)
-      if (sandboxMode) thread.sandboxMode = sandboxMode
+    const requestedCollaborationMode = collaborationModeFromParams(params)
+    const activeOnResume = this.hasActiveTurn(threadId)
+    if (activeOnResume) {
+      const activePlanMode =
+        this.activeTurnPermissionByThread.get(threadId)?.planMode ??
+        thread.collaborationMode === 'plan'
+      const resumePlanMode =
+        requestedCollaborationMode != null ? requestedCollaborationMode === 'plan' : activePlanMode
+      if (this.permissionStateChanged(thread, permission, resumePlanMode)) {
+        debugLog('thread.resume.permissionWhileActive', {
+          threadId,
+          requestedApprovalPolicy: permission.approvalPolicy,
+          requestedSandboxMode: permission.sandboxMode,
+          requestedCollaborationMode,
+        })
+      } else {
+        this.applyThreadPermission(thread, permission)
+        thread.collaborationMode = requestedCollaborationMode ?? thread.collaborationMode ?? null
+      }
     } else {
-      if (hasLegacyPermissionParams(params)) thread.permissionProfileId = null
-      if (typeof params.approvalPolicy === 'string')
-        thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
-      if (typeof params.sandbox === 'string')
-        thread.sandboxMode = normalizeSandboxMode(params.sandbox)
+      this.applyThreadPermission(thread, permission)
+      thread.collaborationMode = requestedCollaborationMode ?? thread.collaborationMode ?? null
     }
     if (typeof params.threadSource === 'string')
       thread.threadSource = normalizeThreadSource(params.threadSource)
@@ -1879,8 +1954,6 @@ export class CodexClaudeAppServer {
       thread.developerInstructions = nullIfEmpty(params.developerInstructions)
     if (typeof params.personality === 'string')
       thread.personality = normalizePersonality(params.personality)
-    thread.collaborationMode =
-      collaborationModeFromParams(params) ?? thread.collaborationMode ?? null
     thread.approvalsReviewer =
       approvalsReviewerFromParams(params) ?? thread.approvalsReviewer ?? null
     this.store.upsertThread(thread)
@@ -1949,6 +2022,7 @@ export class CodexClaudeAppServer {
       invalidRequestIfThrows(() => assertModelProfileTransition(parent.model, forkModel))
     }
     const profileFingerprint = profileFingerprintForModel(forkModel, runtimeBackend)
+    const permission = this.resolveThreadPermission(params, parent)
     const requestedCwd = stringOr(params.cwd, parent.cwd)
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
     let forkPoint = runtimeBackend === 'claude' ? this.forkPointOf(parent, kept) : null
@@ -1980,19 +2054,9 @@ export class CodexClaudeAppServer {
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
-      approvalPolicy:
-        permissionProfilePolicy(permissionProfileIdFromParams(params))?.approvalPolicy ??
-        (typeof params.approvalPolicy === 'string'
-          ? normalizeApprovalPolicy(params.approvalPolicy)
-          : parent.approvalPolicy),
-      sandboxMode:
-        permissionProfilePolicy(permissionProfileIdFromParams(params))?.sandboxMode ??
-        (typeof params.sandbox === 'string'
-          ? normalizeSandboxMode(params.sandbox)
-          : parent.sandboxMode),
-      permissionProfileId:
-        permissionProfileIdFromParams(params) ??
-        (hasLegacyPermissionParams(params) ? null : (parent.permissionProfileId ?? null)),
+      approvalPolicy: permission.approvalPolicy,
+      sandboxMode: permission.sandboxMode,
+      permissionProfileId: permission.id,
       // The App forks a thread to describe it and asks for an ephemeral fork;
       // like any helper thread, it stays out of the thread list.
       ephemeral: params.ephemeral === true || parent.ephemeral,
@@ -3223,7 +3287,11 @@ export class CodexClaudeAppServer {
       approvalsReviewer: _reviewer,
       ...rest
     } = this.lastTurnParamsByThread.get(threadId) ?? {}
-    return { ...rest, threadId, planMode: false }
+    return {
+      ...this.permissionlessTurnParams(rest),
+      threadId,
+      planMode: false,
+    }
   }
 
   // The thread just went idle: run the next queued message, else keep an
@@ -3313,13 +3381,21 @@ export class CodexClaudeAppServer {
     // Support dynamic model, reasoning effort, approval policy and sandbox updates
     const model = this.requestedModelChange(thread, params)
     const reasoningEffort = reasoningEffortFromParams(params, null)
+    const permission = this.resolveThreadPermission(params, thread)
+    if (this.hasActiveTurn(threadId)) {
+      const activePlanMode =
+        this.activeTurnPermissionByThread.get(threadId)?.planMode ??
+        thread.collaborationMode === 'plan'
+      if (this.permissionStateChanged(thread, permission, activePlanMode)) {
+        throw invalidRequest(
+          'cannot change permission mode while a turn is running; retry after it ends',
+        )
+      }
+    }
     // First, so a model on the other backend is refused before anything changes.
     if (model) this.setThreadModel(thread, model)
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
-    if (typeof params.approvalPolicy === 'string')
-      thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
-    if (typeof params.sandbox === 'string')
-      thread.sandboxMode = normalizeSandboxMode(params.sandbox)
+    this.applyThreadPermission(thread, permission)
     if (typeof params.isPinned === 'boolean') {
       const currentlyPinned = thread.sectionId === PINNED_SECTION_ID || thread.isPinned === true
       if (currentlyPinned !== params.isPinned) {
@@ -3364,6 +3440,20 @@ export class CodexClaudeAppServer {
     // legacy settings fields in the compatibility handler so removing the
     // duplicate dispatch case does not silently disable profile/model
     // switching for existing clients.
+    const requestedCollaborationMode = collaborationModeFromParams(params)
+    const permission = this.resolveThreadPermission(params, thread)
+    if (this.hasActiveTurn(threadId)) {
+      const activePlanMode =
+        this.activeTurnPermissionByThread.get(threadId)?.planMode ??
+        thread.collaborationMode === 'plan'
+      const requestedPlanMode =
+        requestedCollaborationMode != null ? requestedCollaborationMode === 'plan' : activePlanMode
+      if (this.permissionStateChanged(thread, permission, requestedPlanMode)) {
+        throw invalidRequest(
+          'cannot change permission mode while a turn is running; retry after it ends',
+        )
+      }
+    }
     // The App's model menu lands here. A model on the other backend is
     // refused before anything changes: the App then reports that it could
     // not update the settings and the chat keeps its model.
@@ -3384,27 +3474,9 @@ export class CodexClaudeAppServer {
           : null
     if (developerInstructions !== null)
       thread.developerInstructions = nullIfEmpty(developerInstructions)
-    thread.collaborationMode =
-      collaborationModeFromParams(params) ?? thread.collaborationMode ?? null
+    thread.collaborationMode = requestedCollaborationMode ?? thread.collaborationMode ?? null
 
-    const permissionProfileId = permissionProfileIdFromParams(params)
-    const permissionProfile = permissionProfilePolicy(permissionProfileId)
-    if (permissionProfileId) {
-      thread.permissionProfileId = permissionProfileId
-      // A custom profile has no policy the adapter knows: the explicit fields
-      // set it, as on turn/start.
-      const approvalPolicy =
-        permissionProfile?.approvalPolicy ?? normalizeApprovalPolicy(params.approvalPolicy)
-      if (approvalPolicy) thread.approvalPolicy = approvalPolicy
-      const sandboxMode = permissionProfile?.sandboxMode ?? sandboxFromTurnParams(params)
-      if (sandboxMode) thread.sandboxMode = sandboxMode
-    } else {
-      if (hasLegacyPermissionParams(params)) thread.permissionProfileId = null
-      if (typeof params.approvalPolicy === 'string')
-        thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
-      const sandboxMode = sandboxFromTurnParams(params)
-      if (sandboxMode) thread.sandboxMode = sandboxMode
-    }
+    this.applyThreadPermission(thread, permission)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     // App rule: auto-review
     thread.approvalsReviewer =
@@ -4063,6 +4135,11 @@ export class CodexClaudeAppServer {
       purpose: params.outputSchema == null ? 'normal' : 'summary',
     })
     this.activeTurnByThread.set(threadId, turnId)
+    this.activeTurnPermissionByThread.set(threadId, {
+      approvalPolicy: thread.approvalPolicy,
+      sandboxMode: thread.sandboxMode,
+      planMode: false,
+    })
     this.unsteerableTurns.set(turnId, 'review')
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     // The review/start RESPONSE carries the synthesized userMessage item (the
@@ -4140,6 +4217,11 @@ export class CodexClaudeAppServer {
       purpose: 'compact',
     })
     this.activeTurnByThread.set(threadId, turnId)
+    this.activeTurnPermissionByThread.set(threadId, {
+      approvalPolicy: thread.approvalPolicy,
+      sandboxMode: thread.sandboxMode,
+      planMode: false,
+    })
     this.unsteerableTurns.set(turnId, 'compact')
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     setImmediate(() => {
@@ -4327,7 +4409,7 @@ export class CodexClaudeAppServer {
   ): Promise<boolean> {
     // The settings of the thread's last turn keep its session's signature,
     // so the live session takes the command instead of a new one opening.
-    const params = this.lastTurnParamsByThread.get(thread.id) ?? {}
+    const params = this.permissionlessTurnParams(this.lastTurnParamsByThread.get(thread.id) ?? {})
     const built = this.runtimeTurnContext(thread, turnId, '/compact', params)
     // thread/compact/start carries no instructions: a bare /compact, which
     // no side-conversation note may precede either.
@@ -4526,8 +4608,34 @@ export class CodexClaudeAppServer {
     this.flushPendingTurnEnds(threadId)
     let thread = this.startableThread(threadId)
     const activeTurnId = this.activeTurnByThread.get(threadId)
+    const activeTurnRunning =
+      activeTurnId != null && this.store.turnStatus(activeTurnId) === 'inProgress'
+    const activePermission = activeTurnRunning
+      ? this.activeTurnPermissionByThread.get(threadId)
+      : undefined
+    const requestedCollaborationMode = collaborationModeFromParams(params)
+    let requestedPlanMode =
+      params.outputSchema == null &&
+      (requestedCollaborationMode != null
+        ? requestedCollaborationMode === 'plan'
+        : typeof params.planMode === 'boolean'
+          ? params.planMode
+          : activePermission != null
+            ? activePermission.planMode
+            : thread.collaborationMode === 'plan')
+    let permission = this.resolveThreadPermission(params, thread)
+    let permissionBoundaryChanged = this.permissionStateChanged(
+      thread,
+      permission,
+      requestedPlanMode,
+    )
     if (activeTurnId && this.userShells.get(activeTurnId)?.standalone) {
       throw invalidRequest('cannot start a turn while a user shell command is running')
+    }
+    if (activeTurnRunning && permissionBoundaryChanged) {
+      throw invalidRequest(
+        'cannot change permission mode while a turn is running; retry after it ends',
+      )
     }
     this.checkModelProfileBinding(thread)
     // Follow-up turns the adapter starts itself have no requesting peer.
@@ -4573,17 +4681,26 @@ export class CodexClaudeAppServer {
       const running = runningTurnId ? this.store.getTurn(runningTurnId) : null
       if (running?.status === 'inProgress') return { turn: this.toLifecycleTurn(running) }
     } else if (!hiddenPrompt && params.outputSchema == null && !queued) {
-      const joined = await this.joinRunningTurn(
-        peer,
-        threadId,
-        params,
-        workflowCommand?.type === 'list',
-      )
-      if (joined) return { turn: this.toLifecycleTurn(joined) }
+      // A permission change is a native process boundary. Do not steer the
+      // incoming prompt into the active turn before applying the new policy;
+      // let this request claim a fresh turn instead.
+      if (!permissionBoundaryChanged) {
+        const joined = await this.joinRunningTurn(
+          peer,
+          threadId,
+          params,
+          workflowCommand?.type === 'list',
+        )
+        if (joined) return { turn: this.toLifecycleTurn(joined) }
+      }
       // Other requests ran while the input waited: take the thread as they
       // left it, so this turn's write keeps a rename and a delete holds.
       this.flushPendingTurnEnds(threadId)
       thread = this.startableThread(threadId)
+      permission = this.resolveThreadPermission(params, thread)
+      if (typeof params.planMode !== 'boolean' && requestedCollaborationMode === null)
+        requestedPlanMode = thread.collaborationMode === 'plan'
+      permissionBoundaryChanged = this.permissionStateChanged(thread, permission, requestedPlanMode)
     }
     // A structured summary or title turn runs its model, mapped to the
     // summary model, for that turn alone; it never rebinds the thread's.
@@ -4618,27 +4735,12 @@ export class CodexClaudeAppServer {
         : typeof params.planMode === 'boolean'
           ? params.planMode
           : thread.collaborationMode === 'plan')
+    requestedPlanMode = planMode
     const reasoningEffort = reasoningEffortFromParams(params, thread.reasoningEffort)
-    const permissionProfileId = permissionProfileIdFromParams(params)
-    const permissionProfile = permissionProfilePolicy(permissionProfileId)
+    permission = this.resolveThreadPermission(params, thread)
+    permissionBoundaryChanged = this.permissionStateChanged(thread, permission, requestedPlanMode)
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
-    if (permissionProfileId) {
-      thread.permissionProfileId = permissionProfileId
-      // A custom profile has no policy the adapter knows: the explicit fields
-      // set it, as they do for this turn (runtimeTurnContext), so the stored
-      // policy the approvals read and later turns run on is the same.
-      const approvalPolicy =
-        permissionProfile?.approvalPolicy ?? normalizeApprovalPolicy(params.approvalPolicy)
-      if (approvalPolicy) thread.approvalPolicy = approvalPolicy
-      const sandboxMode = permissionProfile?.sandboxMode ?? sandboxFromTurnParams(params)
-      if (sandboxMode) thread.sandboxMode = sandboxMode
-    } else {
-      if (hasLegacyPermissionParams(params)) thread.permissionProfileId = null
-      if (typeof params.approvalPolicy === 'string')
-        thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
-      const requestedSandbox = sandboxFromTurnParams(params)
-      if (requestedSandbox) thread.sandboxMode = requestedSandbox
-    }
+    this.applyThreadPermission(thread, permission)
     // Like Codex, a reviewer named on turn/start holds for later turns too.
     // App rule: auto-review
     const reviewer = approvalsReviewerFromParams(params)
@@ -4720,7 +4822,13 @@ export class CodexClaudeAppServer {
       if (claim.claimed) break
       const ownedHere = this.activeTurnByThread.get(threadId) === claim.activeTurn.id
       if (ownedHere && resumed) return { turn: this.toLifecycleTurn(claim.activeTurn) }
-      if (ownedHere && !hiddenPrompt && params.outputSchema == null && !queued) {
+      if (
+        ownedHere &&
+        !permissionBoundaryChanged &&
+        !hiddenPrompt &&
+        params.outputSchema == null &&
+        !queued
+      ) {
         const joined = await this.joinRunningTurn(
           peer,
           threadId,
@@ -4732,6 +4840,10 @@ export class CodexClaudeAppServer {
         // next turn with the input instead of dropping it.
         continue
       }
+      if (ownedHere && permissionBoundaryChanged)
+        throw invalidRequest(
+          'cannot change permission mode while a turn is running; retry after it ends',
+        )
       if (ownedHere) throw invalidRequest(`thread ${threadId} already has an active turn`)
       throw this.claimRefusedError(threadId, claim.ownedBySelf)
     }
@@ -4744,6 +4856,11 @@ export class CodexClaudeAppServer {
       purpose: params.outputSchema == null ? 'normal' : 'summary',
     })
     this.activeTurnByThread.set(threadId, turnId)
+    this.activeTurnPermissionByThread.set(threadId, {
+      approvalPolicy: thread.approvalPolicy,
+      sandboxMode: thread.sandboxMode,
+      planMode,
+    })
     if (hiddenPrompt) this.goalTurns.add(turnId)
     else if (params.outputSchema == null) {
       this.goalIdleStreaks.delete(threadId)
@@ -4996,15 +5113,9 @@ export class CodexClaudeAppServer {
     // the thread-level setting captured at start/resume. turn/start ships a
     // sandboxPolicy struct (e.g. {type:"dangerFullAccess"}); thread/start uses
     // the simpler sandbox string. Both are honoured.
-    const permissionProfile = permissionProfilePolicy(permissionProfileIdFromParams(params))
-    const approvalPolicy =
-      permissionProfile?.approvalPolicy ??
-      (typeof params.approvalPolicy === 'string'
-        ? normalizeApprovalPolicy(params.approvalPolicy)
-        : null) ??
-      thread.approvalPolicy
-    const sandboxMode =
-      permissionProfile?.sandboxMode ?? sandboxFromTurnParams(params) ?? thread.sandboxMode
+    const permission = this.resolveThreadPermission(params, thread)
+    const approvalPolicy = permission.approvalPolicy
+    const sandboxMode = permission.sandboxMode
     // Per-turn instruction overrides: Codex App may resend its instruction
     // panel state when the user toggles personality mid-thread. Falls back to
     // whatever was captured at thread/start.
@@ -5635,7 +5746,7 @@ export class CodexClaudeAppServer {
         _queuedSubmission: _queued,
         ...rest
       } = params
-      this.lastTurnParamsByThread.set(thread.id, rest)
+      this.lastTurnParamsByThread.set(thread.id, this.permissionlessTurnParams(rest))
     }
     const { context, isCodexThread, resumeSessionAt, turnCwd } = this.runtimeTurnContext(
       thread,
@@ -8250,13 +8361,18 @@ export class CodexClaudeAppServer {
       purpose: 'continuation',
     })
     this.activeTurnByThread.set(threadId, turn.id)
+    this.activeTurnPermissionByThread.set(threadId, {
+      approvalPolicy: thread.approvalPolicy,
+      sandboxMode: thread.sandboxMode,
+      planMode: false,
+    })
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     this.notify(peer, {
       method: 'turn/started',
       params: { threadId, turn: this.toLifecycleTurn(turn) },
     })
     const params: Record<string, unknown> = {
-      ...(this.lastTurnParamsByThread.get(threadId) ?? {}),
+      ...this.permissionlessTurnParams(this.lastTurnParamsByThread.get(threadId) ?? {}),
       threadId,
       planMode: false,
       outputSchema: null,
@@ -8428,27 +8544,24 @@ export class CodexClaudeAppServer {
     commandFallback?: ThreadItem,
     signal?: AbortSignal,
   ): Promise<PermissionDecision> {
-    // Defensive: if Codex App selected approvalPolicy=never (or "Full access"
-    // sandbox), auto-accept without bouncing the request to the user. The
-    // sidecar already drops can_use_tool in those modes, but in case some
-    // future SDK path still emits permission_request, this prevents the
-    // adapter from sitting on "Awaiting approval" forever.
-    // A call Claude Code says the user has to answer themselves is the
-    // exception, in every mode: only the user answers it, and only for this
-    // call.
+    // Only the exact Codex Full Access pair authorizes an ordinary tool
+    // without a card. User-only requests always reach the user.
     // App rule: auto-review
     const userOnly = event.requiresUser === true
-    const thread = this.store.getThread(threadId)
-    if (
-      !userOnly &&
-      thread &&
-      (thread.approvalPolicy === 'never' || thread.sandboxMode === 'danger-full-access')
-    ) {
+    const activePermission = this.activeTurnPermissionByThread.get(threadId)
+    const thread = activePermission ? null : this.store.getThread(threadId)
+    const approvalPolicy = activePermission
+      ? activePermission.approvalPolicy
+      : (thread?.approvalPolicy ?? null)
+    const sandboxMode = activePermission
+      ? activePermission.sandboxMode
+      : (thread?.sandboxMode ?? null)
+    if (!userOnly && approvalPolicy === 'never') {
+      if (sandboxMode === 'danger-full-access') return { decision: 'accept' }
       // A read-only sandbox that never asks runs reads alone and refuses the
       // rest: nothing would confine another call to reading.
-      if (thread.sandboxMode === 'read-only' && !readsOnly(event.toolName))
-        return { decision: 'decline' }
-      return { decision: 'accept' }
+      if (sandboxMode === 'read-only')
+        return { decision: readsOnly(event.toolName) ? 'accept' : 'decline' }
     }
     // App rule: mcp-tool-approval
     const mcpTool = /^mcp__(.+?)__(.+)$/.exec(event.toolName)
@@ -10569,12 +10682,11 @@ export class CodexClaudeAppServer {
           },
         }
       : normalizeSessionSource(thread.source)
-    const profileId =
-      thread.sandboxMode === 'danger-full-access'
-        ? ':danger-full-access'
-        : thread.sandboxMode === 'read-only'
-          ? ':read-only'
-          : ':workspace'
+    const profileId = threadPermissionProfileId(
+      thread.permissionProfileId,
+      thread.approvalPolicy,
+      thread.sandboxMode,
+    )
     const section = thread.sectionId == null ? null : this.store.getSection(thread.sectionId)
     const isPinned = thread.sectionId === PINNED_SECTION_ID || thread.isPinned === true
 
@@ -11031,6 +11143,7 @@ export class CodexClaudeAppServer {
       this.store.updateThreadStatus(threadId, { type: 'idle' })
     }
     this.activeTurnByThread.clear()
+    this.activeTurnPermissionByThread.clear()
   }
 
   private finalizeActiveSubagentsForShutdown(message: string): void {
@@ -11061,6 +11174,7 @@ export class CodexClaudeAppServer {
     const turnId = this.activeTurnByThread.get(threadId)
     if (turnId !== expectedTurnId) return
     const existed = this.activeTurnByThread.delete(threadId)
+    this.activeTurnPermissionByThread.delete(threadId)
     if (turnId) {
       this.closeStreamingItemsByTurn.delete(turnId)
       this.unsteerableTurns.delete(turnId)

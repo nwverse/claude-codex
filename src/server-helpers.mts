@@ -567,6 +567,17 @@ export interface PermissionProfilePolicy {
   sandboxMode: string | null
 }
 
+export interface PermissionProfileState {
+  id: string | null
+  approvalPolicy: string | null
+  sandboxMode: string | null
+}
+
+const SAFE_PERMISSION_PROFILE = {
+  approvalPolicy: 'on-request',
+  sandboxMode: 'workspace-write',
+} as const
+
 export function normalizePermissionProfileId(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const id = value.trim()
@@ -608,6 +619,106 @@ export function permissionProfilePolicy(value: unknown): PermissionProfilePolicy
   }
 }
 
+// Resolve the policy fields carried by a permission profile once, so thread
+// lifecycle methods and the runtime agree about what an unknown profile means.
+// A new or changed custom profile is fail-closed: missing fields use the safe
+// asking/workspace pair rather than whatever policy happened to be on the
+// thread before it. An unchanged custom profile is already resolved by the
+// adapter, so fieldless updates keep its stored fields. Requests with no
+// profile are the legacy fieldless form and inherit the current thread policy.
+export function resolvePermissionProfile(
+  params: Record<string, unknown>,
+  previous: PermissionProfileState | null | undefined,
+  defaults: Pick<
+    PermissionProfileState,
+    'approvalPolicy' | 'sandboxMode'
+  > = SAFE_PERMISSION_PROFILE,
+): PermissionProfileState {
+  const profileId = permissionProfileIdFromParams(params)
+  const profile = permissionProfilePolicy(profileId)
+  const explicitApprovalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
+  const explicitSandboxMode = sandboxFromTurnParams(params)
+  // Optional policy fields are commonly serialized as null (or undefined) to
+  // mean "no override". Only a non-null value is an explicit field: malformed
+  // non-null values still fail closed, while null does not erase inheritance.
+  const hasApprovalField = Object.hasOwn(params, 'approvalPolicy') && params.approvalPolicy != null
+  const hasSandboxField =
+    (Object.hasOwn(params, 'sandbox') && params.sandbox != null) ||
+    (Object.hasOwn(params, 'sandboxPolicy') && params.sandboxPolicy != null)
+  const invalidProfileField =
+    (Object.hasOwn(params, 'permissions') && params.permissions != null && !profileId) ||
+    (Object.hasOwn(params, 'activePermissionProfile') &&
+      params.activePermissionProfile != null &&
+      !profileId)
+  const invalidExplicitPolicy =
+    invalidProfileField ||
+    (hasApprovalField && explicitApprovalPolicy === null) ||
+    (hasSandboxField && explicitSandboxMode === null)
+  const previousId = normalizePermissionProfileId(previous?.id)
+  const previousApprovalPolicy = normalizeApprovalPolicy(previous?.approvalPolicy)
+  const previousSandboxMode = normalizeSandboxMode(previous?.sandboxMode)
+  const fallbackApprovalPolicy =
+    normalizeApprovalPolicy(defaults.approvalPolicy) ?? SAFE_PERMISSION_PROFILE.approvalPolicy
+  const fallbackSandboxMode =
+    normalizeSandboxMode(defaults.sandboxMode) ?? SAFE_PERMISSION_PROFILE.sandboxMode
+
+  if (profileId) {
+    if (profile && profile.approvalPolicy !== null && profile.sandboxMode !== null) {
+      // Built-in profiles are canonical. Ignore malformed legacy fields rather
+      // than letting them override the profile named by the client.
+      return profile
+    }
+    const unchangedCustom = previousId === profileId
+    return {
+      id: profileId,
+      // A malformed explicit field is never allowed to preserve a previous
+      // broad policy. A valid sibling field still applies independently.
+      approvalPolicy:
+        hasApprovalField && explicitApprovalPolicy === null
+          ? fallbackApprovalPolicy
+          : (explicitApprovalPolicy ??
+            (unchangedCustom ? previousApprovalPolicy : null) ??
+            fallbackApprovalPolicy),
+      sandboxMode:
+        hasSandboxField && explicitSandboxMode === null
+          ? fallbackSandboxMode
+          : (explicitSandboxMode ??
+            (unchangedCustom ? previousSandboxMode : null) ??
+            fallbackSandboxMode),
+    }
+  }
+
+  // An explicitly malformed field is an update even when its value is not a
+  // recognized legacy policy shape. It clears the profile and falls back to
+  // the configured safe defaults rather than preserving a broad old policy.
+  if (invalidExplicitPolicy) {
+    return {
+      id: null,
+      approvalPolicy:
+        hasApprovalField && explicitApprovalPolicy !== null
+          ? explicitApprovalPolicy
+          : fallbackApprovalPolicy,
+      sandboxMode:
+        hasSandboxField && explicitSandboxMode !== null ? explicitSandboxMode : fallbackSandboxMode,
+    }
+  }
+
+  // No profile is the old policy surface. Preserve a fieldless request's
+  // current custom/built-in selection, including a Full Access selection.
+  if (!hasLegacyPermissionParams(params)) {
+    return {
+      id: previousId,
+      approvalPolicy: previousApprovalPolicy ?? fallbackApprovalPolicy,
+      sandboxMode: previousSandboxMode ?? fallbackSandboxMode,
+    }
+  }
+  return {
+    id: null,
+    approvalPolicy: explicitApprovalPolicy ?? previousApprovalPolicy ?? fallbackApprovalPolicy,
+    sandboxMode: explicitSandboxMode ?? previousSandboxMode ?? fallbackSandboxMode,
+  }
+}
+
 export function threadPermissionProfileId(
   permissionProfileId: string | null | undefined,
   approvalPolicy: string | null,
@@ -616,7 +727,8 @@ export function threadPermissionProfileId(
   const explicit = normalizePermissionProfileId(permissionProfileId)
   if (explicit) return explicit
   if (sandboxMode === 'read-only') return ':read-only'
-  if (sandboxMode === 'danger-full-access') return ':danger-full-access'
+  if (sandboxMode === 'danger-full-access' && approvalPolicy === 'never')
+    return ':danger-full-access'
   if (sandboxMode === 'workspace-write' && approvalPolicy === 'on-request') return ':workspace'
   return null
 }

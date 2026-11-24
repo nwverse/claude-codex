@@ -389,15 +389,18 @@ test('a chat a leader starts gets its permissions and never more', async () => {
     }
     assert.equal(await policyOf(), 'approvalPolicy=untrusted sandboxMode=read-only')
 
-    // Values the adapter does not know leave the leader with no policy, which
-    // asks before tools run. The chat it starts asks too: thread/start would
-    // read a missing policy as never and full access.
+    // Values the adapter does not know fail closed to the safe asking/workspace
+    // defaults on the leader and on any chat it starts, never escalating to
+    // Full Access.
     await server.request('thread/resume', {
       threadId: leader,
       approvalPolicy: 'bogus',
       sandbox: 'bogus',
     })
-    assert.equal(await server.ask(leader, 'policy check'), 'approvalPolicy=null sandboxMode=null')
+    assert.equal(
+      await server.ask(leader, 'policy check'),
+      'approvalPolicy=on-request sandboxMode=workspace-write',
+    )
     assert.equal(await policyOf(), 'approvalPolicy=on-request sandboxMode=workspace-write')
   })
 })

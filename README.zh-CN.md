@@ -243,20 +243,8 @@ Claude 线程会启动 Claude Code 服务器：全局配置文件（`~/.claude` 
 策略决定什么可以运行。
 
 `CLAUDE_CODEX_CLAUDE_PERMISSIONS=1` 时权限规则也会生效。用户 `settings.json` 和项目
-`.claude/settings.json`、`.claude/settings.local.json` 中的 `permissions.deny` 始终生效：
-无论审批策略如何，被拒绝的工具仍拒绝。`permissions.ask` 也一样：CLI 不接受设置文件之外
-的 ask 规则，因此适配器注册 `PreToolUse` 回调，把匹配调用送到 Codex 审批提示，即使 allow
-规则或 hook 本可批准。匹配方式与 Claude Code 相同，并倾向询问：Bash 规则覆盖复合命令行的
-每条命令以及 `timeout`、`xargs`、`sh -c` 等包装器实际运行的命令；带命令替换、heredoc 或
-变量命令名的命令行在任何 Bash 规则下都要询问，因为它可能运行任何内容；`Edit` 规则覆盖
-所有编辑文件的工具，`Read` 规则按搜索目录覆盖 `Glob` 和 `Grep`。Full Access 下提示会自动
-批准；plan 模式下被要求询问的调用会拒绝。`permissions.allow` 让匹配调用无需 Codex 审批即可
-运行：用户规则始终生效，项目规则仅在项目受信任后生效（仓库提供的 `settings.local.json`
-规则永不生效）；plan 模式或只读沙箱中均不生效，因为 Codex 本就不会允许这些工具未经询问
-运行。用户规则中的 `/path` 与 Claude Code 一样相对于配置目录。审批卡保存的规则（“允许类似
-命令”、“始终允许”；见[审批](docs/guide/gui.md#approvals)）写入项目
-`.claude/settings.local.json`，因此项目受信任后在这里生效。`defaultMode` 和
-`additionalDirectories` 不继承，模式和目录由 Codex 审批策略及沙箱决定。
+`.claude/settings.json`、`.claude/settings.local.json` 中的
+`permissions.deny` 即使在 Full Access 下也始终生效，拒绝的工具仍会被拒绝；`permissions.ask` 也一样：CLI 不接受设置文件之外的 ask 规则，因此适配器注册 `PreToolUse` 回调，把匹配调用送到 Codex 审批提示，即使 allow 规则或 hook 本可批准。匹配方式与 Claude Code 相同，并倾向询问：Bash 规则覆盖复合命令行的每条命令以及 `timeout`、`xargs`、`sh -c` 等包装器实际运行的命令；带命令替换、heredoc 或变量命令名的命令行在任何 Bash 规则下都要询问，因为它可能运行任何内容；`Edit` 规则覆盖所有编辑文件的工具，`Read` 规则按搜索目录覆盖 `Glob` 和 `Grep`。原生 Agent SDK 后端会把 App 的准确 Full Access 组合（`approval_policy=never` 与 `sandbox_mode=danger-full-access`，且不在 Plan 模式）映射为原生 `bypassPermissions`，并启用 SDK 所要求的 `allowDangerouslySkipPermissions`；因此普通权限请求不会到达 Codex 审批桥，但必须由用户亲自回答的交互和 MCP elicitation 仍走各自的用户交互路径。此 bypass 会移除权限审批边界，适配器也不提供操作系统沙箱，只应在适当隔离的环境和主机上使用。其他组合使用正常的权限映射，plan 模式下被要求询问的调用会拒绝。`permissions.allow` 让匹配调用无需 Codex 审批即可运行：用户规则始终生效，项目规则仅在项目受信任后生效（仓库提供的 `settings.local.json` 规则永不生效）；plan 模式或只读沙箱中均不生效，因为 Codex 本就不会允许这些工具未经询问运行。用户规则中的 `/path` 与 Claude Code 一样相对于配置目录。审批卡保存的规则（“允许类似命令”、“始终允许”；见[审批](docs/guide/gui.md#approvals)）写入项目 `.claude/settings.local.json`，因此项目受信任后在这里生效。`defaultMode` 和 `additionalDirectories` 不继承，模式和目录由 Codex 审批策略及沙箱决定。
 
 命令 hooks 也只有明确请求时才运行：它们通常是终端会话的状态或通知集成，在每个 App 对话中
 运行会悄悄改变行为（等待输入的 hook 甚至会卡住轮次）。`CLAUDE_CODEX_CLAUDE_HOOKS=user`

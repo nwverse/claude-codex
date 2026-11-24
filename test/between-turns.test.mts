@@ -77,18 +77,23 @@ test('a tool call between turns is denied with the reason, and the user hears of
   assert.match(notices[0]?.message ?? '', /new message/)
 })
 
-test('a thread whose policy answers for it allows between turns without a notice', async () => {
+test('native Full Access rejects unexpected ordinary callback calls between turns', async () => {
   const { options, notices } = betweenTurns({
     approvalPolicy: 'never',
     sandboxMode: 'danger-full-access',
   })
   const signal = new AbortController().signal
-  assert.deepEqual(await options.canUseTool('Bash', { command: 'make' }, { signal }), {
-    behavior: 'allow',
-  })
-  // The goal tools never ask either.
+  const denied = {
+    behavior: 'deny',
+    message: 'Bash was denied: Full Access only forwards interactions that require the user.',
+  }
+  assert.deepEqual(await options.canUseTool('Bash', { command: 'make' }, { signal }), denied)
+  // Goal tools run natively in Full Access; if this narrow transport callback
+  // is invoked for one anyway, it must not become an approval bridge.
   assert.deepEqual(await options.canUseTool('mcp__codex_goal__get_goal', {}, { signal }), {
-    behavior: 'allow',
+    behavior: 'deny',
+    message:
+      'mcp__codex_goal__get_goal was denied: Full Access only forwards interactions that require the user.',
   })
   assert.deepEqual(notices, [])
 })
@@ -100,7 +105,22 @@ test('a question between turns still has no answer: the call is denied and notic
     sandboxMode: 'danger-full-access',
   })
   const signal = new AbortController().signal
-  const decision = await options.canUseTool('AskUserQuestion', { questions: [] }, { signal })
+  const decision = await options.canUseTool(
+    'AskUserQuestion',
+    {
+      questions: [
+        {
+          question: 'Pick one',
+          header: 'Choice',
+          options: [
+            { label: 'A', description: 'A' },
+            { label: 'B', description: 'B' },
+          ],
+        },
+      ],
+    },
+    { signal, toolUseID: 'question', requiresUserInteraction: true },
+  )
   assert.equal(decision.behavior, 'deny')
   assert.match(decision.message, /^AskUserQuestion was denied because no user turn was active/)
   assert.equal(notices.length, 1)

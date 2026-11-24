@@ -35,7 +35,7 @@ import {
 } from '../src/native-runtime.mjs'
 import { TurnInput } from '../src/native-turn-input.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
-import { buildSystemPromptAddendum } from '../src/server-helpers.mjs'
+import { buildSystemPromptAddendum, resolvePermissionProfile } from '../src/server-helpers.mjs'
 import { sessionChangesHint } from '../src/session-changes.mjs'
 import type { DynamicToolServer, RuntimeTurnContext } from '../src/types.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from '../src/workflow-command.mjs'
@@ -263,19 +263,15 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
   assert.equal(options.settings, undefined)
   assert.equal(options.env.CLAUDE_CODE_WORKFLOWS, '1')
   assert.equal(options.env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1')
-  assert.equal(options.permissionMode, 'default')
-  assert.equal(options.allowDangerouslySkipPermissions, undefined)
+  assert.equal(options.permissionMode, 'bypassPermissions')
+  assert.equal(options.allowDangerouslySkipPermissions, true)
   assert.equal(typeof options.canUseTool, 'function')
   assert.deepEqual(
-    await options.canUseTool(
-      'Bash',
-      { command: 'true' },
-      {
-        toolUseID: 'tool',
-        signal: new AbortController().signal,
-      },
-    ),
-    { behavior: 'allow' },
+    await options.canUseTool('Bash', { command: 'true' }, { signal: new AbortController().signal }),
+    {
+      behavior: 'deny',
+      message: 'Bash was denied: Full Access only forwards interactions that require the user.',
+    },
   )
 })
 
@@ -785,7 +781,7 @@ test('native SDK runtime serves the chat changes, and outside git tells Claude o
   }
 })
 
-test('explicit native SDK bypass includes the required dangerous opt-in flag', () => {
+test('explicit native SDK bypass includes the required dangerous opt-in flag', async () => {
   const previous = process.env.CLAUDE_CODEX_PERMISSION_MODE
   process.env.CLAUDE_CODEX_PERMISSION_MODE = 'bypassPermissions'
   try {
@@ -799,7 +795,105 @@ test('explicit native SDK bypass includes the required dangerous opt-in flag', (
     )
     assert.equal(options.permissionMode, 'bypassPermissions')
     assert.equal(options.allowDangerouslySkipPermissions, true)
-    assert.equal(options.canUseTool, undefined)
+    assert.equal(typeof options.canUseTool, 'function')
+    assert.deepEqual(
+      await options.canUseTool(
+        'Bash',
+        { command: 'true' },
+        { signal: new AbortController().signal },
+      ),
+      {
+        behavior: 'deny',
+        message: 'Bash was denied: Full Access only forwards interactions that require the user.',
+      },
+    )
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+    else process.env.CLAUDE_CODEX_PERMISSION_MODE = previous
+  }
+})
+
+test('native SDK Full Access forwards only user-only interactions', async () => {
+  const previous = process.env.CLAUDE_CODEX_PERMISSION_MODE
+  delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+  try {
+    const runtime = new NativeClaudeRuntime()
+    const buildOptions = Reflect.get(runtime, 'buildOptions')
+    const context = nativeTurnContext({
+      threadId: 'full-access-thread',
+      turnId: 'full-access-turn',
+      approvalPolicy: 'never',
+      sandboxMode: 'danger-full-access',
+    })
+    const requests: any[] = []
+    const questions: any[] = []
+    const current = {
+      context,
+      resolved: false,
+      handlers: {
+        onPermissionRequest: async (event: unknown) => {
+          requests.push(event)
+          return { decision: 'accept' }
+        },
+        onUserInputRequest: async (event: any) => {
+          questions.push(event)
+          return { answers: { [event.questions[0].id]: { answers: ['A'] } } }
+        },
+      },
+    }
+    const options = buildOptions.call(runtime, {}, context, new AbortController(), () => ({
+      current,
+      lastContext: context,
+    }))
+    assert.equal(options.permissionMode, 'bypassPermissions')
+    assert.equal(typeof options.canUseTool, 'function')
+    const signal = new AbortController().signal
+    assert.deepEqual(await options.canUseTool('Bash', { command: 'true' }, { signal }), {
+      behavior: 'deny',
+      message: 'Bash was denied: Full Access only forwards interactions that require the user.',
+    })
+    assert.deepEqual(
+      await options.canUseTool(
+        'Bash',
+        { command: 'git push' },
+        { signal, toolUseID: 'user-only', requiresUserInteraction: true },
+      ),
+      { behavior: 'allow', updatedInput: { command: 'git push' } },
+    )
+    const questionDecision = await options.canUseTool(
+      'AskUserQuestion',
+      {
+        questions: [
+          {
+            question: 'Pick one',
+            header: 'Choice',
+            options: [
+              { label: 'A', description: 'A' },
+              { label: 'B', description: 'B' },
+            ],
+          },
+        ],
+      },
+      { signal, toolUseID: 'question', requiresUserInteraction: true },
+    )
+    assert.equal(questionDecision.behavior, 'deny')
+    assert.deepEqual(JSON.parse(questionDecision.message), {
+      questions: [
+        {
+          question: 'Pick one',
+          header: 'Choice',
+          options: [
+            { label: 'A', description: 'A' },
+            { label: 'B', description: 'B' },
+          ],
+        },
+      ],
+      answers: { 'Pick one': 'A' },
+    })
+    assert.equal(questions.length, 1)
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0].toolName, 'Bash')
+    assert.equal(requests[0].requiresUser, true)
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_CODEX_PERMISSION_MODE
     else process.env.CLAUDE_CODEX_PERMISSION_MODE = previous
@@ -2830,9 +2924,10 @@ test('native SDK sessions always launch in an explicit permission mode', () => {
   delete process.env.CLAUDE_CODEX_PERMISSION_MODE
   const runtime = new NativeClaudeRuntime()
   const buildOptions = Reflect.get(runtime, 'buildOptions')
-  const launch = (overrides: Partial<RuntimeTurnContext>): unknown =>
+  const launchOptions = (overrides: Partial<RuntimeTurnContext>): Record<string, any> =>
     buildOptions.call(runtime, {}, nativeTurnContext(overrides), new AbortController(), () => null)
-      .permissionMode
+  const launch = (overrides: Partial<RuntimeTurnContext>): unknown =>
+    launchOptions(overrides).permissionMode
   try {
     assert.equal(launch({}), 'default')
     assert.equal(launch({ approvalPolicy: 'untrusted', sandboxMode: 'read-only' }), 'default')
@@ -2844,7 +2939,19 @@ test('native SDK sessions always launch in an explicit permission mode', () => {
       launch({ approvalPolicy: 'on-failure', sandboxMode: 'workspace-write' }),
       'acceptEdits',
     )
-    assert.equal(launch({ approvalPolicy: 'never', sandboxMode: 'danger-full-access' }), 'default')
+    const fullAccess = launchOptions({
+      approvalPolicy: 'never',
+      sandboxMode: 'danger-full-access',
+    })
+    assert.equal(fullAccess.permissionMode, 'bypassPermissions')
+    assert.equal(fullAccess.allowDangerouslySkipPermissions, true)
+    assert.equal(typeof fullAccess.canUseTool, 'function')
+    assert.equal(launch({ approvalPolicy: 'never', sandboxMode: 'workspace-write' }), 'default')
+    assert.equal(launch({ approvalPolicy: 'never', sandboxMode: 'read-only' }), 'default')
+    assert.equal(
+      launch({ approvalPolicy: 'on-request', sandboxMode: 'danger-full-access' }),
+      'default',
+    )
     assert.equal(launch({ planMode: true, approvalPolicy: 'never' }), 'plan')
     // Auto review switches to auto mode after launch, once the session knows
     // its model supports it.
@@ -2988,15 +3095,31 @@ test('native SDK asks only the user may answer reach the App in every mode', asy
   assert.equal(requests.length, 2)
 })
 
-test('native SDK permission request between turns falls back to the standing policy', async () => {
+test('native SDK permission requests between turns only use the Full Access standing policy', async () => {
   const runtime = new NativeClaudeRuntime()
   const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
   const options = { toolUseID: 'tool', signal: new AbortController().signal }
   const ask = (lastContext: RuntimeTurnContext) =>
     makeCanUseTool.call(runtime, () => ({ current: null, lastContext }))
   assert.deepEqual(
-    await ask(nativeTurnContext({ approvalPolicy: 'never' }))('Bash', { command: 'true' }, options),
+    await ask(nativeTurnContext({ approvalPolicy: 'never', sandboxMode: 'danger-full-access' }))(
+      'Bash',
+      { command: 'true' },
+      options,
+    ),
     { behavior: 'allow' },
+  )
+  // A single never-ask field is not Full Access and must not silently grant
+  // an ordinary call while no user turn is running.
+  assert.equal(
+    (
+      await ask(nativeTurnContext({ approvalPolicy: 'never', sandboxMode: null }))(
+        'Bash',
+        { command: 'true' },
+        options,
+      )
+    ).behavior,
+    'deny',
   )
   assert.equal(
     (
@@ -3079,16 +3202,21 @@ test('native SDK read-only sandbox that never asks runs reads alone, and refuses
   })
   assert.equal(requests.length, 2)
 
-  // A workspace that never asks, or Full access, still runs every call.
-  for (const sandboxMode of ['workspace-write', 'danger-full-access', null]) {
+  // A workspace that never asks is not the native Full Access policy; its
+  // ordinary callback still goes through the approval handler. Full Access
+  // itself is covered by the bypass callback test above.
+  for (const sandboxMode of ['workspace-write', null]) {
     const open = nativeTurnContext({ approvalPolicy: 'never', sandboxMode })
     const ask = makeCanUseTool.call(runtime, () => ({
       current: { context: open, resolved: false, handlers: handlers('decline') },
       lastContext: open,
     }))
-    assert.deepEqual(await ask('Bash', { command: 'make' }, plain), { behavior: 'allow' })
+    assert.deepEqual(await ask('Bash', { command: 'make' }, plain), {
+      behavior: 'deny',
+      message: 'declined by user',
+    })
   }
-  assert.equal(requests.length, 2)
+  assert.equal(requests.length, 4)
 })
 
 test('native SDK plan mode carries ExitPlanMode and AskUserQuestion to the App', async () => {
@@ -4335,4 +4463,62 @@ test('file checkpointing changes the session signature when toggled', () => {
   assert.equal(disabled, omitted)
   assert.notEqual(enabled, disabled)
   assert.notEqual(enabled, omitted)
+})
+
+test('resolvePermissionProfile preserves Full Access on nullable fields and honors configured defaults', () => {
+  const fullAccess = {
+    id: ':danger-full-access',
+    approvalPolicy: 'never',
+    sandboxMode: 'danger-full-access',
+  }
+  const readOnlyDefaults = {
+    approvalPolicy: 'on-request',
+    sandboxMode: 'read-only',
+  }
+
+  // Serialized nullable fields mean "no override", not a malformed reset.
+  assert.deepEqual(
+    resolvePermissionProfile(
+      { approvalPolicy: null, sandbox: null, sandboxPolicy: null, permissions: null },
+      fullAccess,
+      readOnlyDefaults,
+    ),
+    fullAccess,
+  )
+
+  // A new unknown custom profile falls back to configured defaults, not a
+  // wider hardcoded workspace-write mode.
+  assert.deepEqual(
+    resolvePermissionProfile({ permissions: 'custom-profile' }, fullAccess, readOnlyDefaults),
+    {
+      id: 'custom-profile',
+      approvalPolicy: 'on-request',
+      sandboxMode: 'read-only',
+    },
+  )
+
+  // A valid sibling field still applies when the other field is null on an
+  // unchanged custom profile.
+  assert.deepEqual(
+    resolvePermissionProfile(
+      { permissions: 'custom-profile', approvalPolicy: 'never', sandboxPolicy: null },
+      { id: 'custom-profile', approvalPolicy: 'on-request', sandboxMode: 'read-only' },
+      readOnlyDefaults,
+    ),
+    {
+      id: 'custom-profile',
+      approvalPolicy: 'never',
+      sandboxMode: 'read-only',
+    },
+  )
+
+  // A non-null malformed legacy field fails closed to the configured defaults.
+  assert.deepEqual(
+    resolvePermissionProfile({ sandbox: 'granular' }, fullAccess, readOnlyDefaults),
+    {
+      id: null,
+      approvalPolicy: 'on-request',
+      sandboxMode: 'read-only',
+    },
+  )
 })
