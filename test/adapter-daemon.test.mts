@@ -621,6 +621,79 @@ test('a turn the state database refuses still ends and frees the thread', {
   }
 })
 
+test('a turn that ends while the state database stays locked still runs the queue after it', {
+  timeout: 30_000,
+}, async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const debugLogPath = join(home, 'debug.jsonl')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_HOME: join(home, 'adapter'),
+      CLAUDE_CODEX_DEBUG_LOG: debugLogPath,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_STATE_DB_TIMEOUT_MS: '50',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  t.signal.addEventListener('abort', () => proc.kill('SIGKILL'))
+  let exit: { code: number | null; signal: NodeJS.Signals | null } | null = null
+  proc.on('exit', (code, signal) => {
+    exit = { code, signal }
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startLockTestThread(proc, reader, home)
+    const turnId = await startLockTestTurn(proc, reader, threadId, 2, 'state lock follow-up check')
+    await nextNotification(reader, 'item/agentMessage/delta')
+    proc.stdin?.write(
+      json({
+        id: 3,
+        method: 'thread/queue/add',
+        params: { threadId, input: textInput('queued behind the lock') },
+      }),
+    )
+    assert.equal((await reader.nextResponse(3)).error, undefined)
+    // Held past the turn's end this time: the follow-up check that runs as
+    // the turn ends finds the database locked too.
+    const release = holdStateDatabase(join(home, 'adapter', 'state.sqlite'))
+    try {
+      const seen = await nextTurnCompleted(reader, turnId)
+      assert.equal(seen.completed.status, 'failed')
+      await nextNotification(reader, 'thread/status/changed')
+      await delay(1_000)
+    } finally {
+      release()
+    }
+
+    // The queued message still runs once the lock is gone.
+    let queuedTurnId: string | null = null
+    for (let i = 0; i < 5_000 && !queuedTurnId; i += 1) {
+      const message = await reader.nextWithin(10_000)
+      if (!message) break
+      if (message.method === 'turn/started' && message.params.turn.id !== turnId)
+        queuedTurnId = message.params.turn.id
+    }
+    assert.equal(exit, null)
+    assert.notEqual(queuedTurnId, null)
+    const queued = await nextTurnCompleted(reader, queuedTurnId as string)
+    assert.equal(queued.completed.status, 'completed')
+
+    const events = (await readFile(debugLogPath, 'utf8'))
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line).event)
+    assert.equal(events.includes('queue.follow_up_failed'), true)
+    assert.equal(events.includes('adapter.uncaughtException'), false)
+    assert.equal(exit, null)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('startup recovery terminalizes persisted in-progress item liveness', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const store = new SessionStore(join(home, 'state.sqlite'))
@@ -1637,12 +1710,16 @@ function holdStateDatabase(path: string): () => void {
   }
 }
 
-async function startLockTestThread(proc: ChildProcess, reader: JsonLineReader): Promise<string> {
+async function startLockTestThread(
+  proc: ChildProcess,
+  reader: JsonLineReader,
+  cwd = process.cwd(),
+): Promise<string> {
   proc.stdin?.write(
     json({
       id: 1,
       method: 'thread/start',
-      params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      params: { cwd, experimentalRawEvents: false, persistExtendedHistory: false },
     }),
   )
   const start = await reader.nextResponse(1)

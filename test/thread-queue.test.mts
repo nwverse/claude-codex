@@ -456,6 +456,25 @@ test('a follow-up whose queued message is deleted before its claim runs the next
   })
 })
 
+test('a follow-up retry still pending when the server stops leaves it idle', async () => {
+  const { runtime, releases } = holdingRuntime()
+  await withInProcessApp(runtime, async (app) => {
+    const { threadId } = await twoQueuedBehindAnInterrupt(app, releases)
+    queueHolds(app).set(threadId, false)
+    // The state database stays locked to the follow-up check.
+    const store = app.store as unknown as { listQueue(id: string): unknown[] }
+    store.listQueue = () => {
+      throw new Error('database is locked')
+    }
+    const server = app.server as unknown as { followUp(threadId: string): boolean }
+
+    assert.equal(server.followUp(threadId), true)
+    assert.equal(app.server.hasActiveTurns(), true)
+    await app.server.stop()
+    assert.equal(app.server.hasActiveTurns(), false)
+  })
+})
+
 test('thread/queue/start of a message deleted while its turn starts runs nothing else', async () => {
   const { runtime, prompts, releases } = holdingRuntime()
   await withInProcessApp(runtime, async (app) => {

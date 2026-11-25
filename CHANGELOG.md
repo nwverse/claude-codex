@@ -637,6 +637,12 @@ versioning or publishing metadata.
 - A queued message deleted just as its turn starts is skipped quietly, and the
   next one runs. It used to report "unknown queued submission" and leave the
   rest of the queue waiting for another turn to end. (#368)
+- A turn that ends while another process holds the state database locked no
+  longer takes the adapter down, and every App session with it, with
+  "database is locked": the check for the next queued message or goal
+  continuation is tried again (2 s, 4 s, ... apart, five times), and the
+  queued message runs once the lock is gone. `thread/queue/add` and
+  `thread/goal/set` on an idle thread run that check the same way. (#370)
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.

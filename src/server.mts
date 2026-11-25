@@ -832,6 +832,9 @@ export class CodexClaudeAppServer {
   >()
   // Claude started a turn of its own while the thread's turn was settling.
   private pendingAutonomousTurns = new Set<string>()
+  // Follow-up checks the state database refused, waiting to run again (see
+  // followUp), by thread.
+  private followUpRetries = new Map<string, NodeJS.Timeout>()
   private lastTurnParamsByThread = new Map<string, Record<string, unknown>>()
   // Whether each thread's server-side queue holds (see queueHeld).
   private queueHolds = new Map<string, boolean>()
@@ -1045,6 +1048,10 @@ export class CodexClaudeAppServer {
     this.stopped = true
     for (const search of this.activeThreadSearches.values()) search.cancelled = true
     this.activeThreadSearches.clear()
+    // A follow-up retry still pending would find the server stopped; until
+    // it fired, it would keep hasActiveTurns() true.
+    for (const timer of this.followUpRetries.values()) clearTimeout(timer)
+    this.followUpRetries.clear()
     const nativeStopped = this.codexBridge?.stop()
     // command/exec and process/spawn run in process groups of their own, out
     // of reach of a signal to the adapter's group (launchd job stop, Ctrl-C),
@@ -1111,9 +1118,10 @@ export class CodexClaudeAppServer {
   // Background agents keep running (and Claude may still answer them) after
   // every turn has settled; the daemon must not idle-exit underneath them.
   // Nor under a turn still being claimed, such as a queued message the
-  // adapter dispatched while no client was connected.
+  // adapter dispatched while no client was connected, or one about to be.
   hasActiveTurns(): boolean {
     if (this.activeTurnByThread.size > 0 || this.startingTurnByThread.size > 0) return true
+    if (this.followUpRetries.size > 0) return true
     if (this.codexBridge?.busy()) return true
     for (const entry of this.backgroundSubagents.values()) if (entry.running) return true
     return this.runtime.hasBackgroundWork?.() === true
@@ -3049,7 +3057,7 @@ export class CodexClaudeAppServer {
     if (goal.status === 'active') this.goalIdleStreaks.delete(threadId)
     this.commitGoal(goal)
     if (goal.status === 'active') {
-      if (!this.activeTurnByThread.has(threadId)) setImmediate(() => this.startFollowUp(threadId))
+      if (!this.activeTurnByThread.has(threadId)) setImmediate(() => this.followUp(threadId))
       else if (objectiveChanged)
         void this.runtime
           .steer(threadId, goalObjectiveUpdatedPrompt(goal))
@@ -3385,7 +3393,7 @@ export class CodexClaudeAppServer {
     }
     this.mutateQueue(threadId, (items) => [...items, submission])
     if (!this.activeTurnByThread.has(threadId) && !this.queueHeld(threadId))
-      setImmediate(() => this.startFollowUp(threadId))
+      setImmediate(() => this.followUp(threadId))
     return { queuedSubmission: submission }
   }
 
@@ -3464,8 +3472,8 @@ export class CodexClaudeAppServer {
   // compaction, goal continuation or Claude's own follow-up in between leaves
   // the hold as it was. Until this process starts a turn on the thread, the
   // stored turns say, so a hold outlives a restart. Should they fail to say,
-  // the newest turn does, as before: this also runs where a throw would stop
-  // the daemon (a follow-up after a turn ends).
+  // the newest turn does, as before: this also runs where a throw would delay
+  // the queue (a follow-up after a turn ends, see followUp).
   private queueHeld(threadId: string): boolean {
     const held = this.queueHolds.get(threadId)
     if (held !== undefined) return held
@@ -3616,6 +3624,38 @@ export class CodexClaudeAppServer {
       _hiddenPrompt: goalContinuationPrompt(goal),
     }).catch((error) => debugLog('goal.continue.failed', { threadId, error: String(error) }))
     return this.activeTurnByThread.has(threadId)
+  }
+
+  // startFollowUp for a caller outside any request (a setImmediate), where a
+  // throw would end the adapter and every client's session with it. Its reads
+  // throw while another process holds the state database locked, so a throw
+  // is logged and the check runs again on the turn-end retry schedule; the
+  // adapter counts as busy meanwhile, and a newer check replaces it. After the
+  // last attempt the queue waits for the thread's next turn end or queue add.
+  // Returns whether a turn started or is coming, or the check is retried.
+  private followUp(threadId: string, settled?: TurnStatus, attempt = 0): boolean {
+    clearTimeout(this.followUpRetries.get(threadId))
+    this.followUpRetries.delete(threadId)
+    try {
+      return this.startFollowUp(threadId, settled)
+    } catch (error) {
+      const retry = attempt < TURN_END_RETRY_ATTEMPTS
+      debugLog(retry ? 'queue.follow_up_failed' : 'queue.follow_up_abandoned', {
+        threadId,
+        attempt,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      if (!retry) return false
+      const next = attempt + 1
+      const timer = setTimeout(() => {
+        this.followUpRetries.delete(threadId)
+        if (!this.followUp(threadId, settled, next) && this.activeTurnByThread.size === 0)
+          this.checkIdle()
+      }, TURN_END_RETRY_DELAY_MS * next)
+      timer.unref?.()
+      this.followUpRetries.set(threadId, timer)
+      return true
+    }
   }
 
   private threadAdjustElicitation(params: Record<string, unknown>, delta: number): unknown {
@@ -11621,7 +11661,7 @@ export class CodexClaudeAppServer {
     if (existed) {
       this.refreshGitInfoAfterTurn(threadId)
       setImmediate(() => {
-        if (!this.startFollowUp(threadId, settled?.status) && this.activeTurnByThread.size === 0)
+        if (!this.followUp(threadId, settled?.status) && this.activeTurnByThread.size === 0)
           this.checkIdle()
       })
     }
