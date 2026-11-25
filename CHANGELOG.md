@@ -278,6 +278,28 @@ versioning or publishing metadata.
   conversation twice. It is null for Codex threads, before the first Claude
   turn, and for a fork until a turn of its own has written a session; the
   thread's `path` stays null. (#357)
+- `thread/loaded/list` no longer keeps every subagent and helper thread a
+  client ever followed. A subagent thread is loaded while its agent runs and
+  unloads when the agent is done, and an ephemeral thread unloads once its
+  structured helper turn (a title, description or summary) ends, on Claude
+  and native Codex chats alike: their followers are dropped and get
+  `thread/closed`, as after `thread/unsubscribe` (the App opts out of it).
+  `thread/resume` of a chat the adapter runs still follows its forks and any
+  open ephemeral side chat another client still follows, and its subagent
+  threads and helper forks only while they run; it used to follow every one of
+  them, finished or not, on each resume. `thread/loaded/list` now pages over
+  sorted loaded thread ids with a cursor keyed on the last returned id, so
+  unloads between pages cannot skip a live chat. A finished agent
+  that runs again (a `SendMessage`) is followed by whoever follows its chat by
+  then, and a notification about a finished one still reaches its chat's
+  followers without loading it again. On a daemon that ran for weeks with an
+  observer that reads every loaded thread every few seconds, the list held
+  hundreds of finished agent threads. Chats stay loaded while a client follows
+  them, and `thread/unsubscribe` answers `notLoaded`, as Codex does, for a
+  thread no client follows. With native Codex on, reading a native thread
+  (`thread/read`, `thread/turns/list` and the other read-only requests) no
+  longer makes the reader follow it, as in Codex; an observer that read every
+  chat used to keep them all loaded until it disconnected. (#361)
 - Codex App 26.1111.71704 is a verified build too, and the upgrade baseline.
   Its Codex, `0.169.1`, has the same app-server protocol as 26.1111.21308's,
   its gates are unchanged, and the one new method-shaped name in its scripts,
@@ -1126,6 +1148,18 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- The App's helper requests leave no Claude Code transcripts. A title, a
+  description fork and the other turns of an ephemeral thread, and the summary
+  a compaction falls back to, run with the Agent SDK's `persistSession: false`.
+  Each used to write a transcript under the config directory, which tools that
+  list Claude Code sessions showed as one of the user's. A description fork
+  still starts from the chat's session. A subagent thread, which the user can
+  go on talking to, keeps its transcripts. Nothing could resume such a
+  session, so the thread does not record it: each turn of an ephemeral fork
+  starts from its parent's session again, and a later turn of any other
+  ephemeral thread starts from no session. An ephemeral thread other than a
+  subagent's therefore carries context from one turn to the next only while
+  their Claude session is still open. (#358)
 - `runs.jsonl`, the run registry, rotates like `debug.jsonl`: at
   `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` (50 MiB by default) it moves to
   `runs.jsonl.1`, and `CLAUDE_CODEX_DEBUG_LOG_KEEP` old files (3 by default)

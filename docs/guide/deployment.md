@@ -178,6 +178,12 @@ answer wins, and the others get `serverRequest/resolved`; any connected client
 may answer. A client that opens a thread while one of its turns is waiting on a
 request, such as the App after a reconnect, gets the request too.
 
+A subagent thread is followed only while its agent runs, and a helper thread
+(a title, a description or a summary) until its turn ends. Then it unloads, so
+`thread/loaded/list` on a daemon that runs for weeks holds the chats clients
+follow and the agents still running, not every agent a workflow ever ran. See
+[Loaded threads](/reference/protocol-coverage) for the details.
+
 ## Quick remote probe
 
 ```bash

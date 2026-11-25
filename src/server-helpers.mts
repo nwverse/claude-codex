@@ -448,6 +448,15 @@ export function reviewPrompt(target: unknown): string {
   ].join('\n')
 }
 
+// A thread a client runs a helper request in and drops: a title, a
+// description fork, a memory consolidation. Its Claude sessions leave no
+// transcript, which nothing would resume and other tools would list as the
+// user's session. A subagent thread is ephemeral too, but the user can go on
+// talking to it.
+export function helperThread(thread: ThreadRecord): boolean {
+  return thread.ephemeral && thread.threadSource !== 'subagent'
+}
+
 export function compactSummary(thread: ThreadRecord, turns: TurnRecord[]): string {
   const snippets = turns
     .flatMap((turn) => turn.items)

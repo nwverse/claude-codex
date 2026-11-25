@@ -98,6 +98,15 @@ interface StaleTurnRow {
   owner_started: string | null
 }
 
+// A thread below another, as descendantThreads reads it.
+export interface DescendantThread {
+  id: string
+  ephemeral: boolean
+  threadSource: string | null
+  // Its stored status is active: a turn runs on it, here or in another adapter.
+  active: boolean
+}
+
 // What a turn read decodes, in turns and thread_inherited_turns alike: every
 // column rowToTurn uses, and not diff, which older builds filled with up to
 // megabytes per turn until clearStoredTurnDiffs gets to it.
@@ -866,10 +875,14 @@ export class SessionStore {
   }
 
   // Every unarchived thread below rootId, ephemeral ones included, without
-  // listThreads' page cap. An archived thread hides its own descendants too.
-  // CROSS JOIN keeps the walk going parent to child through
-  // idx_threads_forked_from; left to itself SQLite may scan threads instead.
-  descendantThreadIds(rootId: string): string[] {
+  // listThreads' page cap, with what decides whether a client that opens
+  // rootId follows it (bindPeerToDescendants in server.mts). An archived
+  // thread hides its own descendants too. CROSS JOIN keeps the walk going
+  // parent to child through idx_threads_forked_from and reads each thread by
+  // its id; left to itself SQLite may scan threads instead. A status SQLite
+  // cannot parse counts as not active rather than failing the resume: CASE
+  // keeps json_extract off it.
+  descendantThreads(rootId: string): DescendantThread[] {
     const rows = this.db
       .prepare(
         `WITH RECURSIVE descendants(id) AS (
@@ -878,10 +891,19 @@ export class SessionStore {
            SELECT child.id FROM descendants parent CROSS JOIN threads child
              ON child.forked_from_id = parent.id WHERE child.archived = 0
          )
-         SELECT id FROM descendants WHERE id <> ?`,
+         SELECT t.id, t.ephemeral, t.thread_source,
+                CASE WHEN json_valid(t.status_json)
+                     THEN json_extract(t.status_json, '$.type') = 'active' ELSE 0 END AS active
+           FROM descendants d CROSS JOIN threads t ON t.id = d.id
+          WHERE d.id <> ?`,
       )
-      .all(rootId, rootId) as Array<{ id: unknown }>
-    return rows.map((row) => String(row.id))
+      .all(rootId, rootId) as Array<Record<string, unknown>>
+    return rows.map((row) => ({
+      id: String(row.id),
+      ephemeral: Number(row.ephemeral) === 1,
+      threadSource: row.thread_source == null ? null : String(row.thread_source),
+      active: Number(row.active) === 1,
+    }))
   }
 
   listSections(limit = 100, cursor: string | null = null): ThreadSectionRecord[] {

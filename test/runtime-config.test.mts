@@ -4326,6 +4326,24 @@ test('native SDK runtime forwards file checkpointing only when enabled', () => {
   }
 })
 
+test('native SDK runtime turns session persistence off only when asked', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  for (const persistSession of [false, true, undefined]) {
+    // A fork resumes its parent's session; cwd '' skips the transcript lookup.
+    const context = nativeTurnContext({ cwd: '', claudeSessionId: 'parent', forkSession: true })
+    if (persistSession !== undefined) context.persistSession = persistSession
+    const options = buildOptions.call(runtime, {}, context, new AbortController(), () => null)
+    assert.equal(options.resume, 'parent')
+    assert.equal(options.forkSession, true)
+    if (persistSession === false) assert.equal(options.persistSession, false)
+    else assert.equal(Object.hasOwn(options, 'persistSession'), false)
+  }
+  const persisted = sessionSignature(nativeTurnContext())
+  assert.equal(sessionSignature(nativeTurnContext({ persistSession: true })), persisted)
+  assert.notEqual(sessionSignature(nativeTurnContext({ persistSession: false })), persisted)
+})
+
 test('file checkpointing changes the session signature when toggled', () => {
   const disabled = sessionSignature(nativeTurnContext({ enableFileCheckpointing: false }))
   const unset = nativeTurnContext()
