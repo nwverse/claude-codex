@@ -193,6 +193,12 @@ own: one more model call for each such chat. A client that names the chat
 (`thread/name/set`) before its first turn keeps the App from generating a title
 for it.
 
+A subagent thread is followed only while its agent runs, and a helper thread
+(a title, a description or a summary) until its turn ends. Then it unloads, so
+`thread/loaded/list` on a daemon that runs for weeks holds the chats clients
+follow and the agents still running, not every agent a workflow ever ran. See
+[Loaded threads](/reference/protocol-coverage) for the details.
+
 ## Quick remote probe
 
 ```bash

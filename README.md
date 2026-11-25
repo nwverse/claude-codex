@@ -116,6 +116,8 @@ commit API keys, OAuth/session data, `.env` files, or acceptance-test logs.
 
 Full walkthrough → **[Getting started](https://nwverse.github.io/claude-codex/guide/getting-started)**.
 
+With a local Persona node, the optional [Persona companion](scripts/persona/README.md) exposes this adapter’s threads, read state and model controls in Agents.
+
 ## How it works
 
 ```
@@ -345,19 +347,23 @@ the thread's sandbox and approval policy. An `Edit` rule
 covers every tool that edits files, a `Read` rule `Glob` and `Grep` by the
 folder they search and the folder a glob starts from; file rules match paths in
 any case and through symlinks, and `*` in a tool name or a `domain:` works as in
-Claude Code. Under Full Access the prompt
-is approved without asking, as every other one is; in plan mode an asked-for
-call is refused. `permissions.allow` lets matching tool calls run without a
-Codex approval prompt; the user's rules always count, a project's only once the
-project is trusted (those of a `settings.local.json` the repository supplies
-never), and none in plan mode or a read-only sandbox, where Codex would not let
-those tools run unasked. A user rule's `/path` stays relative to the config
-folder, as in Claude Code. A rule saved from an approval card ("Allow similar
-commands", "Always allow"; see [Approvals](docs/guide/gui.md#approvals)) goes
-to the project's `.claude/settings.local.json`, so it counts here once the
-project is trusted. `defaultMode` and `additionalDirectories` are not
-carried over: the Codex approval policy and sandbox decide the mode and the
-folders.
+Claude Code. With the native Agent SDK, the App's exact Full Access
+combination (`approval_policy=never` and `sandbox_mode=danger-full-access`,
+outside Plan mode) maps to native `bypassPermissions`. The SDK's required
+`allowDangerouslySkipPermissions` opt-in is enabled, so ordinary permission
+requests do not reach the App; user-only interactions and MCP elicitation still
+use their explicit user-facing paths. An explicit `CLAUDE_CODEX_PERMISSION_MODE`
+override still wins. Other combinations use the normal permission mapping, and
+in plan mode an asked-for call is refused. `permissions.allow` lets matching tool calls run
+without a Codex approval prompt; the user's rules always count, a project's
+only once the project is trusted (those of a `settings.local.json` the
+repository supplies never), and none in plan mode or a read-only sandbox,
+where Codex would not let those tools run unasked. A user rule's `/path` stays
+relative to the config folder, as in Claude Code. A rule saved from an approval
+card ("Allow similar commands", "Always allow"; see [Approvals](docs/guide/gui.md#approvals))
+goes to the project's `.claude/settings.local.json`, so it counts here once the
+project is trusted. `defaultMode` and `additionalDirectories` are not carried
+over: the Codex approval policy and sandbox decide the mode and the folders.
 
 Its command hooks run only when asked for too: they are often status or
 notification integrations for terminal sessions, and running them for every App
@@ -483,13 +489,14 @@ This compatibility layer is specific to the native Claude Agent SDK backend. Alt
 agentapi, and `claude -p` backends receive no workflow event bridge. Interactive workflow
 management actions such as pause, resume, stop, and save are not implemented.
 
-When Codex Full Access is selected, the adapter keeps Claude in its standard permission mode and
-auto-allows permission requests through the existing Codex bridge. This avoids Relay's refusal of
-dangerous permission bypass outside a recognized container sandbox while preserving a zero-prompt
-Full Access turn. Operators can still opt into native SDK bypass explicitly with
-`CLAUDE_CODEX_PERMISSION_MODE=bypassPermissions` in an appropriately isolated environment.
-The variable applies to every Claude thread and overrides the App's Plan mode, approval policy
-and sandbox; see the
+For the native Agent SDK backend, the App's exact Full Access combination
+(`approval_policy=never` and `sandbox_mode=danger-full-access`, outside Plan mode)
+maps to native `bypassPermissions`. The SDK's required
+`allowDangerouslySkipPermissions` opt-in is enabled, so permission requests do not
+reach the Codex approval bridge. This bypass is safe only in an appropriately
+isolated environment and host; the adapter does not provide an OS sandbox.
+An explicit `CLAUDE_CODEX_PERMISSION_MODE` override still wins for every Claude
+thread and overrides the App's Plan mode, approval policy and sandbox; see the
 [configuration reference](https://nwverse.github.io/claude-codex/guide/configuration#reference-table).
 
 ## Current release boundaries

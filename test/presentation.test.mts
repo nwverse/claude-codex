@@ -867,7 +867,7 @@ for (const sandbox of ['danger-full-access', 'workspace-write']) {
           content: 'Started background server.',
         })
       },
-      { sandbox },
+      sandbox === 'danger-full-access' ? { sandbox, approvalPolicy: 'never' } : { sandbox },
       async (listener, threadId) => {
         await listener.onTaskEvent(threadId, {
           type: 'task_output',

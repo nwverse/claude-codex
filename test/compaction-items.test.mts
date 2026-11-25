@@ -268,6 +268,8 @@ test('the summary written in place of a compaction reads only, and any other too
     assert.equal(context?.approvalPolicy, 'on-request')
     assert.equal(context?.sandboxMode, 'read-only')
     assert.deepEqual(context?.allowedTools, ['Read', 'Glob', 'Grep'])
+    // Nothing resumes the summary's session, so it leaves no transcript.
+    assert.equal(context?.persistSession, false)
     // The call is refused without a card, and Claude goes on with the summary.
     assert.deepEqual(decisions, [{ decision: 'decline' }])
     assert.deepEqual(

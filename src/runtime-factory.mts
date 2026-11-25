@@ -14,6 +14,7 @@ import type {
   RuntimeHandlers,
   RuntimeLiveTask,
   RuntimeMcpServerStatus,
+  RuntimeSessionRef,
   RuntimeSteerOptions,
   RuntimeTurnContext,
   RuntimeTurnSettings,
@@ -202,6 +203,13 @@ class SelectableRuntime implements ClaudeRuntime {
       if (statuses) return statuses
     }
     return null
+  }
+
+  // A Claude thread's turns run on the configured backend, which knows where
+  // it keeps their sessions. A session another backend wrote (a prefixed id)
+  // is not one it can place.
+  sessionTranscript(session: RuntimeSessionRef): { configDir: string | null } | null {
+    return this.runtimeFor(this.config.type).sessionTranscript?.(session) ?? null
   }
 
   private runtimeFor(type: RuntimeBackendType): ClaudeRuntime {

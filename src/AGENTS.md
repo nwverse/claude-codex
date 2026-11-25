@@ -61,6 +61,12 @@ Persistence:
   project folder of a thread's new workspace, so a chat resumes after its
   folder is moved or renamed, and decides when a missing transcript is
   certainly gone (a new session) or only out of reach (the turn fails).
+- `claude-config-roots.mts` — the config dirs a session's transcripts live
+  under: the adapter's own, a router's per model, and every one a session may
+  have run from; and `sdkSessionTranscript`, the one a thread's session is in
+  (its profile's resolved once per pinned fingerprint), which the native and
+  mock runtimes answer `ClaudeRuntime.sessionTranscript` with for
+  `Thread.claudeSession`.
 
 Codex and Claude Code config bridging:
 

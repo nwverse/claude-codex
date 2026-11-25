@@ -537,6 +537,11 @@ export interface RuntimeTurnContext {
   // Its Claude session opens with the parent's history, all older than this,
   // and what Claude left scheduled or running there stays the parent's.
   forkedAt?: number | null
+  // false: the session writes no Claude Code transcript (the SDK's
+  // persistSession), for a helper turn nothing resumes later, which other
+  // tools would list as the user's session. A fork still reads the
+  // transcript it resumes. Unset persists; backends without it ignore it.
+  persistSession?: boolean
   mcpServers: unknown | null
   allowedTools: string[] | null
   // Tools Claude must not use, as permission rules (the CLI's --disallowedTools).
@@ -1150,6 +1155,32 @@ export interface RuntimeMcpServerStatus {
   serverInfo: { name: string; version: string } | null
 }
 
+// Thread.claudeSession: the Claude Code session a Claude thread's turns
+// resume, the folder it was last written in, and the config dir it lives
+// under. A client on the same computer that also reads Claude Code
+// transcripts matches the thread to its transcript with it, instead of
+// showing the conversation twice. The thread's `path` stays null: the App
+// reads that as a Codex rollout.
+export interface ClaudeSessionRef {
+  id: string
+  cwd: string
+  // Absolute; null when the thread's model process profile is no longer
+  // configured as it was when the thread started, so its folder is unknown.
+  configDir: string | null
+}
+
+// The session a Claude thread's turns resume, as the server asks a backend
+// where its transcript is (ClaudeRuntime.sessionTranscript).
+export interface RuntimeSessionRef {
+  sessionId: string
+  // The thread's model: a model process profile's id or a Claude model.
+  model: string
+  // The profile configuration the thread pinned when it started.
+  modelProfileFingerprint: string | null
+  // The folder the session was last written in.
+  cwd: string
+}
+
 export interface ClaudeRuntime {
   runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void>
   // false: no running turn took the message. true: delivered, and
@@ -1209,4 +1240,11 @@ export interface ClaudeRuntime {
   // The MCP servers of the thread's live session, as Claude Code sees them;
   // null when no live session can say. Never rejects.
   mcpServerStatuses?(threadId: string): Promise<RuntimeMcpServerStatus[] | null>
+  // Where the backend keeps the Claude Code transcript of a thread's
+  // session, for Thread.claudeSession: the config dir its turns run with
+  // (null when the thread's model process profile is no longer configured
+  // as it was, so the dir is unknown). Null when the backend keeps no Claude
+  // Code transcript for that session. The server asks for every Thread it
+  // returns, so it must be cheap.
+  sessionTranscript?(session: RuntimeSessionRef): { configDir: string | null } | null
 }

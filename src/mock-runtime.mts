@@ -1,5 +1,6 @@
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { sdkSessionTranscript } from './claude-config-roots.mjs'
 import { SESSION_CHANGES_TOOL } from './session-changes.mjs'
 import { subagentItemsEnabled } from './subagent-items.mjs'
 import type {
@@ -10,6 +11,7 @@ import type {
   RuntimeHandlers,
   RuntimeLiveTask,
   RuntimeMcpServerStatus,
+  RuntimeSessionRef,
   RuntimeSteerOptions,
   RuntimeTurnContext,
   RuntimeTurnSettings,
@@ -1973,6 +1975,11 @@ export class MockRuntime implements ClaudeRuntime {
 
   async mcpServerStatuses(threadId: string): Promise<RuntimeMcpServerStatus[] | null> {
     return this.mcpSessions.get(threadId) ?? null
+  }
+
+  // Where the native runtime would keep it: the mock stands in for it.
+  sessionTranscript(session: RuntimeSessionRef): { configDir: string | null } | null {
+    return sdkSessionTranscript(session)
   }
 
   private scheduleBackgroundReport(

@@ -25,6 +25,19 @@ mode saved there) takes Claude Code's WebSearch tool away on the SDK route and
 WebSearch there whatever the web search setting says, as Claude Code's own
 setting decides [memories](/guide/gui#memories) there.
 
+## Native Agent SDK permissions
+
+On the `agent-sdk-sidecar` backend, the App's exact Full Access combination
+(`approval_policy=never` and `sandbox_mode=danger-full-access`, outside Plan mode)
+maps to Claude Agent SDK `bypassPermissions`. The adapter enables the SDK's
+required `allowDangerouslySkipPermissions` opt-in, so ordinary permission callbacks and
+Codex approval cards are not used for that thread. User-only interactions and MCP
+elicitation still use their explicit user-facing paths. This is a permission
+bypass, not an OS sandbox: use it only with appropriate environment and host
+isolation. Set
+`CLAUDE_CODEX_PERMISSION_MODE` when an explicit mode must override the App's
+policy; see [Configuration](/guide/configuration#reference-table).
+
 ## Harnesses
 
 With `CLAUDE_CODEX_NATIVE_CODEX=on`, each chat picks one of three harnesses from
