@@ -917,3 +917,121 @@ for (const sandbox of ['danger-full-access', 'workspace-write']) {
     )
   })
 }
+
+test('multi-block reasoning emits distinct summary parts instead of gluing bold headings', async () => {
+  const { messages, turn, replay } = await present(
+    emit([
+      { type: 'reasoning_delta', delta: '**Inspecting state**' },
+      { type: 'reasoning_delta', delta: '**Planning fix**', newPart: true },
+      { type: 'reasoning_delta', delta: ' (details)' },
+      { type: 'text_delta', delta: 'Done.' },
+    ]),
+  )
+  const reasoning = turn.items.find((item) => item.type === 'reasoning')
+  assert.ok(reasoning?.type === 'reasoning')
+  assert.deepEqual(reasoning.summary, ['**Inspecting state**', '**Planning fix** (details)'])
+  assert.deepEqual(
+    messages
+      .filter((message) => message.method === 'item/reasoning/summaryPartAdded')
+      .map((message) => message.params.summaryIndex),
+    [0, 1],
+  )
+  assert.deepEqual(
+    messages
+      .filter((message) => message.method === 'item/reasoning/summaryTextDelta')
+      .map((message) => [message.params.summaryIndex, message.params.delta]),
+    [
+      [0, '**Inspecting state**'],
+      [1, '**Planning fix**'],
+      [1, ' (details)'],
+    ],
+  )
+  const replayed = replay.items.find((item: ThreadItem) => item.type === 'reasoning')
+  assert.deepEqual(replayed, reasoning)
+})
+
+test('synthetic failedRequest text does not leak into agentMessage prose on error or compaction failure', async () => {
+  // 1. Mid-turn failed compaction followed by normal answer: no API Error agentMessage.
+  {
+    const { messages, turn } = await present(
+      emit([
+        { type: 'text_delta', delta: 'Before compaction.' },
+        { type: 'compaction_started' },
+        { type: 'message_boundary', failedRequest: true },
+        {
+          type: 'text_delta',
+          delta: 'API Error: Server error mid-response. The response above may be incomplete.',
+          failedRequest: true,
+        },
+        {
+          type: 'compaction_failed',
+          message:
+            'Claude could not compact the conversation: API Error: Server error mid-response. The response above may be incomplete.',
+        },
+        { type: 'message_boundary' },
+        { type: 'text_delta', delta: 'After recovery.' },
+      ]),
+    )
+    assert.deepEqual(
+      assistantItems(turn.items).map((item) => [item.phase, item.text]),
+      [
+        ['commentary', 'Before compaction.'],
+        ['final_answer', 'After recovery.'],
+      ],
+    )
+    assert.deepEqual(
+      messages
+        .filter((message) => message.method === 'warning')
+        .map((message) => message.params.message),
+      [
+        'Claude could not compact the conversation: API Error: Server error mid-response. The response above may be incomplete.',
+      ],
+    )
+  }
+
+  // 2. Failed turn: synthetic API Error stub is not duplicated as an agentMessage.
+  {
+    const { turn } = await present(async (handlers) => {
+      await handlers.onEvent({ type: 'message_boundary', failedRequest: true })
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: 'API Error: 503 no eligible upstream account is currently available',
+        failedRequest: true,
+      })
+      await handlers.onEvent({
+        type: 'completed',
+        success: false,
+        result: 'API Error: 503 no eligible upstream account is currently available',
+        failure: { terminalReason: null, category: 'server_error', status: 503 },
+      })
+    })
+    assert.equal(turn.status, 'failed')
+    assert.deepEqual(assistantItems(turn.items), [])
+  }
+
+  // 3. Mid-turn synthetic API Error outside compaction that recovers: surfaces as notice, not prose.
+  {
+    const { messages, turn } = await present(
+      emit([
+        { type: 'message_boundary', failedRequest: true },
+        {
+          type: 'text_delta',
+          delta: 'API Error: Server error mid-response.',
+          failedRequest: true,
+        },
+        { type: 'message_boundary' },
+        { type: 'text_delta', delta: 'Recovered answer.' },
+      ]),
+    )
+    assert.deepEqual(
+      assistantItems(turn.items).map((item) => [item.phase, item.text]),
+      [['final_answer', 'Recovered answer.']],
+    )
+    assert.deepEqual(
+      messages
+        .filter((message) => message.method === 'warning')
+        .map((message) => message.params.message),
+      ['API Error: Server error mid-response.'],
+    )
+  }
+})

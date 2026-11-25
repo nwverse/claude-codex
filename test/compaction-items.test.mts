@@ -282,3 +282,98 @@ test('the summary written in place of a compaction reads only, and any other too
     assert.deepEqual(summary?.type === 'agentMessage' && summary.text, 'SUMMARY: work so far.')
   })
 })
+
+test('a /compact that hits a transient 503 retries once and compacts without a false failure notice', async () => {
+  let compactCalls = 0
+  const runtime = scriptedRuntime(
+    async (context, handlers) => {
+      if (context.prompt === '/compact') {
+        compactCalls += 1
+        if (compactCalls === 1) {
+          await handlers.onEvent({
+            type: 'compaction_failed',
+            message:
+              'Claude could not compact the conversation: API Error: 503 Server error mid-response.',
+          })
+          await handlers.onEvent({ type: 'completed', success: true, result: '' })
+          return
+        }
+        await handlers.onEvent({
+          type: 'compaction_completed',
+          trigger: 'manual',
+          preTokens: 120_000,
+          postTokens: 12_000,
+        })
+        await handlers.onEvent({ type: 'completed', success: true, result: '' })
+        return
+      }
+      await handlers.onEvent({ type: 'session', claudeSessionId: 'claude-session' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'done' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+    },
+    { compactsSessions: () => true },
+  )
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    const first = await app.startTurn(threadId, 'hello')
+    await app.turnCompleted(first)
+    await app.request('thread/compact/start', { threadId })
+    const compactTurn = await app.waitFor(
+      () => app.notified('turn/started').find((params) => params.turn.id !== first)?.turn.id,
+    )
+    assert.equal((await app.turnCompleted(compactTurn)).status, 'completed')
+    assert.equal(compactCalls, 2)
+    assert.deepEqual(storedTypes(app, compactTurn), ['contextCompaction'])
+    assert.deepEqual(app.notified('thread/compacted'), [{ threadId, turnId: compactTurn }])
+    assert.deepEqual(app.notified('error'), [])
+    assert.deepEqual(app.notified('warning'), [])
+  })
+})
+
+test('a /compact that fails with 503 on both attempts publishes the failure once and falls back', async () => {
+  let compactCalls = 0
+  const failure =
+    'Claude could not compact the conversation: API Error: 503 no eligible upstream account'
+  const runtime = scriptedRuntime(
+    async (context, handlers) => {
+      if (context.prompt === '/compact') {
+        compactCalls += 1
+        await handlers.onEvent({ type: 'compaction_failed', message: failure })
+        await handlers.onEvent({ type: 'completed', success: true, result: '' })
+        return
+      }
+      if (context.purpose === 'compact') {
+        await handlers.onEvent({ type: 'text_delta', delta: 'Fallback summary.' })
+        await handlers.onEvent({ type: 'completed', success: true, result: 'Fallback summary.' })
+        return
+      }
+      await handlers.onEvent({ type: 'session', claudeSessionId: 'claude-session' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'done' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+    },
+    { compactsSessions: () => true },
+  )
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    const first = await app.startTurn(threadId, 'hello')
+    await app.turnCompleted(first)
+    await app.request('thread/compact/start', { threadId })
+    const compactTurn = await app.waitFor(
+      () => app.notified('turn/started').find((params) => params.turn.id !== first)?.turn.id,
+    )
+    assert.equal((await app.turnCompleted(compactTurn)).status, 'completed')
+    assert.equal(compactCalls, 2)
+    assert.deepEqual(storedTypes(app, compactTurn), ['agentMessage'])
+    assert.deepEqual(app.notified('thread/compacted'), [])
+    assert.deepEqual(
+      app.notified('warning').map((params) => params.message),
+      [failure],
+    )
+    assert.deepEqual(
+      app
+        .notified('error')
+        .map((params) => [params.turnId, params.willRetry, params.error.message]),
+      [[compactTurn, true, failure]],
+    )
+  })
+})

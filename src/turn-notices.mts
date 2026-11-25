@@ -61,6 +61,17 @@ export class TurnNoticeLog {
     return { warn: true, show: true }
   }
 
+  // Drops notices that a later event made obsolete (for example, a transient
+  // compaction failure once a later compaction in the same turn succeeds), so
+  // an unrelated failure later in the turn does not repeat them in its details.
+  clearMatching(key: string, predicate: (message: string) => boolean): void {
+    const entry = this.turns.get(key)
+    if (!entry) return
+    for (const message of [...entry.seen]) {
+      if (predicate(message)) entry.seen.delete(message)
+    }
+  }
+
   // The turn's notices, in the order they came.
   messages(key: string): string[] {
     return [...(this.turns.get(key)?.seen ?? [])]

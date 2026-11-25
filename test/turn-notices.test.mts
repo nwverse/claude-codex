@@ -211,3 +211,46 @@ test('a notice between turns shows under the running turn, else the last one', a
     assert.equal((await app.turnCompleted(running)).status, 'completed')
   })
 })
+
+test('a later successful compaction clears obsolete compaction-failure notices from failure details', async () => {
+  const log = new TurnNoticeLog()
+  log.record('t1', 'Claude could not compact the conversation: HTTP 503')
+  log.record('t1', 'Claude switched to claude-b.')
+  log.clearMatching('t1', (m) => m.startsWith('Claude could not compact the conversation'))
+  assert.deepEqual(log.messages('t1'), ['Claude switched to claude-b.'])
+
+  const runtime = scriptedRuntime(async (_context, handlers) => {
+    await handlers.onEvent({ type: 'compaction_started' })
+    await handlers.onEvent({
+      type: 'compaction_failed',
+      message: 'Claude could not compact the conversation: API Error: Server error mid-response.',
+    })
+    await handlers.onEvent({ type: 'compaction_started' })
+    await handlers.onEvent({
+      type: 'compaction_completed',
+      trigger: 'auto',
+      preTokens: 160_000,
+      postTokens: 15_000,
+    })
+    await handlers.onEvent({
+      type: 'notice',
+      level: 'warning',
+      message: 'Claude switched to claude-b.',
+    })
+    await handlers.onEvent({
+      type: 'completed',
+      success: false,
+      result: 'Unrelated failure.',
+      failure: { terminalReason: null, category: null, status: null },
+    })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    const turnId = await app.startTurn(threadId, 'go')
+    const completed = await app.turnCompleted(turnId)
+    assert.equal(completed.status, 'failed')
+    const details = completed.error.additionalDetails ?? ''
+    assert.match(details, /Claude switched to claude-b\./)
+    assert.doesNotMatch(details, /Claude could not compact the conversation/)
+  })
+})

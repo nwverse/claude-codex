@@ -197,6 +197,9 @@ interface PendingTurn {
   // streamed ones and emitting a boundary only when the message id changes.
   assistantMessageId: string | null
   streamedBlocks: Map<number, { type: string; text: string }>
+  thinkingBlockIndex: number | null
+  thinkingEmitted: boolean
+  autoModeFallbackTriggered: boolean
   // Subagent suppression — when a Task/Agent tool_use opens a subagent, all
   // nested tool_use / text / thinking events should be hidden from the App
   // timeline until the matching tool_result closes the parent Task.
@@ -1838,6 +1841,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       reject,
       assistantMessageId: null,
       streamedBlocks: new Map(),
+      thinkingBlockIndex: null,
+      thinkingEmitted: false,
+      autoModeFallbackTriggered: false,
       activeSubagents: new Set(),
       completedWorkflowTasks: new Set(),
       workflowToolUseIds: new Set(),
@@ -1973,6 +1979,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       const info = modelInfoFor(models, model)
       if (info?.supportsAutoMode === false)
         return `${stringOrNull(info.displayName) ?? model ?? 'The default model'} does not support auto mode`
+      if (Array.isArray(models) && models.length > 0 && model && info == null)
+        return `${model} does not support auto mode`
     }
     let failure: unknown = null
     const settled = await settlesWithin(
@@ -1992,6 +2000,37 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return null
   }
 
+  // When Claude Code's server-side auto-mode classifier is unreachable (e.g.
+  // through a custom inference proxy), exit auto mode immediately back to the
+  // thread's configured policy instead of letting repeated classifier denials
+  // kill the turn and its subagents.
+  private async fallbackFromBrokenAutoMode(pending: PendingTurn, reason: string): Promise<void> {
+    if (pending.autoModeFallbackTriggered) return
+    pending.autoModeFallbackTriggered = true
+    const session = pending.session
+    const targetMode = derivePermissionMode(
+      pending.context.approvalPolicy,
+      pending.context.sandboxMode,
+      pending.context.planMode,
+    )
+    const query = session.query as
+      | (Query & { setPermissionMode?: (mode: string) => Promise<void> })
+      | null
+    if (query?.setPermissionMode && targetMode !== 'auto') {
+      let failed = false
+      const settled = await settlesWithin(
+        query.setPermissionMode(targetMode).catch(() => {
+          failed = true
+        }),
+        SESSION_CONTROL_TIMEOUT_MS,
+      )
+      session.permissionMode = settled && !failed ? targetMode : 'unconfirmed'
+    } else if (session.permissionMode === 'auto') {
+      session.permissionMode = 'unconfirmed'
+    }
+    await pending.handlers.onEvent({ type: 'auto_review_unavailable', reason })
+  }
+
   private serialize(session: LiveSession, task: () => Promise<void> | void): Promise<void> {
     const run = session.chain.then(task)
     session.chain = run.catch(() => {})
@@ -2008,7 +2047,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         if (session.closed) break
       }
     } catch (err) {
-      failure = err instanceof Error ? err : new Error(String(err))
+      const raw = err instanceof Error ? err : new Error(String(err))
+      failure = formatSessionExitError(raw)
+      if (failure !== raw) {
+        debugLog('native.session.exit_error', {
+          threadId: session.threadId,
+          raw: raw.message,
+          formatted: failure.message,
+        })
+      }
     }
     await this.serialize(session, () => this.endSession(session, failure))
   }
@@ -3052,6 +3099,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         return
       }
       if (key) pending.notificationKeys.add(key)
+      if (isAutoModeClassifierOutage(text)) {
+        await this.fallbackFromBrokenAutoMode(pending, text)
+      }
       await pending.handlers.onEvent({
         type: 'notice',
         level: message.color === 'error' ? 'error' : 'warning',
@@ -3096,14 +3146,23 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // The auto-mode classifier's verdict is the review the App shows on the
       // call's item; the server warns when it has no item for the call.
       // App rule: auto-review
-      if (message.decision_reason_type === 'classifier' && toolUseId) {
-        await pending.handlers.onEvent({
-          type: 'tool_denied',
-          toolUseId,
-          toolName,
-          autoReview: { rationale: reason || stringOrNull(message.message)?.trim() || null },
-        })
-        return
+      const detail = reason || stringOrNull(message.message)?.trim() || null
+      if (message.decision_reason_type === 'classifier') {
+        if (isAutoModeClassifierOutage(detail)) {
+          await this.fallbackFromBrokenAutoMode(
+            pending,
+            detail || 'Auto mode classifier is unavailable',
+          )
+        }
+        if (toolUseId) {
+          await pending.handlers.onEvent({
+            type: 'tool_denied',
+            toolUseId,
+            toolName,
+            autoReview: { rationale: detail },
+          })
+          return
+        }
       }
       if (toolUseId) await pending.handlers.onEvent({ type: 'tool_denied', toolUseId })
       await pending.handlers.onEvent({
@@ -3386,6 +3445,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       } else if (deltaType === 'text_delta') {
         const text = String(delta.text ?? '')
         if (!text) return
+        pending.thinkingBlockIndex = null
+        pending.thinkingEmitted = false
         this.recordStreamedBlock(pending, event.index, 'text', text)
         // Special-case: StructuredOutput synthetic tool buffers text and emits
         // only the final coerced JSON; suppress raw deltas while it's active.
@@ -3397,8 +3458,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       } else if (deltaType === 'thinking_delta') {
         const thinking = String(delta.thinking ?? '')
         if (!thinking) return
+        const blockIndex = typeof event.index === 'number' ? event.index : 0
+        const newPart = pending.thinkingEmitted && pending.thinkingBlockIndex !== blockIndex
+        pending.thinkingBlockIndex = blockIndex
+        pending.thinkingEmitted = true
         this.recordStreamedBlock(pending, event.index, 'thinking', thinking)
-        await pending.handlers.onEvent({ type: 'reasoning_delta', delta: thinking })
+        await pending.handlers.onEvent({
+          type: 'reasoning_delta',
+          delta: thinking,
+          ...(newPart ? { newPart: true } : {}),
+        })
       }
     }
   }
@@ -3412,6 +3481,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (messageId ? messageId === pending.assistantMessageId : !streamStart) return
     pending.assistantMessageId = messageId
     pending.streamedBlocks = new Map()
+    pending.thinkingBlockIndex = null
+    pending.thinkingEmitted = false
     pending.toolInputPreviews?.clear()
     if (!pending.context?.outputFormat) {
       await pending.handlers.onEvent({
@@ -3433,13 +3504,17 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     blocks.set(blockIndex, { type, text: (previous?.type === type ? previous.text : '') + text })
   }
 
-  private unstreamedBlockText(pending: PendingTurn, type: string, text: string): string {
+  private unstreamedBlock(
+    pending: PendingTurn,
+    type: string,
+    text: string,
+  ): { text: string; matched: boolean } {
     for (const [index, block] of pending.streamedBlocks ?? []) {
       if (block.type !== type || !text.startsWith(block.text)) continue
       pending.streamedBlocks.delete(index)
-      return text.slice(block.text.length)
+      return { text: text.slice(block.text.length), matched: true }
     }
-    return text
+    return { text, matched: false }
   }
 
   private async handleAssistant(
@@ -3454,11 +3529,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const agentId = nestedMessage ? stringOrNull(message.agent_id) : null
     // The CLI answers a request that failed for good with an assistant
     // message naming the error; the result then carries its HTTP status. The
-    // message shows, but is no sign Claude got on with the turn.
+    // message is a runtime error stub, not normal assistant prose or progress.
     const apiError = stringOrNull(message.error)
-    const failed = !nestedMessage && apiError != null ? { failedRequest: true } : {}
+    const isApiError = apiError != null || message.isApiErrorMessage === true
+    const failed = !nestedMessage && isApiError ? { failedRequest: true } : {}
     if (!nestedMessage) {
-      await this.beginAssistantMessage(pending, stringOrNull(inner.id), false, apiError != null)
+      await this.beginAssistantMessage(pending, stringOrNull(inner.id), false, isApiError)
       pending.model = stringOrNull(inner.model) ?? pending.model
       pending.apiError = apiError ? { category: apiError, status: null } : null
       const usage = recordOrNull(inner.usage)
@@ -3473,17 +3549,36 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       const blockType = String(block.type ?? '')
       if (blockType === 'text') {
         if (nestedMessage) continue
-        const text = this.unstreamedBlockText(pending, 'text', String(block.text ?? ''))
+        const { text } = this.unstreamedBlock(pending, 'text', String(block.text ?? ''))
         if (pending.context?.outputFormat) {
           pending.structuredBuffer += text
         } else if (text) {
+          pending.thinkingBlockIndex = null
+          pending.thinkingEmitted = false
           await pending.handlers.onEvent({ type: 'text_delta', delta: text, ...failed })
         }
       } else if (blockType === 'thinking') {
         if (nestedMessage) continue
-        const thinking = this.unstreamedBlockText(pending, 'thinking', String(block.thinking ?? ''))
-        if (thinking) await pending.handlers.onEvent({ type: 'reasoning_delta', delta: thinking })
+        const { text: thinking, matched } = this.unstreamedBlock(
+          pending,
+          'thinking',
+          String(block.thinking ?? ''),
+        )
+        if (thinking) {
+          const newPart = !matched && pending.thinkingEmitted
+          if (!matched) pending.thinkingBlockIndex = null
+          pending.thinkingEmitted = true
+          await pending.handlers.onEvent({
+            type: 'reasoning_delta',
+            delta: thinking,
+            ...(newPart ? { newPart: true } : {}),
+          })
+        }
       } else if (blockType === 'tool_use') {
+        if (!nestedMessage) {
+          pending.thinkingBlockIndex = null
+          pending.thinkingEmitted = false
+        }
         const id = String(block.id ?? '')
         const name = String(block.name ?? '')
         const input = (block.input as Record<string, unknown>) || {}
@@ -4041,6 +4136,54 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       return
     }
   }
+}
+
+const SIGNAL_EXIT_NAMES: Readonly<Record<number, string>> = {
+  130: 'SIGINT',
+  137: 'SIGKILL',
+  143: 'SIGTERM',
+}
+
+const BENIGN_CLI_STDERR_LINE =
+  /^(?:\[claude-code:unrecognized_model\](?:\s|$)|Claude Code doesn't recognize the model\b)/
+
+// Cleans up Claude Agent SDK process exit errors before they surface to the
+// user: drops benign startup telemetry (such as [claude-code:unrecognized_model]
+// emitted for custom proxy models) from the stderr tail, and explains POSIX
+// signal exit codes (e.g. 143 -> SIGTERM) clearly.
+export function formatSessionExitError(error: Error): Error {
+  const match =
+    /^(Claude Code process exited with code (\d+)|Claude Code process terminated by signal (SIG[A-Z0-9]+))(?:\.\s*stderr:\s*([\s\S]*))?$/.exec(
+      error.message.trim(),
+    )
+  if (!match) return error
+  const rawPrefix = match[1] ?? error.message
+  const exitCode = match[2] != null ? Number(match[2]) : null
+  const rawStderr = match[4] ?? ''
+  const signalName = exitCode != null ? SIGNAL_EXIT_NAMES[exitCode] : undefined
+  const prefix =
+    signalName != null
+      ? `Claude Code process was ${signalName === 'SIGKILL' ? 'killed' : signalName === 'SIGINT' ? 'interrupted' : 'terminated'} by ${signalName} (exit code ${exitCode})`
+      : rawPrefix
+  const keptLines = rawStderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !BENIGN_CLI_STDERR_LINE.test(line))
+  const cleanedStderr = keptLines.join('\n')
+  const formattedMessage = cleanedStderr ? `${prefix}. stderr: ${cleanedStderr}` : `${prefix}.`
+  if (formattedMessage === error.message) return error
+  const carried = error as Error & { codexErrorInfo?: unknown; additionalDetails?: unknown }
+  return Object.assign(new Error(formattedMessage, { cause: error }), {
+    ...('codexErrorInfo' in carried ? { codexErrorInfo: carried.codexErrorInfo } : {}),
+    ...('additionalDetails' in carried ? { additionalDetails: carried.additionalDetails } : {}),
+  })
+}
+
+function isAutoModeClassifierOutage(text: string | null): boolean {
+  if (!text) return false
+  return /classifier unavailable|auto mode (?:is )?unavailable|auto mode classifier gave no verdict/i.test(
+    text,
+  )
 }
 
 // A message's content blocks; a message whose content is plain text has none.

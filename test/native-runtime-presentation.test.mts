@@ -194,7 +194,50 @@ test('native presentation deduplicates per content block without losing adjacent
     { type: 'text_delta', delta: ' second' },
     { type: 'text_delta', delta: 'First' },
     { type: 'reasoning_delta', delta: 'One thought' },
-    { type: 'reasoning_delta', delta: 'Another thought' },
+    { type: 'reasoning_delta', delta: 'Another thought', newPart: true },
+  ])
+})
+
+test('native presentation marks separate thinking blocks as new reasoning parts without splitting chunks', async () => {
+  const events = await collect([
+    start('multi-think'),
+    delta('thinking', '**Inspecting ', 0),
+    delta('thinking', 'state**', 0),
+    delta('thinking', '**Planning fix**', 1),
+    assistant('multi-think', [{ type: 'thinking', thinking: '**Inspecting state**' }]),
+    assistant('multi-think', [{ type: 'thinking', thinking: '**Planning fix**' }]),
+    assistant('multi-think', [{ type: 'thinking', thinking: '**Verifying output**' }]),
+  ])
+  assert.deepEqual(events, [
+    { type: 'message_boundary' },
+    { type: 'reasoning_delta', delta: '**Inspecting ' },
+    { type: 'reasoning_delta', delta: 'state**' },
+    { type: 'reasoning_delta', delta: '**Planning fix**', newPart: true },
+    { type: 'reasoning_delta', delta: '**Verifying output**', newPart: true },
+  ])
+})
+
+test('native presentation marks isApiErrorMessage synthetic assistant stubs as failedRequest', async () => {
+  const events = await collect([
+    {
+      type: 'assistant',
+      isApiErrorMessage: true,
+      message: {
+        id: 'msg_synthetic_mid',
+        model: '<synthetic>',
+        content: [
+          text('API Error: Server error mid-response. The response above may be incomplete.'),
+        ],
+      },
+    },
+  ])
+  assert.deepEqual(events, [
+    { type: 'message_boundary', failedRequest: true },
+    {
+      type: 'text_delta',
+      delta: 'API Error: Server error mid-response. The response above may be incomplete.',
+      failedRequest: true,
+    },
   ])
 })
 

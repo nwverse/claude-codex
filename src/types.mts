@@ -728,7 +728,7 @@ export type RuntimeEvent =
   // with the turn.
   | { type: 'message_boundary'; failedRequest?: boolean }
   | { type: 'text_delta'; delta: string; failedRequest?: boolean }
-  | { type: 'reasoning_delta'; delta: string }
+  | { type: 'reasoning_delta'; delta: string; newPart?: boolean }
   | {
       type: 'tool_use'
       toolUseId: string

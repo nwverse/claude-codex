@@ -486,6 +486,15 @@ const MAX_FINISHED_BACKGROUND_AGENTS = 256
 // Command items a background shell's later output may still go to.
 const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
+const COMPACTION_FAILED_PREFIX = 'Claude could not compact the conversation'
+const COMPACT_TRANSIENT_RETRY_MS = 500
+
+function isTransientCompactionFailure(message: string | null): boolean {
+  if (!message) return false
+  return /\b(?:502|503|504|529|429)\b|server error mid-response|overloaded|temporarily unavailable|no eligible upstream account|upstream request failed|rate_limit/i.test(
+    message,
+  )
+}
 
 // What a turn hears that does not show Claude getting on with it: a request
 // it will send again, a notice (a model fallback, a compaction that failed),
@@ -4421,15 +4430,32 @@ export class CodexClaudeAppServer {
         current.claudeSessionId &&
         this.runtime.compactsSessions?.() === true
       ) {
-        compacted = await this.runSessionCompaction(peer, current, turnId, active, () =>
-          endCompactItem(true),
-        ).catch((error) => {
-          debugLog('thread.compact.session_failed', {
-            threadId,
-            error: error instanceof Error ? error.message : String(error),
+        const attemptCompact = async (publishFailureNotice: boolean) =>
+          this.runSessionCompaction(
+            peer,
+            current,
+            turnId,
+            active,
+            () => endCompactItem(true),
+            publishFailureNotice,
+          ).catch((error) => {
+            const message = error instanceof Error ? error.message : String(error)
+            debugLog('thread.compact.session_failed', { threadId, error: message })
+            return { compacted: false, failure: message, noticeMessage: null as string | null }
           })
-          return false
-        })
+        let result = await attemptCompact(false)
+        if (!result.compacted && active() && isTransientCompactionFailure(result.failure)) {
+          debugLog('thread.compact.session_retrying', {
+            threadId,
+            turnId,
+            failure: result.failure,
+          })
+          await new Promise((resolve) => setTimeout(resolve, COMPACT_TRANSIENT_RETRY_MS))
+          if (active()) result = await attemptCompact(true)
+        } else if (!result.compacted && active() && result.noticeMessage) {
+          this.publishNotice(peer, current.id, turnId, result.noticeMessage)
+        }
+        compacted = result.compacted
         sessionFailed = !compacted
       }
       // The summary written next is not the session's compaction.
@@ -4520,7 +4546,8 @@ export class CodexClaudeAppServer {
     turnId: string,
     active: () => boolean,
     completeCompactItem: () => void,
-  ): Promise<boolean> {
+    publishFailureNotice = true,
+  ): Promise<{ compacted: boolean; failure: string | null; noticeMessage: string | null }> {
     // The settings of the thread's last turn keep its session's signature,
     // so the live session takes the command instead of a new one opening.
     const params = this.permissionlessTurnParams(this.lastTurnParamsByThread.get(thread.id) ?? {})
@@ -4535,6 +4562,7 @@ export class CodexClaudeAppServer {
     }
     let compacted = false
     let failure: string | null = null
+    let noticeMessage: string | null = null
     // A helper thread's session leaves no transcript to resume: the thread
     // goes on naming the session it resumed, as after its user turns.
     const keepsSession = context.persistSession !== false
@@ -4566,7 +4594,8 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'compaction_failed') {
             failure = event.message
-            this.publishNotice(peer, thread.id, turnId, event.message)
+            noticeMessage = event.message
+            if (publishFailureNotice) this.publishNotice(peer, thread.id, turnId, event.message)
             return
           }
           if (event.type === 'notice') {
@@ -4606,7 +4635,7 @@ export class CodexClaudeAppServer {
         turnId,
         failure,
       })
-    return compacted
+    return { compacted, failure, noticeMessage }
   }
 
   // Calls into the runtime with a structured "give me a 1-paragraph summary"
@@ -5490,7 +5519,9 @@ export class CodexClaudeAppServer {
     const itemIds = new Map<string, string>()
     let agentItemId: string | null = null
     let reasoningItemId: string | null = null
+    let reasoningPartIndex = 0
     let hasTextOutput = false
+    let pendingFailedRequestNotice: string | null = null
     // What Claude Code reports beside the turn, once each: a warning, and a
     // row under the turn unless the turn is one the user does not watch.
     const noticesVisible = params.outputSchema == null
@@ -5581,9 +5612,16 @@ export class CodexClaudeAppServer {
     // then it stays raw content, kept in history but not shown.
     // App rule: reasoning-summary
     const reasoningVisible = reasoningSummariesVisible(this.configOverrides)
+    const flushPendingFailedRequestNotice = (): void => {
+      if (!pendingFailedRequestNotice) return
+      const message = pendingFailedRequestNotice
+      pendingFailedRequestNotice = null
+      publishNotice(message)
+    }
     const ensureReasoningItem = (): string => {
       if (reasoningItemId) return reasoningItemId
       reasoningItemId = newId()
+      reasoningPartIndex = 0
       const item: ThreadItem = {
         type: 'reasoning',
         id: reasoningItemId,
@@ -5616,6 +5654,7 @@ export class CodexClaudeAppServer {
           params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
         })
       reasoningItemId = null
+      reasoningPartIndex = 0
     }
     const completeAgentItem = (phase: 'commentary' | 'final_answer'): void => {
       if (!agentItemId) return
@@ -6524,6 +6563,18 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'text_delta') {
             if (event.delta.length === 0) return
+            // Synthetic API error messages Claude CLI writes when a request fails
+            // (e.g. mid-response 503/429 or failed compaction) are runtime errors,
+            // not assistant prose. Never open or append an agentMessage for them;
+            // a failed turn surfaces turn.error and a failed compaction publishes
+            // compaction_failed. Keep it only as a fallback notice if the turn
+            // recovers without a compaction_failed notice.
+            if (event.failedRequest) {
+              const trimmed = event.delta.trim()
+              if (trimmed && !compaction) pendingFailedRequestNotice = trimmed
+              return
+            }
+            flushPendingFailedRequestNotice()
             completeReasoningItem()
             hasTextOutput = true
             const itemId = ensureAgentItem()
@@ -6539,13 +6590,60 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'reasoning_delta') {
             if (event.delta.length === 0) return
+            flushPendingFailedRequestNotice()
             completeAgentItem('commentary')
+            const hadOpen = reasoningItemId !== null
             const itemId = ensureReasoningItem()
+            let partIndex = reasoningPartIndex
+            if (hadOpen && event.newPart) {
+              const existing = this.store
+                .getTurn(turn.id)
+                ?.items.find((candidate) => candidate.id === itemId)
+              const currentPart =
+                existing?.type === 'reasoning'
+                  ? ((reasoningVisible
+                      ? existing.summary[partIndex]
+                      : existing.content[partIndex]) ?? '')
+                  : ''
+              if (currentPart.length > 0) {
+                partIndex += 1
+                reasoningPartIndex = partIndex
+                this.store.streamItem(turn.id, itemId, (item) => {
+                  if (item.type !== 'reasoning') return item
+                  if (reasoningVisible) {
+                    const summary = [...item.summary]
+                    while (summary.length <= partIndex) summary.push('')
+                    return { ...item, summary }
+                  }
+                  const content = [...item.content]
+                  while (content.length <= partIndex) content.push('')
+                  return { ...item, content }
+                })
+                if (reasoningVisible) {
+                  this.notify(peer, {
+                    method: 'item/reasoning/summaryPartAdded',
+                    params: {
+                      threadId: thread.id,
+                      turnId: turn.id,
+                      itemId,
+                      summaryIndex: partIndex,
+                    },
+                  })
+                }
+              }
+            }
             this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type !== 'reasoning') return item
-              return reasoningVisible
-                ? { ...item, summary: [(item.summary[0] ?? '') + event.delta] }
-                : { ...item, content: [(item.content[0] ?? '') + event.delta] }
+              if (reasoningVisible) {
+                const summary = [...item.summary]
+                while (summary.length <= partIndex) summary.push('')
+                summary[partIndex] = (summary[partIndex] ?? '') + event.delta
+                return { ...item, summary }
+              }
+              const content = [...item.content]
+              while (content.length <= partIndex) content.push('')
+              content[partIndex] = (content[partIndex] ?? '') + event.delta
+              return { ...item, content }
             })
             this.notify(peer, {
               method: reasoningVisible
@@ -6556,12 +6654,13 @@ export class CodexClaudeAppServer {
                 turnId: turn.id,
                 itemId,
                 delta: event.delta,
-                ...(reasoningVisible ? { summaryIndex: 0 } : { contentIndex: 0 }),
+                ...(reasoningVisible ? { summaryIndex: partIndex } : { contentIndex: partIndex }),
               },
             })
             return
           }
           if (event.type === 'tool_use') {
+            flushPendingFailedRequestNotice()
             if (isWorkflowToolName(event.toolName)) {
               workflowLaunchToolUseIds.add(event.toolUseId)
               workflowInFlight = true
@@ -6745,9 +6844,13 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'compaction_completed') {
             // A boundary can arrive without the status before it.
+            pendingFailedRequestNotice = null
             completeMessage()
             startCompactionItem()
             endCompaction(true)
+            this.turnNotices.clearMatching(turn.id, (message) =>
+              message.startsWith(COMPACTION_FAILED_PREFIX),
+            )
             this.notify(peer, {
               method: 'thread/compacted',
               params: { threadId: thread.id, turnId: turn.id },
@@ -6761,6 +6864,7 @@ export class CodexClaudeAppServer {
               turnId: turn.id,
               message: event.message,
             })
+            pendingFailedRequestNotice = null
             endCompaction(false)
             publishNotice(event.message)
             return
@@ -6927,8 +7031,11 @@ export class CodexClaudeAppServer {
                 this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
               }
             }
-            if (!event.success)
+            if (!event.success) {
+              pendingFailedRequestNotice = null
               throw turnFailure(event.result ?? 'Claude turn failed', event.failure)
+            }
+            flushPendingFailedRequestNotice()
           }
           if (event.type === 'error') {
             throw new Error(event.message)
