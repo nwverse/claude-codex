@@ -171,6 +171,7 @@ import {
   fallbackStructuredText,
   fileChangeFromTool,
   gitDiff,
+  helperThread,
   isSubagentToolName,
   listFiles,
   modelFromParams,
@@ -219,7 +220,12 @@ import {
 } from './server-helpers.mjs'
 import { sessionChanges, sessionChangesEnabled } from './session-changes.mjs'
 import { type SleepMonitor, SleepTracker, withSleepNotice } from './sleep-notice.mjs'
-import { PINNED_SECTION_ID, type SessionStore, settledTurn } from './store.mjs'
+import {
+  type DescendantThread,
+  PINNED_SECTION_ID,
+  type SessionStore,
+  settledTurn,
+} from './store.mjs'
 import {
   SUBAGENT_CALL_UNFINISHED,
   SubagentItems,
@@ -703,6 +709,27 @@ function unknownThread(threadId: string): RpcError {
   return invalidRequest(`unknown thread: ${threadId}`)
 }
 
+// Opaque cursor for thread/loaded/list: the last thread id returned by the
+// previous page over sorted loaded ids, so unloads between pages cannot shift
+// or skip later threads.
+function loadedThreadCursor(value: unknown): string | null {
+  if (value == null) return null
+  if (typeof value !== 'string' || !value.startsWith('after:') || value.length === 6)
+    throw invalidRequest('invalid loaded thread cursor')
+  return value.slice(6)
+}
+
+// What decides whether a thread is followed along with the chat it hangs off
+// (followedWithAncestor), read from its record.
+function followState(thread: ThreadRecord): DescendantThread {
+  return {
+    id: thread.id,
+    ephemeral: thread.ephemeral,
+    threadSource: thread.threadSource,
+    active: thread.status.type === 'active',
+  }
+}
+
 export interface ServerOptions {
   configOverrides?: readonly string[]
   sleepMonitor?: SleepMonitor
@@ -719,7 +746,16 @@ export class CodexClaudeAppServer {
   // The peers following each thread, by peer id, the latest subscriber last.
   // A thread's notifications and server requests go to all of them, the way
   // Codex app-server connections each subscribe to the threads they open.
+  // Its keys are the loaded threads (see unloadFinishedThreads).
   private subscribersByThread = new Map<string, Map<string, RpcPeer>>()
+  // Ephemeral threads whose latest turn is a structured helper turn (a title,
+  // description or summary), until that turn's work ends and they unload.
+  private helperThreads = new Set<string>()
+  // Whether each loaded thread is a subagent's, which never changes, so an
+  // unload sweep reads only those (unloadFinishedThreads). A sweep runs after
+  // every request the native bridge routes.
+  private subagentByThread = new Map<string, boolean>()
+  private unloadScheduled = false
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
   private activeTurnPermissionByThread = new Map<
@@ -1046,10 +1082,12 @@ export class CodexClaudeAppServer {
   }
 
   // Something that kept the adapter busy may have ended: the keep-awake
-  // guard and the daemon's idle exit look again.
+  // guard and the daemon's idle exit look again, and so does the unloading
+  // of the subagent and helper threads it ran on.
   private checkIdle(): void {
     this.idleSleep.check()
     this.idleCheckHandler?.()
+    this.scheduleUnload()
   }
 
   private async handleNotification(_peer: RpcPeer, _message: WireMessage): Promise<void> {
@@ -2714,7 +2752,9 @@ export class CodexClaudeAppServer {
   private threadUnsubscribe(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const subscribers = this.subscribersByThread.get(threadId)
-    if (!subscribers?.delete(peer.id)) return { status: 'notSubscribed' }
+    // As in Codex: a thread no client follows is not loaded.
+    if (!subscribers) return { status: 'notLoaded' }
+    if (!subscribers.delete(peer.id)) return { status: 'notSubscribed' }
     if (subscribers.size === 0) this.subscribersByThread.delete(threadId)
     // The peer drops the thread's request cards with it, so a later
     // thread/resume shows its pending requests again.
@@ -2725,14 +2765,22 @@ export class CodexClaudeAppServer {
     return { status: 'unsubscribed' }
   }
 
+  // The threads clients follow, as Codex lists the threads it holds in
+  // memory. Sorted ids with a cursor keyed on the last returned thread id keep
+  // unloads (a sweep here, a turn/agent end, or an unsubscribe) from shifting
+  // or skipping threads on later pages.
   private threadLoadedList(params: Record<string, unknown>): unknown {
-    const loaded = Array.from(this.subscribersByThread.keys())
-    const offset = offsetCursor(params.cursor, 'loaded thread')
-    const limit = pageLimit(params.limit) ?? (loaded.length || 50)
-    const end = offset + limit
+    const after = loadedThreadCursor(params.cursor)
+    this.unloadFinishedThreads()
+    const loaded = Array.from(this.subscribersByThread.keys()).sort()
+    const remaining = after == null ? loaded : loaded.filter((id) => id > after)
+    const limit = pageLimit(params.limit)
+    const data = limit == null ? remaining : remaining.slice(0, limit)
+    const last = data.at(-1)
+    const hasMore = limit != null && remaining.length > limit
     return {
-      data: loaded.slice(offset, end),
-      nextCursor: end < loaded.length ? String(end) : null,
+      data,
+      nextCursor: hasMore && last != null ? `after:${last}` : null,
     }
   }
 
@@ -3716,6 +3764,9 @@ export class CodexClaudeAppServer {
 
   private async removeThread(peer: RpcPeer, threadId: string): Promise<void> {
     await this.stopThreadWork(peer, threadId)
+    // Read before the threads go: they hear of every subagent thread that
+    // goes with it, unloaded ones included.
+    const treeFollowers = this.followersOf(threadId)
     const deleted = this.store.transaction(() => {
       for (const id of this.store.subagentTreeIds(threadId)) this.requireLocalOrIdle(id)
       return this.store.deleteThread(threadId)
@@ -3730,7 +3781,8 @@ export class CodexClaudeAppServer {
       this.subagentItems.forget(id)
       // Whoever deleted the thread hears it, and so does every follower.
       const targets = new Map([[peer.id, peer]])
-      for (const follower of this.subscribersOf(id)) targets.set(follower.id, follower)
+      for (const follower of [...treeFollowers, ...this.subscribersOf(id)])
+        targets.set(follower.id, follower)
       this.subscribersByThread.delete(id)
       for (const target of targets.values())
         this.sendNotification(target, { method: 'thread/deleted', params: { threadId: id } })
@@ -4421,20 +4473,25 @@ export class CodexClaudeAppServer {
     }
     let compacted = false
     let failure: string | null = null
+    // A helper thread's session leaves no transcript to resume: the thread
+    // goes on naming the session it resumed, as after its user turns.
+    const keepsSession = context.persistSession !== false
     await this.runtime
       .runTurn(context, {
         onEvent: async (event) => {
           // As in a user turn, where Claude's session ends up is where a
           // rewind to this turn resumes.
           if (event.type === 'checkpoint') {
-            this.store.setTurnCheckpoint(turnId, {
-              sessionId: event.claudeSessionId,
-              messageUuid: event.messageUuid,
-            })
+            if (keepsSession)
+              this.store.setTurnCheckpoint(turnId, {
+                sessionId: event.claudeSessionId,
+                messageUuid: event.messageUuid,
+              })
             return
           }
           if (!active()) return
           if (event.type === 'session') {
+            if (!keepsSession) return
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
             if (built.resumeSessionAt) this.store.clearClaudeResumeAt(thread.id)
             return
@@ -4455,7 +4512,7 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'completed') {
-            if (event.claudeSessionId)
+            if (keepsSession && event.claudeSessionId)
               this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
             if (!event.success) failure = event.result ?? 'Claude did not compact the conversation'
             return
@@ -4533,6 +4590,8 @@ export class CodexClaudeAppServer {
         effort: resolveClaudeEffort(thread.reasoningEffort ?? null),
         claudeSessionId: null,
         forkSession: false,
+        // Nothing resumes this session: it leaves no transcript.
+        persistSession: false,
         mcpServers: null,
         allowedTools: ['Read', 'Glob', 'Grep'],
         // With web search off, the summary cannot search either.
@@ -4706,6 +4765,7 @@ export class CodexClaudeAppServer {
     // summary model, for that turn alone; it never rebinds the thread's.
     const initialThread = structuredClone(thread)
     const summaryTurn = params.outputSchema != null
+    if (thread.ephemeral) this.markHelperTurn(threadId, summaryTurn)
     const requestedModel = modelFromParams(params, thread.model)
     // A helper thread on Claude maps a Codex model like thread/start does.
     // App rule: helper-thread-model
@@ -5298,6 +5358,7 @@ export class CodexClaudeAppServer {
       // parent is older than the second after it.
       forkedAt:
         !isCodexThread && thread.forkedFromId != null ? (thread.createdAt + 1) * 1000 : null,
+      ...(!isCodexThread && helperThread(thread) ? { persistSession: false } : {}),
       mcpServers: mcp.sdkValue,
       allowedTools: defaultAllowedTools(),
       inheritedAllowedTools: permissionRules?.allow ?? null,
@@ -5814,6 +5875,12 @@ export class CodexClaudeAppServer {
             message: `${toolName} was denied because the turn it asked for approval in had ended; the user can re-run it in a turn.`,
           }
     let resumedAtCheckpoint = false
+    // A helper thread's turn writes no transcript, so neither its session nor
+    // its checkpoints are recorded: nothing could resume them. The thread
+    // goes on naming the session it resumed, and its next turn starts from
+    // there again: an ephemeral fork from its parent's session, at the same
+    // point; any other helper thread from no session.
+    const keepsSession = context.persistSession !== false
     const runtimeTurn = this.runtime.runTurn(
       context,
       // What Claude streams, and the approvals and answers it waits on.
@@ -5826,10 +5893,11 @@ export class CodexClaudeAppServer {
           // Checkpoints are the exception: whatever Claude wrote last, even
           // after an interrupt, is where a rewind to this turn must resume.
           if (event.type === 'checkpoint') {
-            this.store.setTurnCheckpoint(turn.id, {
-              sessionId: event.claudeSessionId,
-              messageUuid: event.messageUuid,
-            })
+            if (keepsSession)
+              this.store.setTurnCheckpoint(turn.id, {
+                sessionId: event.claudeSessionId,
+                messageUuid: event.messageUuid,
+              })
             return
           }
           if (!turnIsActive()) return
@@ -5848,11 +5916,10 @@ export class CodexClaudeAppServer {
             this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
           if (event.type === 'subagent_progress') return
           if (event.type === 'session') {
+            if (resumeSessionAt) resumedAtCheckpoint = true
+            if (!keepsSession) return
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
-            if (resumeSessionAt) {
-              this.store.clearClaudeResumeAt(thread.id)
-              resumedAtCheckpoint = true
-            }
+            if (resumeSessionAt) this.store.clearClaudeResumeAt(thread.id)
             return
           }
           if (activeSubagents.size > 0 && !this.runtime.filtersNestedEvents?.(thread.id)) {
@@ -6796,7 +6863,7 @@ export class CodexClaudeAppServer {
               // next turn). Claude threads keep the original wiring.
               if (isCodexThread) {
                 this.store.updateCodexSessionId(thread.id, event.claudeSessionId)
-              } else {
+              } else if (keepsSession) {
                 this.store.updateClaudeSessionId(thread.id, event.claudeSessionId, context.cwd)
               }
             }
@@ -7292,6 +7359,8 @@ export class CodexClaudeAppServer {
         turn: this.toCompletedTurn(completed),
       },
     })
+    // Once what goes with the agent's end has gone out, its thread unloads.
+    this.scheduleUnload()
     return completed
   }
 
@@ -10923,7 +10992,7 @@ export class CodexClaudeAppServer {
   }
 
   private notifyThread(threadId: string, notification: { method: string; params: unknown }): void {
-    const peer = this.subscribersOf(threadId).at(-1)
+    const peer = this.followersOf(threadId).at(-1)
     if (peer) this.notify(peer, notification)
   }
 
@@ -11029,6 +11098,7 @@ export class CodexClaudeAppServer {
         }
       },
       checkIdle: () => this.checkIdle(),
+      markHelperTurn: (threadId, structured) => this.markHelperTurn(threadId, structured),
     })
   }
 
@@ -11182,6 +11252,8 @@ export class CodexClaudeAppServer {
     }
     // A turn that ended without a result leaves its live calls unsettled.
     this.liveCallUsageByThread.delete(threadId)
+    // A helper's or subagent's thread unloads once its turn has ended.
+    this.scheduleUnload()
     let settled: TurnRecord | null = null
     try {
       settled = turnId ? this.store.getTurn(turnId) : null
@@ -11489,20 +11561,23 @@ export class CodexClaudeAppServer {
   }
 
   // The peers a thread's message goes to: its followers, else those of the
-  // nearest forked-from ancestor (which the thread then inherits), else the
-  // peer that caused it.
+  // nearest forked-from ancestor, else the peer that caused it. The thread
+  // inherits the ancestor's followers, unless it is a subagent's or another
+  // ephemeral thread that nothing runs on: that one stays unloaded.
   private targetsForParams(peer: RpcPeer, params: unknown): RpcPeer[] {
     const threadId = stringOr(asRecord(params).threadId, '')
     if (!threadId) return [peer]
     const direct = this.subscribersByThread.get(threadId)
     if (direct?.size) return [...direct.values()]
     const seen = new Set<string>()
-    let current = this.store.getThread(threadId)
+    const thread = this.store.getThread(threadId)
+    let current = thread
     while (current?.forkedFromId && !seen.has(current.forkedFromId)) {
       seen.add(current.forkedFromId)
       const ancestor = this.subscribersByThread.get(current.forkedFromId)
       if (ancestor?.size) {
-        this.subscribersByThread.set(threadId, new Map(ancestor))
+        if (thread && this.followedWithAncestor(followState(thread)))
+          this.subscribersByThread.set(threadId, new Map(ancestor))
         return [...ancestor.values()]
       }
       current = this.store.getThread(current.forkedFromId)
@@ -11512,6 +11587,18 @@ export class CodexClaudeAppServer {
 
   private subscribersOf(threadId: string): RpcPeer[] {
     return [...(this.subscribersByThread.get(threadId)?.values() ?? [])]
+  }
+
+  // Who hears news of the thread, such as its archive: its followers, or for
+  // a subagent thread that unloaded when its agent was done, those of its
+  // chat, who followed it while it ran.
+  private followersOf(threadId: string): RpcPeer[] {
+    const followers = this.subscribersOf(threadId)
+    if (followers.length > 0 || this.store.getThread(threadId)?.threadSource !== 'subagent')
+      return followers
+    return this.targetsForParams(DETACHED_PEER, { threadId }).filter(
+      (peer) => peer !== DETACHED_PEER,
+    )
   }
 
   // Adds a follower to the thread, or moves it to the end as the latest.
@@ -11528,8 +11615,123 @@ export class CodexClaudeAppServer {
     subscribers.set(peer.id, peer)
   }
 
+  // A client that opens a chat follows what hangs below it that it would
+  // see live: its forks, any open ephemeral side chat another client still
+  // follows, and its subagent threads and helper forks while they run.
+  // Finished agents, finished helper forks and closed side chats stay unloaded.
   private bindPeerToDescendants(peer: RpcPeer, rootThreadId: string): void {
-    for (const id of this.store.descendantThreadIds(rootThreadId)) this.subscribe(id, peer)
+    for (const descendant of this.store.descendantThreads(rootThreadId))
+      if (this.followedWithAncestor(descendant)) this.subscribe(descendant.id, peer)
+  }
+
+  // Whether a thread is followed along with the chat it hangs off, by
+  // whoever follows that chat: a persistent fork always; a subagent or helper
+  // fork only while it runs; an ephemeral side chat while it runs or while
+  // another client still keeps it open.
+  private followedWithAncestor(thread: DescendantThread): boolean {
+    if (!thread.ephemeral && thread.threadSource !== 'subagent') return true
+    if (thread.active || this.runsWork(thread.id)) return true
+    return (
+      thread.threadSource !== 'subagent' &&
+      !this.helperThreads.has(thread.id) &&
+      this.subscribersByThread.has(thread.id)
+    )
+  }
+
+  // Whether this adapter runs anything on the thread or waits on a client
+  // there: a turn (one being started too), a request, a native Codex turn, or
+  // a background agent that the thread is, launched or hosts. A turn the
+  // store has in progress, here or in another adapter, shows as its active
+  // status instead.
+  private runsWork(threadId: string): boolean {
+    if (
+      this.activeTurnByThread.has(threadId) ||
+      this.startingTurnByThread.has(threadId) ||
+      this.pendingAutonomousTurns.has(threadId) ||
+      this.codexBridge?.runsThread(threadId)
+    )
+      return true
+    for (const pending of this.pendingServerRequests.values())
+      if (pending.threadId === threadId) return true
+    for (const entry of this.backgroundSubagents.values()) {
+      if (!entry.running) continue
+      const { childThreadId, hostThreadId } = entry.context
+      if (
+        childThreadId === threadId ||
+        hostThreadId === threadId ||
+        entry.parentThreadId === threadId
+      )
+        return true
+    }
+    return false
+  }
+
+  // A turn on an ephemeral thread: a structured one (a title, description or
+  // summary) makes it a helper's thread, which unloads once the turn's work
+  // ends, whether or not its client unsubscribes. The native bridge reports
+  // the turns it runs here too.
+  private markHelperTurn(threadId: string, structured: boolean): void {
+    if (structured) this.helperThreads.add(threadId)
+    else this.helperThreads.delete(threadId)
+  }
+
+  // Unloads the threads whose work just ended, once the notifications that
+  // end it have gone out.
+  private scheduleUnload(): void {
+    if (this.unloadScheduled || this.stopped) return
+    this.unloadScheduled = true
+    setImmediate(() => {
+      this.unloadScheduled = false
+      if (!this.stopped) this.unloadFinishedThreads()
+    })
+  }
+
+  // What "loaded" means here (thread/loaded/list): Codex holds a thread in
+  // memory while a client follows it, and unloads a sub-agent's thread once
+  // the agent is done. Here a chat stays loaded while a client follows it;
+  // a subagent thread whose agent no longer runs, and an ephemeral thread
+  // whose structured helper turn ended, unload. Should one run again (a
+  // SendMessage reopens a background agent), whoever follows its parent
+  // follows it again while it runs (targetsForParams).
+  private unloadFinishedThreads(): void {
+    try {
+      for (const threadId of this.helperThreads) {
+        if (this.runsWork(threadId) || this.store.getThread(threadId)?.status.type === 'active')
+          continue
+        this.helperThreads.delete(threadId)
+        this.unloadThread(threadId)
+      }
+      for (const threadId of [...this.subscribersByThread.keys()]) {
+        // A thread found not to be a subagent's is not read again.
+        if (this.subagentByThread.get(threadId) === false) continue
+        const thread = this.store.getThread(threadId)
+        if (!thread) continue
+        const subagent = thread.threadSource === 'subagent'
+        this.subagentByThread.set(threadId, subagent)
+        if (subagent && thread.status.type !== 'active' && !this.runsWork(threadId))
+          this.unloadThread(threadId)
+      }
+      for (const threadId of this.subagentByThread.keys())
+        if (!this.subscribersByThread.has(threadId)) this.subagentByThread.delete(threadId)
+    } catch (error) {
+      // A store that cannot be read now leaves them loaded until the next
+      // time. This runs inside setImmediate, where a throw stops the daemon.
+      debugLog('thread.unload_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  // Drops every follower of the thread. Each hears thread/closed, as the
+  // caller of thread/unsubscribe does (the App opts out of it).
+  private unloadThread(threadId: string): void {
+    const followers = this.subscribersByThread.get(threadId)
+    if (!followers) return
+    this.subscribersByThread.delete(threadId)
+    debugLog('thread.unloaded', { threadId, peerIds: [...followers.keys()] })
+    for (const follower of followers.values())
+      if (this.peers.has(follower.id))
+        this.sendNotification(follower, { method: 'thread/closed', params: { threadId } })
   }
 
   private loadPersistedConfig(

@@ -42,6 +42,10 @@ export interface CodexBridgeHost {
   configOverrides(): readonly string[]
   finishMirror(peer: RpcPeer, method: string, params: Record<string, unknown>): unknown
   checkIdle(): void
+  // The child accepted a turn on an ephemeral thread; `structured` when it
+  // is a helper's (a title, description or summary), which the thread
+  // unloads after.
+  markHelperTurn(threadId: string, structured: boolean): void
 }
 
 // Requests about a thread's conversation, answered by the child.
@@ -80,6 +84,23 @@ const FORWARDED = new Set([
   'turn/interrupt',
   'turn/settings/update',
   'review/start',
+])
+
+// Forwarded requests that only read the thread. As in Codex, where opening
+// or changing a thread subscribes the connection and reading it does not,
+// the caller does not follow the thread, and an observer that reads every
+// chat keeps none of them loaded.
+const READS = new Set([
+  'thread/read',
+  'thread/turns/list',
+  'thread/turns/items/list',
+  'thread/items/list',
+  'thread/items/read',
+  'thread/timeline/list',
+  'thread/searchOccurrences',
+  'thread/goal/get',
+  'thread/memory/read',
+  'thread/backgroundTerminals/list',
 ])
 
 // The adapter answers these from its own record; the child hears them too so
@@ -162,6 +183,16 @@ export class CodexNativeBridge {
       this.unannounced.size > 0 ||
       this.pendingRequests.size > 0
     )
+  }
+
+  // The same for one thread: its turn, one Codex has yet to announce, a
+  // claiming request on its way, or a request of its turn waiting on a
+  // client. A subagent or helper thread with none of them unloads.
+  runsThread(threadId: string): boolean {
+    if (this.holdsClaim(threadId) || this.startingTurns.has(threadId)) return true
+    for (const pending of this.pendingRequests.values())
+      if (pending.threadId === threadId) return true
+    return false
   }
 
   async stop(): Promise<void> {
@@ -263,7 +294,7 @@ export class CodexNativeBridge {
       if (!this.host.store.claimNativeTurn(threadId)) throw foreignTurnError(threadId)
       this.claimsInFlight.set(threadId, (this.claimsInFlight.get(threadId) ?? 0) + 1)
     }
-    this.host.subscribe(thread.id, peer)
+    if (!READS.has(method)) this.host.subscribe(thread.id, peer)
     this.requestsInFlight += 1
     this.clearIdleTimer()
     if (startsTurn) this.startingTurns.set(threadId, new Set())
@@ -303,6 +334,9 @@ export class CodexNativeBridge {
         return local
       }
       const result = await this.forward(thread, method, params)
+      // Before the idle check below, so a turn that already ended unloads.
+      if (method === 'turn/start' && thread.ephemeral)
+        this.host.markHelperTurn(thread.id, params.outputSchema != null)
       // A detached review runs on a thread of its own.
       if (
         ANNOUNCED_TURN.has(method) &&

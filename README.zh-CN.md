@@ -89,6 +89,8 @@ shim 会接管传给它的所有以 `app-server` 为首个参数的调用，包�
 
 完整步骤见 **[入门指南](https://nwverse.github.io/claude-codex/guide/getting-started)**。
 
+本机运行 Persona 节点时，可使用 [Persona 伴随进程](scripts/persona/README.md) 在 Agents 里查看和继续适配器线程，或调整模型和推理强度。
+
 ## 工作原理
 
 ```
