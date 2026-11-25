@@ -250,10 +250,37 @@ export function visibleMessageText(item: ThreadItem): string | null {
   return null
 }
 
-// Case-insensitive literal search; null for a blank term.
+// V8 compiles RegExp bytecode lazily and throws "Regular expression too large"
+// at .test()/.exec() time for multi-kilobyte patterns; cap regex compilation so
+// long valid queries (up to thread/search/stream's 65,536-byte limit) fall back
+// cleanly to literal case-insensitive matching.
+const MAX_SEARCH_REGEX_CHARS = 4096
+
+// Case-insensitive literal search; null for a blank term or an oversized query
+// that callers should handle with literal matching.
 export function searchPattern(term: string): RegExp | null {
-  if (!term.trim()) return null
-  return new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu')
+  if (!term.trim() || term.length > MAX_SEARCH_REGEX_CHARS) return null
+  try {
+    return new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu')
+  } catch {
+    return null
+  }
+}
+
+export function literalSearchMatches(text: string, term: string): Array<[number, number]> {
+  if (!term.trim() || text.length < term.length) return []
+  const haystack = text.toLowerCase()
+  const needle = term.toLowerCase()
+  if (!needle) return []
+  const ranges: Array<[number, number]> = []
+  let from = 0
+  while (from <= haystack.length - needle.length) {
+    const index = haystack.indexOf(needle, from)
+    if (index < 0) break
+    ranges.push([index, index + needle.length])
+    from = index + needle.length
+  }
+  return ranges
 }
 
 const SNIPPET_BEFORE = 40
@@ -294,16 +321,19 @@ export interface SearchOccurrence {
 // thread/searchOccurrences: every match in the thread's messages, oldest
 // first, with the thread/turns/list cursor of its turn.
 export function findOccurrences(turns: TurnRecord[], term: string): SearchOccurrence[] {
+  if (!term.trim()) return []
   const pattern = searchPattern(term)
-  if (!pattern) return []
   return turns.flatMap((turn) =>
     turn.items.flatMap((item) => {
       const text = visibleMessageText(item)
       if (!text) return []
-      return [...text.matchAll(pattern)].map((match) => ({
+      const ranges: Array<[number, number]> = pattern
+        ? [...text.matchAll(pattern)].map((match) => [match.index, match.index + match[0].length])
+        : literalSearchMatches(text, term)
+      return ranges.map(([start, end]) => ({
         turnId: turn.id,
         itemId: item.id,
-        ...snippetAt(text, match.index, match.index + match[0].length),
+        ...snippetAt(text, start, end),
         turnCursor: turn.id,
       }))
     }),
@@ -317,13 +347,19 @@ export function threadSnippet(
   turns: () => TurnRecord[],
   term: string,
 ): string | null {
+  if (!term.trim()) return null
   const pattern = searchPattern(term)
-  if (!pattern) return null
+  const lowerNeedle = pattern ? null : term.toLowerCase()
   const firstMatch = (text: string | null): string | null => {
     if (!text) return null
-    pattern.lastIndex = 0
-    const match = pattern.exec(text)
-    return match ? snippetAt(text, match.index, match.index + match[0].length).snippet : null
+    if (pattern) {
+      pattern.lastIndex = 0
+      const match = pattern.exec(text)
+      return match ? snippetAt(text, match.index, match.index + match[0].length).snippet : null
+    }
+    if (!lowerNeedle || text.length < lowerNeedle.length) return null
+    const index = text.toLowerCase().indexOf(lowerNeedle)
+    return index >= 0 ? snippetAt(text, index, index + lowerNeedle.length).snippet : null
   }
   for (const text of texts) {
     const snippet = firstMatch(text)

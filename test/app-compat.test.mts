@@ -80,9 +80,11 @@ test('dispatchCases finds the cases that answer "method not found"', () => {
   for (const method of [
     'thread/prediction/request',
     'account/securitySetup/read',
+    'modelProvider/default/set',
     'thread/guardianReview',
     'thread/prepareApprovedPlan',
     'thread/readState/update',
+    'thread/realtime/list',
   ])
     assert.ok(notFound.has(method), `${method} answers method not found`)
   assert.equal(byDesign.get('thread/readState/update'), 'thread-read-state')
@@ -268,6 +270,8 @@ test('unverifiedAppWarning only speaks up for an unlisted desktop build', () => 
   const verified = VERIFIED_APP_VERSIONS[0] as string
   assert.equal(unverifiedAppWarning({ name: 'codex_desktop', version: verified }), null)
   assert.equal(unverifiedAppWarning({ name: 'Codex Desktop', version: verified }), null)
+  assert.equal(unverifiedAppWarning({ name: 'Codex Desktop', version: '26.1120.41243' }), null)
+  assert.equal(unverifiedAppWarning({ name: 'Codex Desktop', version: '26.1120.50957' }), null)
   assert.equal(unverifiedAppWarning({ name: 'codex_latex_preview', version: '1' }), null)
   assert.equal(unverifiedAppWarning({ name: 'codex-tui', version: '0.159.0' }), null)
   assert.equal(unverifiedAppWarning({}), null)

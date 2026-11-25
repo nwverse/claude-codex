@@ -243,6 +243,21 @@ one on as a problem, and a test keeps the default below all of them.
 predictions stop before `thread/sample` for a thread whose provider is not
 `openai`, and `thread/memory/read` answers with no summary.
 
+App 26.1120 (`26.1120.41243`, `26.1120.50957`) ships Codex `0.171.0-alpha.13.2`,
+still accepts `0.141.0` and up, and adds four gates:
+
+- `turnToolOutputRetention` (`0.163.0-alpha.5`, on at the default): adds
+  `retain: true` onto `turn/start`'s `toolOutput`, which Claude already retains
+  in its session history.
+- `threadSearchStream` (`0.171.0-alpha.13`, off at the default): runs sidebar
+  search with `thread/search/stream`, incremental `thread/search/partial`
+  batches and `thread/search/stream/cancel`. The adapter implements both
+  streaming search and connection-scoped cancellation (`thread/search/cancel`
+  as well), and lists `threadSearchStream` in `GATED_METHODS`.
+- `liveVisualizationExecutorRead` (`0.169.0-alpha.11`) and
+  `directMcpSandboxCwd` (`0.171.0-alpha.6`): stay off at the default in
+  `KEPT_OFF_GATES`.
+
 On macOS the App's LaTeX preview, a separate app-server client, needs
 `0.149.0-alpha.4` or newer, and `0.162.0-alpha.20` for a project under `/tmp`
 or `/var/tmp`; below that it says LaTeX previews need a newer Codex. The
@@ -283,9 +298,10 @@ A Claude chat has no read state: its `thread/read` carries no `readState`,
 and `thread/readState/update` gets `-32601`, as from a Codex without its state
 database (rule `thread-read-state`); a native Codex chat's read state is its
 Codex child's, which answers both. `thread/prediction/request` gets `-32601`
-too, since Codex does not implement it either, and so do three requests of
-the 0.169 protocol that App 26.1111 never sends: `account/securitySetup/read`,
-`thread/guardianReview` and `thread/prepareApprovedPlan`.
+too, since Codex does not implement it either, and so do five requests of
+the 0.169/0.171 protocols that the App never sends: `account/securitySetup/read`,
+`modelProvider/default/set`, `thread/guardianReview`,
+`thread/prepareApprovedPlan` and `thread/realtime/list`.
 
 ### What the gates change
 
@@ -296,6 +312,7 @@ answers in a particular way:
 | Gate | With it on, the App… | The adapter… |
 | --- | --- | --- |
 | `turnToolOutput` | sends a thread handoff or a message from another thread as `turn/start` with empty `input` and the text in `toolOutput` | prompts Claude with it and records a `functionCallOutput` item (rule `tool-output-turns`) |
+| `turnToolOutputRetention` | adds `retain: true` onto `turn/start` `toolOutput` | accepts it; Claude keeps every turn prompt in its session history |
 | `turnApprovalsReviewer` | follows a permission change during a turn with `turn/settings/update` carrying the new `approvalsReviewer` | switches the running session into or out of Claude Code's auto mode, and keeps the reviewer for the thread's later turns (rule `auto-review`) |
 | `threadTimeline` | can read history with `thread/timeline/list`, newest page first | pages from the newest entry back |
 | `mcpServerStatusByName` | passes `serverName` to `mcpServerStatus/list` | lists only that server |

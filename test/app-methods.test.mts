@@ -46,7 +46,7 @@ class AppServer {
   readonly notifications: Array<{ method: string; params: any }> = []
   private readonly proc: ChildProcessWithoutNullStreams
   private readonly pending = new Map<
-    number,
+    number | string,
     { resolve: (result: any) => void; reject: (error: Error) => void }
   >()
   private nextId = 1
@@ -82,8 +82,15 @@ class AppServer {
   }
 
   request(method: string, params: Record<string, unknown> = {}): Promise<any> {
+    return this.requestWithId(this.nextId++, method, params)
+  }
+
+  requestWithId(
+    id: number | string,
+    method: string,
+    params: Record<string, unknown> = {},
+  ): Promise<any> {
     if (this.failure) return Promise.reject(this.failure)
-    const id = this.nextId++
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject })
       this.proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
@@ -832,6 +839,243 @@ test('a chat nothing was sent to stays out of the thread list and search', async
   })
 })
 
+test('thread/search/stream emits partial notifications before the authoritative page and enforces limits', async () => {
+  await withServer(async (server) => {
+    const first = await server.startThread()
+    await server.runTurn(first, 'alpha streamNeedle one')
+    const skipped = await server.startThread()
+    await server.runTurn(skipped, 'nothing matches here')
+    const second = await server.startThread()
+    await server.runTurn(second, 'beta streamNeedle two')
+    await server.request('thread/name/set', { threadId: second, name: 'streamNeedle title' })
+
+    const mark = server.mark()
+    const streamed = await server.requestWithId('search-str-1', 'thread/search/stream', {
+      searchTerm: 'STREAMNEEDLE',
+      includeAttachedThreads: true,
+    })
+    const partials = server.notified('thread/search/partial', mark)
+    assert.ok(partials.length >= 1, 'emits at least one thread/search/partial batch')
+    for (const batch of partials) {
+      assert.equal(batch.requestId, 'search-str-1')
+      assert.ok(Array.isArray(batch.data) && batch.data.length > 0)
+    }
+    const partialIds = partials.flatMap((batch) => batch.data.map((entry: any) => entry.thread.id))
+    const finalIds = streamed.data.map((entry: any) => entry.thread.id)
+    assert.deepEqual(partialIds, finalIds)
+    assert.deepEqual([...finalIds].sort(), [first, second].sort())
+
+    // Matches thread/search across pagination with numeric requestId too.
+    const plain = await server.request('thread/search', { searchTerm: 'STREAMNEEDLE' })
+    assert.deepEqual(
+      streamed.data.map((entry: any) => ({ id: entry.thread.id, snippet: entry.snippet })),
+      plain.data.map((entry: any) => ({ id: entry.thread.id, snippet: entry.snippet })),
+    )
+    assert.equal(streamed.nextCursor, null)
+    assert.equal(streamed.backwardsCursor, plain.backwardsCursor)
+
+    const pagedIds: string[] = []
+    let cursor: string | null = null
+    let reqNum = 9001
+    do {
+      const pageMark = server.mark()
+      const page: any = await server.requestWithId(reqNum, 'thread/search/stream', {
+        searchTerm: 'streamNeedle',
+        limit: 1,
+        cursor,
+      })
+      const pagePartials = server.notified('thread/search/partial', pageMark)
+      if (page.data.length > 0) {
+        assert.equal(pagePartials.length, 1)
+        assert.equal(pagePartials[0].requestId, reqNum)
+      } else {
+        assert.equal(pagePartials.length, 0)
+      }
+      pagedIds.push(...page.data.map((entry: any) => entry.thread.id))
+      cursor = page.nextCursor
+      reqNum += 1
+    } while (cursor !== null && pagedIds.length < 5)
+    assert.deepEqual(pagedIds, finalIds)
+
+    // Empty/whitespace searchTerm returns empty immediately with no partial notifications.
+    const emptyMark = server.mark()
+    assert.deepEqual(await server.request('thread/search/stream', { searchTerm: '   ' }), {
+      data: [],
+      nextCursor: null,
+      backwardsCursor: null,
+    })
+    assert.deepEqual(server.notified('thread/search/partial', emptyMark), [])
+
+    // 65,536 UTF-8 byte cap applies after trimming surrounding whitespace.
+    const atLimit = `  ${'a'.repeat(65_536)}  `
+    assert.deepEqual(
+      (await server.request('thread/search/stream', { searchTerm: atLimit })).data,
+      [],
+    )
+    await assert.rejects(
+      server.request('thread/search/stream', { searchTerm: 'a'.repeat(65_537) }),
+      (error: unknown) => {
+        assert.ok(error instanceof RpcError)
+        assert.equal(error.code, -32600)
+        return true
+      },
+    )
+
+    // Archived filter matches thread/search.
+    await server.request('thread/archive', { threadId: first })
+    const archived = await server.request('thread/search/stream', {
+      searchTerm: 'streamNeedle',
+      archived: true,
+    })
+    assert.deepEqual(
+      archived.data.map((entry: any) => entry.thread.id),
+      [first],
+    )
+
+    // turnToolOutputRetention sends retain: true on turn/start toolOutput.
+    const toolTurn = await server.request('turn/start', {
+      threadId: second,
+      input: [],
+      toolOutput: {
+        name: 'handoff',
+        namespace: 'codex_app',
+        output: 'retained handoff text',
+        retain: true,
+      },
+    })
+    assert.ok(toolTurn.turn?.id)
+  })
+})
+
+test('thread/search/stream respects partial opt-out, isolates peers, and supports connection-scoped cancel', async () => {
+  const runtime = scriptedRuntime(async (_ctx, handlers) => {
+    await handlers.onEvent({ type: 'text_delta', delta: 'batchNeedle answer' })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'batchNeedle answer' })
+  })
+  await withInProcessApp(runtime, async ({ server, startThread, startTurn, turnCompleted }) => {
+    const messagesA: any[] = []
+    const messagesB: any[] = []
+    const peerA = {
+      id: 'peer-a',
+      send(message: any) {
+        messagesA.push(message)
+      },
+      close() {},
+    }
+    const peerB = {
+      id: 'peer-b',
+      send(message: any) {
+        messagesB.push(message)
+      },
+      close() {},
+    }
+    const rpc = async (peer: typeof peerA, id: number | string, method: string, params: any) => {
+      await server.handle(peer, { jsonrpc: '2.0', id, method, params })
+      const bag = peer === peerA ? messagesA : messagesB
+      return bag.find((m) => 'id' in m && m.id === id)
+    }
+
+    await rpc(peerA, 'init-a', 'initialize', {
+      clientInfo: { name: 'Codex Desktop', version: '26.1120.41243' },
+      capabilities: { experimentalApi: true },
+    })
+    await rpc(peerB, 'init-b', 'initialize', {
+      clientInfo: { name: 'Codex Desktop', version: '26.1120.50957' },
+      capabilities: {
+        experimentalApi: true,
+        optOutNotificationMethods: ['thread/search/partial'],
+      },
+    })
+
+    // Seed 24 matching threads so streaming yields across multiple partial batches.
+    for (let i = 0; i < 24; i += 1) {
+      const id = await startThread()
+      const turnId = await startTurn(id, `batchNeedle item ${i}`)
+      await turnCompleted(turnId)
+    }
+
+    // Peer A's partials stay on peer A, never leaking to peer B; peer B's
+    // cancel with the same requestId cannot cancel peer A's stream.
+    const streamA = server.handle(peerA, {
+      jsonrpc: '2.0',
+      id: 'shared-id',
+      method: 'thread/search/stream',
+      params: { searchTerm: 'batchNeedle', limit: 24 },
+    })
+    const cancelFromB = await rpc(peerB, 'cancel-b', 'thread/search/stream/cancel', {
+      requestId: 'shared-id',
+    })
+    assert.deepEqual(cancelFromB.result, {})
+    await streamA
+    const resA = messagesA.find((m) => m.id === 'shared-id')
+    assert.equal(resA.error, undefined)
+    assert.equal(resA.result.data.length, 24)
+    const partialsA = messagesA.filter((m) => m.method === 'thread/search/partial')
+    assert.ok(partialsA.length >= 3, 'multi-batch stream emits multiple partial notifications')
+    assert.equal(
+      messagesB.filter((m) => m.method === 'thread/search/partial').length,
+      0,
+      'partials never leak to another peer',
+    )
+
+    // Peer B opted out of thread/search/partial: still gets the authoritative result, zero partials.
+    const resB = await rpc(peerB, 'stream-b', 'thread/search/stream', {
+      searchTerm: 'batchNeedle',
+      limit: 5,
+    })
+    assert.equal(resB.result.data.length, 5)
+    assert.equal(messagesB.filter((m) => m.method === 'thread/search/partial').length, 0)
+
+    // thread/search/cancel targets only thread/search, NOT thread/search/stream;
+    // thread/search/stream/cancel cancels the active stream mid-flight.
+    const streamToCancel = server.handle(peerA, {
+      jsonrpc: '2.0',
+      id: 'cancel-me',
+      method: 'thread/search/stream',
+      params: { searchTerm: 'batchNeedle', limit: 24 },
+    })
+    const wrongKind = await rpc(peerA, 'cancel-wrong', 'thread/search/cancel', {
+      requestId: 'cancel-me',
+    })
+    assert.deepEqual(wrongKind.result, {})
+    const rightKind = await rpc(peerA, 'cancel-right', 'thread/search/stream/cancel', {
+      requestId: 'cancel-me',
+    })
+    assert.deepEqual(rightKind.result, {})
+    // Idempotent repeat cancel and unknown requestId both succeed with {}.
+    const repeat = await rpc(peerA, 'cancel-repeat', 'thread/search/stream/cancel', {
+      requestId: 'cancel-me',
+    })
+    assert.deepEqual(repeat.result, {})
+    await streamToCancel
+    const cancelledRes = messagesA.find((m) => m.id === 'cancel-me')
+    assert.ok(cancelledRes?.error, 'cancelled stream resolves with an error response')
+    assert.match(cancelledRes.error.message, /cancelled/i)
+
+    // Invalid requestId is rejected with -32600.
+    const invalidCancel = await rpc(peerA, 'cancel-bad', 'thread/search/stream/cancel', {
+      requestId: null,
+    })
+    assert.equal(invalidCancel.error?.code, -32600)
+    const invalidSearchCancel = await rpc(peerA, 'cancel-bad-2', 'thread/search/cancel', {
+      requestId: {},
+    })
+    assert.equal(invalidSearchCancel.error?.code, -32600)
+
+    // Closing a peer cleanly cancels its in-flight stream without throwing.
+    const disconnectStream = server.handle(peerA, {
+      jsonrpc: '2.0',
+      id: 'on-disconnect',
+      method: 'thread/search/stream',
+      params: { searchTerm: 'batchNeedle', limit: 24 },
+    })
+    server.closePeer(peerA)
+    await disconnectStream
+    const disconnectedRes = messagesA.find((m) => m.id === 'on-disconnect')
+    assert.ok(disconnectedRes?.error)
+  })
+})
+
 test('thread/searchOccurrences finds every match with the turn that loads it', async () => {
   await withServer(async (server) => {
     const threadId = await server.startThread()
@@ -1371,7 +1615,13 @@ test('host methods answer truthfully: empty, disabled or unavailable', async () 
     // Codex itself does not implement thread/prediction/request, and has no
     // project/settings, which App 26.1111.71704 names only as the path of a
     // ChatGPT project's settings page on the web.
-    for (const method of ['x/y', 'thread/prediction/request', 'project/settings']) {
+    for (const method of [
+      'x/y',
+      'thread/prediction/request',
+      'project/settings',
+      'modelProvider/default/set',
+      'thread/realtime/list',
+    ]) {
       await assert.rejects(server.request(method), (error: unknown) => {
         assert.ok(error instanceof RpcError)
         assert.equal(error.code, -32601)

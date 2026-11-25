@@ -65,7 +65,10 @@ function openDatabase(path: string): DatabaseSync {
       needles.set(term, searchPattern(term))
     }
     const pattern = needles.get(term)
-    if (!pattern) return Number(text.includes(term))
+    if (!pattern) {
+      if (!term.trim()) return Number(text.includes(term))
+      return Number(text.length >= term.length && text.toLowerCase().includes(term.toLowerCase()))
+    }
     pattern.lastIndex = 0
     return Number(pattern.test(text))
   })

@@ -22,6 +22,8 @@ export const VERIFIED_APP_VERSIONS: readonly string[] = [
   '26.1013.40934',
   '26.1111.21308',
   '26.1111.71704',
+  '26.1120.41243',
+  '26.1120.50957',
 ]
 
 // initialize.clientInfo.name of the desktop App: "Codex Desktop" from 26.1111,
@@ -659,12 +661,18 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   // thread/resume shows modelProvider openai, which no thread here reports
   // (off at the default; rule prediction-provider).
   threadSample: ['thread/sample', 'thread/sample/cancel'],
+  // 26.1120: incremental thread search with thread/search/partial batches
+  // and connection-scoped cancellation (off at the default).
+  threadSearchStream: ['thread/search/stream', 'thread/search/stream/cancel'],
   threadTimeline: ['thread/timeline/list'],
   turnApprovalsReviewer: ['turn/settings/update'],
   // parentTurnId and rootTurnId on turn/start; the turn reports its
   // rootTurnId back.
   turnLineage: ['turn/start'],
   turnToolOutput: ['turn/start'],
+  // 26.1120: adds retain: true to turn/start toolOutput; Claude already keeps
+  // every turn prompt in its session history.
+  turnToolOutputRetention: ['turn/start'],
 }
 
 export interface DispatchCases {
@@ -759,6 +767,8 @@ export const KEPT_OFF_GATES: Readonly<Record<string, string>> = {
   threadRealtimeVoiceBackend: 'not examined',
   realtimeVoiceSessionId: 'not examined',
   threadSampleInterruptOnCancel: 'not examined',
+  liveVisualizationExecutorRead: 'not examined',
+  directMcpSandboxCwd: 'not examined',
 }
 
 // App rule: subagent-completed-kind

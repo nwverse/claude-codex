@@ -488,6 +488,9 @@ const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
 const COMPACTION_FAILED_PREFIX = 'Claude could not compact the conversation'
 const COMPACT_TRANSIENT_RETRY_MS = 500
+const MAX_THREAD_SEARCH_STREAM_TERM_BYTES = 65_536
+const THREAD_SEARCH_STREAM_PARTIAL_BATCH = 8
+const THREAD_SEARCH_YIELD_INTERVAL = 16
 
 function isTransientCompactionFailure(message: string | null): boolean {
   if (!message) return false
@@ -908,6 +911,12 @@ export class CodexClaudeAppServer {
   private stopped = false
   // Every connected peer, for notifications that belong to no thread.
   private peers = new Map<string, RpcPeer>()
+  // Active thread/search and thread/search/stream requests per connection, for
+  // connection-scoped cancellation and disconnect cleanup.
+  private readonly activeThreadSearches = new Map<
+    string,
+    { peerId: string; kind: 'search' | 'stream'; cancelled: boolean }
+  >()
   private readonly stopCommandsListener: () => void
   private readonly store: SessionStore
   private readonly runtime: ClaudeRuntime
@@ -1013,6 +1022,12 @@ export class CodexClaudeAppServer {
         this.subscribersByThread.delete(threadId)
     }
     for (const pending of this.pendingServerRequests.values()) pending.targets.delete(peer.id)
+    for (const [key, search] of this.activeThreadSearches) {
+      if (search.peerId === peer.id) {
+        search.cancelled = true
+        this.activeThreadSearches.delete(key)
+      }
+    }
     for (const watch of this.fsWatchers.get(peer)?.values() ?? []) watch.close()
     this.fsWatchers.delete(peer)
     // Its command/exec and process/spawn processes end with it. Their ids are
@@ -1028,6 +1043,8 @@ export class CodexClaudeAppServer {
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
+    for (const search of this.activeThreadSearches.values()) search.cancelled = true
+    this.activeThreadSearches.clear()
     const nativeStopped = this.codexBridge?.stop()
     // command/exec and process/spawn run in process groups of their own, out
     // of reach of a signal to the adapter's group (launchd job stop, Ctrl-C),
@@ -1121,7 +1138,7 @@ export class CodexClaudeAppServer {
 
   private async handleRequest(peer: RpcPeer, request: JsonRpcRequest): Promise<void> {
     try {
-      const result = await this.dispatch(peer, request.method, request.params ?? {})
+      const result = await this.dispatch(peer, request.method, request.params ?? {}, request.id)
       debugLog('rpc.response', {
         peerId: peer.id,
         id: request.id,
@@ -1147,7 +1164,12 @@ export class CodexClaudeAppServer {
     }
   }
 
-  private async dispatch(peer: RpcPeer, method: string, params: unknown): Promise<unknown> {
+  private async dispatch(
+    peer: RpcPeer,
+    method: string,
+    params: unknown,
+    requestId: JsonRpcId = null,
+  ): Promise<unknown> {
     if (this.codexBridge) {
       const routed = await this.codexBridge.route(peer, method, params)
       if (routed !== NOT_ROUTED) return routed
@@ -1244,7 +1266,13 @@ export class CodexClaudeAppServer {
       case 'thread/timeline/list':
         return this.historyForPeer(peer, this.threadTimelineList(asRecord(params)))
       case 'thread/search':
-        return this.threadSearch(asRecord(params))
+        return this.threadSearch(peer, asRecord(params), requestId)
+      case 'thread/search/cancel':
+        return this.threadSearchCancel(peer, asRecord(params), 'search')
+      case 'thread/search/stream':
+        return this.threadSearchStream(peer, asRecord(params), requestId)
+      case 'thread/search/stream/cancel':
+        return this.threadSearchCancel(peer, asRecord(params), 'stream')
       case 'thread/searchOccurrences':
         return this.threadSearchOccurrences(asRecord(params))
       case 'thread/attachment/add':
@@ -1638,13 +1666,16 @@ export class CodexClaudeAppServer {
         throw new RpcError('durable thread read state unavailable', undefined, METHOD_NOT_FOUND)
       // Codex itself answers this with method not found; no App build sends it.
       case 'thread/prediction/request':
-      // Requests of the 0.169 protocol that App 26.1111 never sends, for
-      // features Claude threads do not have (a ChatGPT account's security
-      // setup, guardian reviews on demand, an approved plan carried into a
-      // new thread): answered as by a Codex without them.
+      // Requests of the 0.169/0.171 protocols that the desktop App never
+      // sends, for features Claude threads do not have (a ChatGPT account's
+      // security setup, guardian reviews on demand, an approved plan carried
+      // into a new thread, changing the default model provider, or realtime
+      // projection logs): answered as by a Codex without them.
       case 'account/securitySetup/read':
+      case 'modelProvider/default/set':
       case 'thread/guardianReview':
       case 'thread/prepareApprovedPlan':
+      case 'thread/realtime/list':
         throw methodNotFound(method)
       default: {
         const result = hostMethod(method, asRecord(params))
@@ -2364,44 +2395,154 @@ export class CodexClaudeAppServer {
     }
   }
 
+  private threadSearchKey(
+    peerId: string,
+    kind: 'search' | 'stream',
+    requestId: string | number,
+  ): string {
+    return `${peerId}\0${kind}\0${typeof requestId}:${String(requestId)}`
+  }
+
+  private threadSearchCancel(
+    peer: RpcPeer,
+    params: Record<string, unknown>,
+    kind: 'search' | 'stream',
+  ): Record<string, never> {
+    const requestId = params.requestId
+    if (
+      typeof requestId !== 'string' &&
+      !(typeof requestId === 'number' && Number.isInteger(requestId))
+    ) {
+      throw invalidRequest('requestId must be a string or integer')
+    }
+    const active = this.activeThreadSearches.get(this.threadSearchKey(peer.id, kind, requestId))
+    if (active) active.cancelled = true
+    return {}
+  }
+
   // The sidebar's and the archive's search. The store narrows the threads by
   // text; a thread matches when its name, its preview or one of its visible
   // messages holds the term, and the first match is its snippet. A page keeps
   // reading the store until it is full, past threads the store let through.
-  private threadSearch(params: Record<string, unknown>): unknown {
+  private threadSearch(
+    peer: RpcPeer,
+    params: Record<string, unknown>,
+    requestId: JsonRpcId,
+  ): Promise<unknown> {
+    return this.runThreadSearch(peer, params, requestId, 'search')
+  }
+
+  // Incremental variant of thread/search: emits best-effort thread/search/partial
+  // batches tagged with requestId on the requesting connection before returning
+  // the authoritative sorted page and cursors. Yields periodically so large
+  // databases stay responsive and thread/search/stream/cancel can preempt.
+  private threadSearchStream(
+    peer: RpcPeer,
+    params: Record<string, unknown>,
+    requestId: JsonRpcId,
+  ): Promise<unknown> {
+    const searchTerm = typeof params.searchTerm === 'string' ? params.searchTerm : ''
+    if (Buffer.byteLength(searchTerm.trim(), 'utf8') > MAX_THREAD_SEARCH_STREAM_TERM_BYTES) {
+      throw invalidRequest(
+        `searchTerm must be at most ${MAX_THREAD_SEARCH_STREAM_TERM_BYTES} UTF-8 bytes`,
+      )
+    }
+    return this.runThreadSearch(peer, params, requestId, 'stream')
+  }
+
+  private async runThreadSearch(
+    peer: RpcPeer,
+    params: Record<string, unknown>,
+    requestId: JsonRpcId,
+    kind: 'search' | 'stream',
+  ): Promise<unknown> {
     const searchTerm = typeof params.searchTerm === 'string' ? params.searchTerm : ''
     const query = this.threadListQuery(params)
     const data: Array<{ thread: unknown; snippet: string }> = []
+    if (searchTerm.trim().length === 0) {
+      return { data, nextCursor: null, backwardsCursor: null }
+    }
+    const state = { peerId: peer.id, kind, cancelled: false }
+    const key =
+      typeof requestId === 'string' || typeof requestId === 'number'
+        ? this.threadSearchKey(peer.id, kind, requestId)
+        : null
+    if (key) this.activeThreadSearches.set(key, state)
+
+    const pendingPartial: Array<{ thread: unknown; snippet: string }> = []
+    const isCancelled = (): boolean => state.cancelled || this.stopped || !this.peers.has(peer.id)
+    const flushPartial = (): void => {
+      if (kind !== 'stream' || pendingPartial.length === 0 || requestId == null || isCancelled()) {
+        pendingPartial.length = 0
+        return
+      }
+      const batch = pendingPartial.splice(0, pendingPartial.length)
+      this.sendNotification(peer, {
+        method: 'thread/search/partial',
+        params: { requestId, data: batch },
+      })
+    }
+    const yieldTurn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve))
+
     let first: ThreadRecord | null = null
     let scanned: ThreadRecord | null = null
-    let exhausted = searchTerm.trim().length === 0
-    while (!exhausted && data.length < query.limit) {
-      const batch = this.store.listThreads({
-        ...query.options,
-        cursor: scanned ? query.cursorOf(scanned) : query.options.cursor,
-        searchTerm,
-      })
-      exhausted = batch.length < query.limit
-      for (const thread of batch) {
-        if (data.length === query.limit) {
-          exhausted = false
-          break
-        }
-        scanned = thread
-        const snippet = threadSnippet(
-          [thread.name, thread.preview],
-          () => this.store.historyTurns(thread.id),
+    let exhausted = false
+    let scannedSinceYield = 0
+    try {
+      while (!exhausted && data.length < query.limit) {
+        if (isCancelled()) throw new RpcError('thread search cancelled', undefined, SERVER_ERROR)
+        const batch = this.store.listThreads({
+          ...query.options,
+          cursor: scanned ? query.cursorOf(scanned) : query.options.cursor,
           searchTerm,
-        )
-        if (!snippet) continue
-        first ??= thread
-        data.push({ thread: this.toThread(thread, []), snippet })
+        })
+        exhausted = batch.length < query.limit
+        for (const thread of batch) {
+          if (data.length === query.limit) {
+            exhausted = false
+            break
+          }
+          if (isCancelled()) throw new RpcError('thread search cancelled', undefined, SERVER_ERROR)
+          scanned = thread
+          scannedSinceYield += 1
+          const snippet = threadSnippet(
+            [thread.name, thread.preview],
+            () => this.store.historyTurns(thread.id),
+            searchTerm,
+          )
+          if (snippet) {
+            first ??= thread
+            const entry = { thread: this.toThread(thread, []), snippet }
+            data.push(entry)
+            if (kind === 'stream') pendingPartial.push(entry)
+          }
+          if (
+            (kind === 'stream' && pendingPartial.length >= THREAD_SEARCH_STREAM_PARTIAL_BATCH) ||
+            scannedSinceYield >= THREAD_SEARCH_YIELD_INTERVAL
+          ) {
+            flushPartial()
+            scannedSinceYield = 0
+            await yieldTurn()
+            if (isCancelled())
+              throw new RpcError('thread search cancelled', undefined, SERVER_ERROR)
+          }
+        }
+        flushPartial()
+        if (!exhausted && data.length < query.limit) {
+          scannedSinceYield = 0
+          await yieldTurn()
+        }
       }
-    }
-    return {
-      data,
-      nextCursor: !exhausted && scanned ? query.cursorOf(scanned) : null,
-      backwardsCursor: first ? query.cursorOf(first) : null,
+      if (isCancelled()) throw new RpcError('thread search cancelled', undefined, SERVER_ERROR)
+      return {
+        data,
+        nextCursor: !exhausted && scanned ? query.cursorOf(scanned) : null,
+        backwardsCursor: first ? query.cursorOf(first) : null,
+      }
+    } finally {
+      if (key && this.activeThreadSearches.get(key) === state) {
+        this.activeThreadSearches.delete(key)
+      }
     }
   }
 
